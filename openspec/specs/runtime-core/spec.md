@@ -40,4 +40,4 @@ runtime SHALL 长期保持 ELF parser 与 loader/linker 的职责分离。
 
 - **WHEN** runtime 演进 ELF 支持
 - **THEN** parser 层 SHALL 负责格式读取与抽象
-- **AND** loader/linker 层 SHALL 负责 guest memory 映射、依赖解析与重定位语义
+- **AND** loader/linker 层 SHALL 负责目标内存映射、依赖解析与重定位语义

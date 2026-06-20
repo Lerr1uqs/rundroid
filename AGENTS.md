@@ -50,3 +50,10 @@ unidbg resources里面有一些可以用于验证的prebuild库
 
 尽量不要这么写： `fn build_exports(image: &ParsedElf, load_bias: u64) -> ExportTable` 不是很面向对象
 最好是 `ExportTable::build(...)` 或者 `ExportTableBuilder(...).set(...).add(...).build(...)`
+
+CPU ARM 这种首字母缩写的 就尽量全部大写 不要出现 `Cpu` 这种形式
+
+所有 ut/harness api都必须注释标注清楚 
+
+# 项目管理
+rust 提供 ffi给到python 如果需要运行python 务必使用uv 管理 不要用全局python

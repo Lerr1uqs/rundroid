@@ -27,9 +27,9 @@ parser SHALL 对外暴露统一的重定位数据模型。
 
 ### Requirement: Loader trait boundary
 
-`runtime/elf/loader` SHALL 只负责单模块装载和 guest memory 布局。
+`runtime/elf/loader` SHALL 只负责单模块装载和目标内存布局。
 
-#### Scenario: Load one parsed image into guest memory
+#### Scenario: Load one parsed image into target memory
 
 - **WHEN** loader 收到一个 `ParsedElf`
 - **THEN** 它 SHALL 完成地址空间保留、段映射、字节写入、零填充、段权限与 TLS 基础布局
@@ -55,7 +55,7 @@ parser、loader、linker SHALL 使用分层错误模型。
 
 - **WHEN** 某一步失败
 - **THEN** parse error SHALL 只描述格式与输入问题
-- **AND** load error SHALL 只描述 guest 映射与布局问题
+- **AND** load error SHALL 只描述目标侧映射与布局问题
 - **AND** link error SHALL 只描述依赖、符号解析、relocation 写回与 init 调度问题
 
 ### Requirement: Telemetry through context

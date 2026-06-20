@@ -30,3 +30,19 @@ harness SHALL 支持把非 Rust oracle 作为可选项。
 
 - **WHEN** 可选 oracle 不可用
 - **THEN** Rust execution path SHALL 仍然可用
+
+### Requirement: Scratch memory is harness-scoped
+
+scratch memory SHALL 仅作为 testing-harness / stub / 调试辅助能力存在。
+
+#### Scenario: Scratch allocation is used only by harness-facing APIs
+
+- **WHEN** case runner、Python stub 或调试辅助逻辑需要准备目标输入输出缓冲区
+- **THEN** harness MAY 通过 scratch API 申请和管理临时目标内存
+- **AND** 该能力 SHALL 被标记为 testing/harness/debug 用途，而不是稳定目标 userspace ABI
+
+#### Scenario: Scratch memory does not replace target heap semantics
+
+- **WHEN** 目标程序的正常执行路径需要动态内存
+- **THEN** runtime SHALL 继续依赖目标程序自身的 `malloc`、`mmap`、`brk` 或等价机制
+- **AND** scratch API 不 SHALL 被实现为正式 heap allocator 的替代品

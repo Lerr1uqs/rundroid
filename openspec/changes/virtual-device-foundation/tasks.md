@@ -1,0 +1,28 @@
+- [ ] 新增 `runtime/driver` crate，提供 `VirtualDevice`、`DeviceFactory`、`DeviceRegistry`、fd device handle 抽象
+- [ ] 为 VFS 增加 `map_file(virtual_path, VirtFile(...))` 与 `map_device(virtual_path, device)` 两类挂载面
+- [ ] 为文件节点实现 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 抽象
+- [ ] 统一 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 的 `read/pread` 主线，确保成功返回前一定完成目标侧回写
+- [ ] 把 `/dev/urandom`、`/dev/random`、`/dev/srandom`、`/dev/null`、`/dev/zero` 实现为 builtin device factory
+- [ ] 改造 VFS，使路径解析结果可返回 `Device` node，而不是仅 host file / bytes
+- [ ] 改造 `openat` 路径，使其在 open 时生成 per-open device instance，并把 handle 保存到 fd table
+- [ ] 改造 `read/write/ioctl/mmap/fstat/close` 路径，使其按 fd kind 分发到 device handle，而不是按路径硬编码分支
+- [ ] 为 file node 与 device node 打通统一的 `mmap` 协同路径，确保成功返回前目标侧映射真实建立
+- [ ] 为 driver 路径增加统一 telemetry 事件
+- [ ] 为 Python 绑定增加 `VirtualDevice` 基类
+- [ ] 为 Python 绑定增加 `VirtFile` 基类或等价值对象 API
+- [ ] 为 Rust runtime 导出 Python 可用的 binding/FFI 注册面，使 Python stub 能显式调用 `map_file` / `map_device`
+- [ ] 为 Python 绑定增加 `@device(path=None, ...)` decorator，允许声明默认虚拟路径，但不在 import 时自动污染 runtime 全局状态
+- [ ] 为 Python 绑定增加 `@file_node(path=None, ...)` decorator，用于动态 regular file provider 声明，并允许声明默认虚拟路径
+- [ ] 为 Python 类提供 `register(runtime, virtual_path=None)` 或等价显式入口，把 decorator 默认路径收敛到 Rust runtime 注册主线
+- [ ] 约束 Python callback 只返回文件/设备语义结果，目标侧回写、errno、fd 生命周期和 telemetry 仍由 Rust 统一提交
+- [ ] 在 `python/` 或等价目录建立 `uv` 管理的 `pyproject.toml` 与最小运行说明
+- [ ] 为 runtime/case-runner 增加 `register_devices(runtime)` 或等价挂载入口
+- [ ] 增加一个 builtin `/dev/urandom` regression case，要求校验目标缓冲区真实可见
+- [ ] 增加一个 `VirtFile.bytes(...)` regression case 和一个 `VirtFile.host(...)` regression case
+- [ ] 为动态 `VirtFile` provider 增加一个回归 case，要求验证 provider 返回成功但目标侧回写失败时整体仍失败
+- [ ] 增加一个 custom fake device regression case，要求验证新增设备不需要编辑 syscall 核心
+- [ ] 增加一个 Python stub 注册设备的回归 case，要求验证通过 FFI 注册后无需编辑 Rust syscall 核心即可生效
+- [ ] 增加一个 decorator 默认路径注册回归 case，要求验证 `@device(\"/dev/xxx\")` 仍需显式 `register(...)` 才会生效
+- [ ] 增加一个 file-backed 或 device-backed `mmap` regression case，要求验证返回区间在目标侧真实可读/可写
+- [ ] 明确当前阶段不强制引入 `vfs root`，并在接口中保留未来扩展余地
+- [ ] 使用 `openspec validate --type change virtual-device-foundation --strict` 验证 change

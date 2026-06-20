@@ -1,0 +1,18 @@
+- [ ] 为 `runtime/backends/api` 增加 `mem_protect`，并把底层统一执行接口命名收敛为 `Backend`
+- [ ] 为 `Backend` 增加 `pc_read` / `pc_write`，统一寄存器、内存、PC 和 stop 控制语义
+- [ ] 为 `runtime/backends/unicorn` 实现 `mem_protect`，移除 syscall 目标内存写入失败的静默吞错语义
+- [ ] 升级 `runtime/elf/parser` 的 `DynamicInfo`，输出真实 `soname` 和 `needed` 字符串
+- [ ] 修正 parser 错误分类，至少区分 `BadMagic`、`Truncated`、`MalformedDynamic`
+- [ ] 为 `runtime/elf/loader` 输出 RELRO 模板或等价的页权限收紧输入
+- [ ] 改造 `runtime/case-runner`，建立 root module + `DT_NEEDED` 的最小装载队列，并填充 `ModuleGraph.deps`
+- [ ] 改造 `runtime/elf/linker` 的 `resolve` 逻辑，使其按 self → direct deps → dependency closure 的稳定顺序解析
+- [ ] 为 `runtime/os/linux` 与 `runtime/case-runner` 增加 scratch memory / 目标缓冲区管理，并明确该 API 仅供 harness/stub/debug 使用
+- [ ] 确保 scratch memory 不被实现为正式目标堆、`malloc` 或通用 userspace allocator 的替代路径
+- [ ] 打通 `read` / `pread64` / `getrandom` 的 source -> 目标侧回写 -> 返回值 主线，确保回写失败时直接报错
+- [ ] 让 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和 builtin `/dev/urandom` 共享同一目标侧回写正确性路径
+- [ ] 让 `SYS_MMAP` 的成功路径必须完成 backend 映射与必要的初始字节落地，不允许只返回地址
+- [ ] 让 case manifest 的 `arch` / `backend` / `seed` / `telemetry` 参数真正生效或明确报错
+- [ ] 重写或新增 smoke case，至少覆盖 `/dev/urandom`、`VirtFile.bytes(...)`、`VirtFile.host(...)` 的目标缓冲区回读断言
+- [ ] 增加 `mmap` 回归 case，验证返回地址真实可读/可写，而不是仅检查 syscall 返回值
+- [ ] 用 `cargo test` 和 `cargo run -p rundroid-cli -- case ...` 验证新旧 case
+- [ ] 使用 `openspec validate --type change runtime-correctness-hardening --strict` 验证 change
