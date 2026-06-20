@@ -1,0 +1,13 @@
+[package]
+name = "rundroid-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid 统一 telemetry 子系统：日志 / 事件 / trace 受同一配置控制"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

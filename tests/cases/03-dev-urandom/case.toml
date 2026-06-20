@@ -1,0 +1,24 @@
+# case 3: /dev/urandom 路径
+# 目的：触发 getrandom syscall 走 LinuxRuntime 分发，并通过回读校验证明字节真的写入 guest 缓冲。
+#
+# 自验证设计（finding 1 修复）：
+# - rd_get_random 现在返回写入字节的 XOR 校验和（非 0），而不是单纯返回写入长度
+# - case runner 在 runtime 装配阶段预映射了 0x800_000..0x900_000 的 RW scratch buffer
+# - 因此 case manifest 可以把缓冲地址设到该区段，syscall 才不会 EFAULT
+# - expect_return 用一个宽范围断言"非零非负"是不够严格的——
+#   bootstrap 阶段先固定种子，校验和值是确定的，下面填的就是实测值
+
+name = "03-dev-urandom"
+arch = "arm64"
+backend = "unicorn"
+module = "resource:smoke/build/libsmoke.so"
+telemetry = "events_only"
+seed = 42
+
+[[call]]
+symbol = "rd_get_random"
+# buf 落在 case runner 预映射的 scratch 区段内（0x800_000..0x900_000）
+args = [0x800000, 16]
+# seed=42 + xorshift64 + 16 字节 的确定性 XOR 校验和。
+# 如果 syscall 写失败（EFAULT），返回值会是 -14；这个断言会失败。
+expect_return = 89

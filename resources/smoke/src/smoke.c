@@ -1,0 +1,53 @@
+/*
+ * rundroid bootstrap smoke fixture
+ *
+ * 三个 case 对应的导出：
+ *   rd_add(a, b)             —— 纯算术，验证 ABI 调用 + 返回值（case 1）
+ *   rd_open_urandom()        —— 通过 openat 打开 /dev/urandom（case 2，file/mmap）
+ *   rd_get_random(buf, n)    —— 通过 getrandom 拉字节（case 3，/dev/urandom）
+ *
+ * case 1 不依赖 syscall，bootstrap 阶段可直接跑通；
+ * case 2/3 走 svc，需要 syscall hook 接入后才能完整执行，
+ * 但 case runner 的 artifact 产出路径已经覆盖这两种 case。
+ */
+
+/* 直接发起 syscall，避免依赖 libc；调用约定见 AArch64 Linux ABI。 */
+static long sys3(long nr, long a0, long a1, long a2) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x8) : "memory");
+    return x0;
+}
+
+int rd_add(int a, int b) {
+    return a + b;
+}
+
+int rd_identity(int v) {
+    return v;
+}
+
+int rd_constant(void) {
+    return 42;
+}
+
+/* case 2：openat(AT_FDCWD=-100, "/dev/urandom", O_RDONLY=0)。返回 fd。 */
+int rd_open_urandom(void) {
+    long fd = sys3(56 /* openat */, -100, (long)"/dev/urandom", 0);
+    return (int)fd;
+}
+
+/* case 3：getrandom(buf, n, 0)。
+ * 返回字节 XOR 校验和，便于 case 断言"字节真的写进了 buf"：
+ * 全零才返回 0（对随机字节几乎不可能），任何写失败（syscall 返回 -EFAULT）
+ * 也会让校验和走负数路径，case 据此区分"成功且有数据" vs "假阳性"。 */
+int rd_get_random(void *buf, int n) {
+    long r = sys3(278 /* getrandom */, (long)buf, n, 0);
+    if (r < 0) return (int)r;
+    unsigned char *p = (unsigned char *)buf;
+    int cs = 0;
+    for (long i = 0; i < r; i++) cs ^= p[i];
+    return cs;
+}

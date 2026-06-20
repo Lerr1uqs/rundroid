@@ -1,0 +1,18 @@
+# case 2: openat 路径（原名 02-file-mmap）
+# 目的：触发 openat syscall 走 VFS 解析 /dev/urandom。
+# 与 case 3 配合覆盖 fd/syscall 路径：case 2 做 openat 拿 fd，case 3 做 getrandom 证明写缓冲生效。
+#
+# 注意：SYS_MMAP 在 LinuxRuntime 中是占位 stub（返回固定递增地址），
+# 真正 mmap 语义（flags/prot 校验 + 通知 backend 映射）待后续 task 补全。
+
+name = "02-openat"
+arch = "arm64"
+backend = "unicorn"
+module = "resource:smoke/build/libsmoke.so"
+telemetry = "events_only"
+
+[[call]]
+symbol = "rd_open_urandom"
+args = []
+# 返回 fd=3（0/1/2 留给 stdin/stdout/stderr）
+expect_return = 3

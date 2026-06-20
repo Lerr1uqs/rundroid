@@ -8,7 +8,7 @@
 
 - **WHEN** 贡献者打开仓库
 - **THEN** 他们 SHALL 看到包含 bootstrap crates 的 workspace 布局
-- **AND** workspace SHALL 包含 `runtime/core`、`runtime/backends/api`、`runtime/backends/unicorn`、`runtime/memory`、`runtime/elf/parse`、`runtime/elf/loader`、`runtime/elf/linker`、`runtime/os/linux`、`runtime/telemetry`、`runtime/cli`
+- **AND** workspace SHALL 包含 `runtime/core`、`runtime/backends/api`、`runtime/backends/unicorn`、`runtime/memory`、`runtime/elf/parser`、`runtime/elf/loader`、`runtime/elf/linker`、`runtime/os/linux`、`runtime/telemetry`、`runtime/cli`
 
 ### Requirement: ELF Layer Separation
 
@@ -17,7 +17,7 @@ runtime SHALL 把 ELF parser 与 loader/linker 明确分层。
 #### Scenario: Parse and load responsibilities are separated
 
 - **WHEN** 实现方开发 ELF 支持
-- **THEN** `runtime/elf/parse` SHALL 只负责 ELF 结构读取与统一解析接口
+- **THEN** `runtime/elf/parser` SHALL 只负责 ELF 结构读取与统一解析接口
 - **AND** `runtime/elf/loader` SHALL 负责段映射、load bias、TLS 基础布局和模块对象构建
 - **AND** `runtime/elf/linker` SHALL 负责依赖图、符号解析、重定位写回和 init/fini 调度
 

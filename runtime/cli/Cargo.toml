@@ -1,0 +1,17 @@
+[package]
+name = "rundroid-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid 命令行入口"
+
+[[bin]]
+name = "rundroid"
+path = "src/main.rs"
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-case-runner.workspace = true

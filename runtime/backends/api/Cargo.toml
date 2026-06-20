@@ -1,0 +1,13 @@
+[package]
+name = "rundroid-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid backend 抽象层：定义 CPU emulator 的统一 trait"
+
+[dependencies]
+rundroid-core.workspace = true
+thiserror.workspace = true

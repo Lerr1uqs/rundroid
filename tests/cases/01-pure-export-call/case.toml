@@ -1,0 +1,24 @@
+# case 1: 纯导出调用
+# 目的：验证 parser → loader → linker → backend 调用链。
+# 不依赖 syscall，bootstrap 阶段可直接跑通。
+
+name = "01-pure-export-call"
+arch = "arm64"
+backend = "unicorn"
+module = "resource:smoke/build/libsmoke.so"
+telemetry = "events_only"
+
+[[call]]
+symbol = "rd_add"
+args = [2, 3]
+expect_return = 5
+
+[[call]]
+symbol = "rd_constant"
+args = []
+expect_return = 42
+
+[[call]]
+symbol = "rd_identity"
+args = [1234]
+expect_return = 1234

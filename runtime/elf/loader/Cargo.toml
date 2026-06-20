@@ -1,0 +1,16 @@
+[package]
+name = "rundroid-elf-loader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid ELF loader：单模块 PT_LOAD 映射与模块对象构建"
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-memory.workspace = true
+rundroid-elf-parser.workspace = true
+rundroid-telemetry.workspace = true
+thiserror.workspace = true

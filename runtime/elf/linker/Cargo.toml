@@ -1,0 +1,17 @@
+[package]
+name = "rundroid-elf-linker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid ELF linker：依赖图、符号解析、relocation 写回、init 调度"
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-memory.workspace = true
+rundroid-elf-parser.workspace = true
+rundroid-elf-loader.workspace = true
+rundroid-telemetry.workspace = true
+thiserror.workspace = true

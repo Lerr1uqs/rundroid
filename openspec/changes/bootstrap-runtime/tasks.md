@@ -1,15 +1,15 @@
-- [ ] 建立 bootstrap 阶段需要的 workspace skeleton 和 crate 目录
-- [ ] 建立 `runtime/core`，实现 config、ids、runtime、session、error model
-- [ ] 建立 `runtime/backends/api` 和 `runtime/backends/unicorn`，跑通 ARM64 执行路径
-- [ ] 建立 `runtime/telemetry`，至少支持 `Disabled` 和 `EventsOnly`
-- [ ] 建立 `runtime/memory`，实现最小 stack/TLS 布局和 region tracking
-- [ ] 建立 `runtime/elf/parse`，基于现成 Rust parser crate 暴露统一解析接口
-- [ ] 建立 `runtime/elf/loader`，至少能 map 一个简单 ARM64 `.so`
-- [ ] 建立 `runtime/elf/linker`，至少能完成基础依赖解析、符号定位和导出符号调用
-- [ ] 固化 `runtime/elf/parse`、`runtime/elf/loader`、`runtime/elf/linker` 的 trait、DTO 和 error taxonomy
-- [ ] 建立 `runtime/os/linux`，覆盖 smoke case 所需的基础 fd/VFS/syscall
-- [ ] 实现 `tests/cases` 目录、`case.toml` 解析和 Rust runner
-- [ ] 实现资源 URI 解析和最小版 `tools/resources.py`
-- [ ] 添加至少 3 个 smoke case：纯导出调用、file/mmap、`/dev/urandom`
-- [ ] case 执行后输出 `result.json`、`backend.json`、`events.jsonl`
-- [ ] 使用 `openspec validate --type change bootstrap-runtime --strict` 验证 change
+- [x] 建立 bootstrap 阶段需要的 workspace skeleton 和 crate 目录
+- [x] 建立 `runtime/core`，实现 config、ids、runtime、session、error model
+- [x] 建立 `runtime/backends/api` 和 `runtime/backends/unicorn`，跑通 ARM64 执行路径
+- [x] 建立 `runtime/telemetry`，至少支持 `Disabled` 和 `EventsOnly`
+- [x] 建立 `runtime/memory`，实现最小 stack/TLS 布局和 region tracking
+- [x] 建立 `runtime/elf/parser`，基于现成 Rust parser crate 暴露统一解析接口
+- [x] 建立 `runtime/elf/loader`，至少能 map 一个简单 ARM64 `.so`
+- [x] 建立 `runtime/elf/linker`，至少能完成基础依赖解析、符号定位和导出符号调用
+- [x] 固化 `runtime/elf/parser`、`runtime/elf/loader`、`runtime/elf/linker` 的 trait、DTO 和 error taxonomy
+- [x] 建立 `runtime/os/linux`，覆盖 smoke case 所需的基础 fd/VFS/syscall
+- [x] 实现 `tests/cases` 目录、`case.toml` 解析和 Rust runner
+- [x] 实现资源 URI 解析和最小版 `tools/resources.py`
+- [x] 添加至少 3 个 smoke case：纯导出调用、file/mmap、`/dev/urandom`
+- [x] case 执行后输出 `result.json`、`backend.json`、`events.jsonl`
+- [x] 使用 `openspec validate --type change bootstrap-runtime --strict` 验证 change

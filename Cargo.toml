@@ -1,6 +1,55 @@
-[package]
-name = "rundroid"
+# rundroid bootstrap workspace
+# 顶层使用虚拟 workspace，所有 crate 都位于 runtime/ 下的语义化短名目录中。
+# 命名约定：磁盘目录保持短名（core / elf/parser 等），Cargo package 使用 `rundroid-*` 前缀。
+
+[workspace]
+resolver = "2"
+members = [
+    "runtime/core",
+    "runtime/backends/api",
+    "runtime/backends/unicorn",
+    "runtime/memory",
+    "runtime/elf/parser",
+    "runtime/elf/loader",
+    "runtime/elf/linker",
+    "runtime/os/linux",
+    "runtime/telemetry",
+    "runtime/cli",
+    "runtime/case-runner",
+]
+
+# 所有 crate 共享以下元信息与版本，避免在每个 package 中重复声明。
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/rundroid/rundroid"
+authors = ["rundroid contributors"]
 
-[dependencies]
+# workspace 级别的公共依赖入口，子 crate 通过 `dep.workspace = true` 引用，
+# 保证版本统一、升级时只需要改一处。
+[workspace.dependencies]
+rundroid-core = { path = "runtime/core" }
+rundroid-backend = { path = "runtime/backends/api" }
+rundroid-backend-unicorn = { path = "runtime/backends/unicorn" }
+rundroid-memory = { path = "runtime/memory" }
+rundroid-elf-parser = { path = "runtime/elf/parser" }
+rundroid-elf-loader = { path = "runtime/elf/loader" }
+rundroid-elf-linker = { path = "runtime/elf/linker" }
+rundroid-linux = { path = "runtime/os/linux" }
+rundroid-telemetry = { path = "runtime/telemetry" }
+rundroid-case-runner = { path = "runtime/case-runner" }
+
+# 外部依赖（bootstrap 阶段实际用到时再开启，先占位以便后续 crate 复用版本号）。
+thiserror = "2"
+tracing = "0.1"
+unicorn-engine = "2.1"
+elf = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+debug = true          # bootstrap 阶段保留符号，便于调试 Unicorn 路径
+opt-level = 3

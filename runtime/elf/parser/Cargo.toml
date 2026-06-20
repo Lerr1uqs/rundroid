@@ -1,0 +1,13 @@
+[package]
+name = "rundroid-elf-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid ELF 解析层：把字节流归一化为只读 ParsedElf 快照"
+
+[dependencies]
+elf.workspace = true
+thiserror.workspace = true

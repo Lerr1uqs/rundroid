@@ -1,0 +1,24 @@
+[package]
+name = "rundroid-case-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid case runner：解析 case.toml、装配 runtime、产出 artifact"
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-backend.workspace = true
+rundroid-backend-unicorn.workspace = true
+rundroid-memory.workspace = true
+rundroid-elf-parser.workspace = true
+rundroid-elf-loader.workspace = true
+rundroid-elf-linker.workspace = true
+rundroid-linux.workspace = true
+rundroid-telemetry.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

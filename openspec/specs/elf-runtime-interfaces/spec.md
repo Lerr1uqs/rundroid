@@ -6,7 +6,7 @@
 
 ### Requirement: Parser trait boundary
 
-`runtime/elf/parse` SHALL 暴露独立、只读的解析接口。
+`runtime/elf/parser` SHALL 暴露独立、只读的解析接口。
 
 #### Scenario: Parse bytes into immutable ELF view
 

@@ -23,7 +23,7 @@ bootstrap workspace 包含：
 - `runtime/backends/api`
 - `runtime/backends/unicorn`
 - `runtime/memory`
-- `runtime/elf/parse`
+- `runtime/elf/parser`
 - `runtime/elf/loader`
 - `runtime/elf/linker`
 - `runtime/os/linux`
@@ -62,7 +62,7 @@ rundroid/
 - `rundroid-backend`
 - `rundroid-backend-unicorn`
 - `rundroid-memory`
-- `rundroid-elf-parse`
+- `rundroid-elf-parser`
 - `rundroid-elf-loader`
 - `rundroid-elf-linker`
 - `rundroid-linux`
@@ -105,7 +105,7 @@ Java 以后可以作为 differential testing 的可选 oracle，但不能成为 
 
 `rundroid` 应保持这个边界，但用 Rust 重写：
 
-- `runtime/elf/parse` 负责 ELF 头、program headers、dynamic table、dynsym、dynstr、hash、version、rel/relA 原始读取
+- `runtime/elf/parser` 负责 ELF 头、program headers、dynamic table、dynsym、dynstr、hash、version、rel/relA 原始读取
 - `runtime/elf/loader` 负责 PT_LOAD 映射、段权限、load bias、TLS 基础布局、模块对象构建
 - `runtime/elf/linker` 负责 `DT_NEEDED` 依赖图、符号查找、重定位写回、`init_array`/`fini_array`
 
@@ -124,7 +124,7 @@ bootstrap 的 loader/linker 选型要求：
 
 trait 级别建议如下。
 
-`runtime/elf/parse` 负责“把字节变成稳定的、不可变的解析结果”，不能依赖 backend、memory mapper 或 syscall 层。
+`runtime/elf/parser` 负责“把字节变成稳定的、不可变的解析结果”，不能依赖 backend、memory mapper 或 syscall 层。
 
 ```rust
 pub trait ElfParser: Send + Sync {
@@ -233,7 +233,7 @@ linker 的关键约束：
 建议的文件布局：
 
 ```text
-runtime/elf/parse/
+runtime/elf/parser/
   src/
     lib.rs
     api.rs

@@ -11,7 +11,7 @@
 - `runtime/backends/api`
 - `runtime/backends/unicorn`
 - `runtime/memory`
-- `runtime/elf/parse`
+- `runtime/elf/parser`
 - `runtime/elf/loader`
 - `runtime/elf/linker`
 - `runtime/os/linux`

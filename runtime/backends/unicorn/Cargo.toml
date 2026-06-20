@@ -1,0 +1,16 @@
+[package]
+name = "rundroid-backend-unicorn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid Unicorn backend：首个 backend 实现（ARM64）"
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-backend.workspace = true
+unicorn-engine.workspace = true
+
+[dev-dependencies]

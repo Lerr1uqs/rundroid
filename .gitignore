@@ -1,1 +1,13 @@
 /target
+
+# case 执行产物（result.json / backend.json / events.jsonl）
+artifacts/
+
+# 交叉编译出的 .so fixture 二进制，不需要进仓库
+resources/smoke/build/
+
+# 本地机器构建配置，不适用于其他环境
+.cargo/
+
+# 外部 review 文档
+review.md
