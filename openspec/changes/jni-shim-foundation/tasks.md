@@ -1,0 +1,26 @@
+- [ ] 将顶层 `runtime/` 目录树重构为 `emulator/`，并同步更新 workspace members、workspace dependencies 与 crate 路径
+- [ ] 新增 `emulator/jni` crate，并加入 workspace members 与 workspace dependencies
+- [ ] 在 `emulator/core` 中新增或重构 emulator 装配层，明确 `Emulator` 是唯一对外主入口
+- [ ] 为 `emulator/jni` crate 建立 foundation 文件骨架：`lib.rs`、`args.rs`、`class.rs`、`descriptor.rs`、`dispatch.rs`、`field.rs`、`jnienv.rs`、`javavm.rs`、`object.rs`、`refs.rs`、`registry.rs`、`types.rs`、`verify.rs`
+- [ ] 在 `emulator/jni` 中实现 `types.rs`，定义 `JType`、`JValue`、`MethodSig`、`FieldSig`
+- [ ] 在 `emulator/jni` 中实现 `descriptor.rs`，支持 method / field descriptor 解析并统一输出 canonical slash-separated class name
+- [ ] 在 `emulator/jni` 中实现 `args.rs`，提供严格 typed getter，不允许 silent widening / narrowing
+- [ ] 在 `emulator/jni` 中实现 `object.rs`、`refs.rs`，建立 `JavaObject`、`RefKind`、`RefTable` 的最小模型
+- [ ] 在 `emulator/jni` 中实现 `class.rs`、`field.rs`、`registry.rs`，建立 class / method / field registry，并对 collision fail-fast
+- [ ] 在 `emulator/jni` 中实现 `verify.rs`，支持 Python 注解与 Java descriptor 的严格匹配校验
+- [ ] 在 `emulator/jni` 中实现 `dispatch.rs`，让 Rust-native 与 Python-shim method / field 共用一条 dispatch 主线
+- [ ] 在 `emulator/jni` 中实现 `jnienv.rs`、`javavm.rs`，提供 foundation 阶段最小 `JNIEnvSurface` / `JavaVMSurface`
+- [ ] 在 emulator 装配层中接入 `emulator/jni`，明确 emulator 持有 JNI registry、对象表和线程 attach 状态
+- [ ] 让模块装载后的 `JNI_OnLoad` 检测和调用进入正式 emulator 主线，并保证失败信息可归因到模块和符号
+- [ ] 扩展 `emulator/bindings/python`，增加 `javashim.rs` 或等价桥接模块，完成 decorator metadata -> Rust registry 的显式注册流程
+- [ ] 将 Python 对外主入口直接重构为 `Emulator`，不保留 `Runtime` 兼容入口
+- [ ] 在 `python/rundroid/` 下新增 `javashim` 包，包含 `base.py`、`decorators.py`、`registry.py`、`types.py`
+- [ ] 为 Python shim 包建立 foundation 文件骨架，并在 `__init__.py` 中暴露最小公开入口
+- [ ] 为 Python `javashim` decorator 规定 metadata-only 行为：import 不自动注册，必须显式 `register(...)`
+- [ ] 增加 descriptor / annotation 匹配成功的单元测试
+- [ ] 增加 descriptor / annotation 不匹配且在注册阶段失败的单元测试
+- [ ] 增加 Rust-native 与 Python-shim 共享 registry dispatch 的集成测试
+- [ ] 增加一个最小 `JNI_OnLoad` harness case，验证 `JavaVM` / `JNIEnv` foundation 调用链
+- [ ] 为 JNI 路径增加统一 telemetry 事件，至少覆盖 register / call / return / ref / error
+- [ ] 使用 `cargo test`、Python `uv run pytest` 与最小 case runner 命令验证 JNI foundation 主线
+- [ ] 使用 `openspec validate --type change jni-shim-foundation --strict` 验证 change
