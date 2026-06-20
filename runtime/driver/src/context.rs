@@ -20,6 +20,8 @@ pub struct DeviceIoContext {
 }
 
 /// 设备 ioctl 时传入的上下文。
+///
+/// bootstrap 阶段仅传递 fd；由 ioctl 分发层负责 argp 指向的 guest 内存读写。
 pub struct DeviceIoctlContext {
     /// 当前 fd。
     pub fd: i32,

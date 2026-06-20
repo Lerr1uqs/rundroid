@@ -422,10 +422,20 @@ impl SyscallHook for SyscallDispatcherPy {
         let mut write_guest = |addr: u64, bytes: &[u8]| -> bool {
             unsafe { (*cpu_ptr).mem_write(addr, bytes) }
         };
+        let mut map_guest = |addr: u64, len: usize, prot: i32| -> bool {
+            use rundroid_backend::MemPerms;
+            let read = (prot & 1) != 0;
+            let write = (prot & 2) != 0;
+            let exec = (prot & 4) != 0;
+            let perms = MemPerms::from_flags(read, write, exec);
+            unsafe { (*cpu_ptr).mem_map(addr, len, perms).is_ok() }
+        };
 
         let result = {
             let mut linux = self.linux.lock().unwrap();
-            linux.dispatch(nr, x0, x1, x2, x3, x4, x5, &mut read_guest, &mut write_guest)
+            linux.dispatch(
+                nr, x0, x1, x2, x3, x4, x5, &mut read_guest, &mut write_guest, &mut map_guest,
+            )
         };
 
         match result {

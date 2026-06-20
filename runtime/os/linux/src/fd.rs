@@ -16,10 +16,17 @@
 //! - 直接实现 `read/write/ioctl/mmap`
 
 use std::collections::HashMap;
-use rundroid_driver::context::DeviceIoContext;
+use std::sync::{Arc, Mutex};
+use rundroid_driver::context::{
+    DeviceCloseContext, DeviceIoContext, DeviceIoctlContext, DeviceMmapContext, DeviceMmapRequest,
+    DeviceMappedRegion, SyntheticStat,
+};
 use rundroid_driver::device::DeviceError;
 use rundroid_driver::mapper::VirtFileSource;
 use rundroid_driver::VirtualDevice;
+
+/// 共享设备句柄。使用 Arc<Mutex<>> 包装，使 dup 可以浅克隆引用而不依赖设备 Clone。
+pub type SharedDevice = Arc<Mutex<Box<dyn VirtualDevice>>>;
 
 // ============================================================================
 // 基础类型：FileHandle / FdHandle / FdKind / FileDescriptorEntry
@@ -42,7 +49,8 @@ pub enum FdHandle {
     /// 普通文件（宿主/内存/动态）。
     File(FileHandle),
     /// 虚拟设备（每 open 一次的新实例）。
-    Device(Box<dyn VirtualDevice>),
+    /// 用 Arc<Mutex<>> 包装以支持 dup：多个 fd slot 可共享同一设备实例。
+    Device(SharedDevice),
     // 后续扩展：Socket, Pipe, Eventfd
 }
 
@@ -91,6 +99,8 @@ impl FileDescriptorEntry {
     }
 
     /// 为虚拟设备创建一个新的描述符条目。
+    ///
+    /// 设备被包装为 Arc<Mutex<>> 共享句柄，使 dup 可以通过 Arc::clone 共享同一实例。
     pub fn new_device(
         fd: i32,
         device: Box<dyn VirtualDevice>,
@@ -99,7 +109,7 @@ impl FileDescriptorEntry {
         Self {
             fd,
             kind: FdKind::Device,
-            handle: FdHandle::Device(device),
+            handle: FdHandle::Device(Arc::new(Mutex::new(device))),
             flags: 0,
             virtual_path,
         }
@@ -299,9 +309,9 @@ impl FileDescriptorTable {
             return false;
         }
         if let Some(entry) = self.table.get_mut(&fd) {
-            if let FdHandle::Device(dev) = &mut entry.handle {
-                let mut ctx = rundroid_driver::context::DeviceCloseContext { fd };
-                let _ = dev.close(&mut ctx);
+            if let FdHandle::Device(dev) = &entry.handle {
+                let mut ctx = DeviceCloseContext { fd };
+                let _ = dev.lock().unwrap().close(&mut ctx);
             }
         }
         self.table.remove(&fd).is_some()
@@ -321,8 +331,10 @@ impl FileDescriptorTable {
             .table
             .get(&source_fd)
             .ok_or(DupError::BadFd)?;
-        if source_fd == target_fd.unwrap_or(source_fd) {
-            return Ok(source_fd);
+        if let Some(tgt) = target_fd {
+            if source_fd == tgt {
+                return Ok(source_fd);
+            }
         }
 
         // clone handle：File handle 做浅克隆，Device 暂不支持。
@@ -367,7 +379,17 @@ impl FileDescriptorTable {
                     virtual_path: source.virtual_path.clone(),
                 })
             }
-            FdHandle::Device(_) => Err(DupError::NotSupported),
+            FdHandle::Device(shared_dev) => {
+                // 设备句柄通过 Arc::clone 共享同一切实实例。
+                // 新 fd slot 独立持有 descriptor flags，但底层读写状态是共享的。
+                Ok(FileDescriptorEntry {
+                    fd,
+                    kind: source.kind,
+                    handle: FdHandle::Device(Arc::clone(shared_dev)),
+                    flags: source.flags,
+                    virtual_path: source.virtual_path.clone(),
+                })
+            }
         }
     }
 }
@@ -408,7 +430,7 @@ pub fn read_from_fd(
         }
         FdHandle::Device(dev) => {
             let mut ctx = DeviceIoContext { fd: entry.fd };
-            dev.read(&mut ctx, len).map_err(|e| match e {
+            dev.lock().unwrap().read(&mut ctx, len).map_err(|e| match e {
                 DeviceError::NotSupported => FdReadWriteError::NotSupported,
                 _ => FdReadWriteError::Internal(e.to_string()),
             })
@@ -440,10 +462,103 @@ pub fn write_to_fd(
         }
         FdHandle::Device(dev) => {
             let mut ctx = DeviceIoContext { fd: entry.fd };
-            dev.write(&mut ctx, data).map_err(|e| match e {
+            dev.lock().unwrap().write(&mut ctx, data).map_err(|e| match e {
                 DeviceError::NotSupported => FdReadWriteError::NotSupported,
                 _ => FdReadWriteError::Internal(e.to_string()),
             })
+        }
+    }
+}
+
+/// 对 fd 执行 ioctl。
+///
+/// - File handle 暂不支持 ioctl（返回 ENOTTY）。
+/// - Device handle 调用 `device.ioctl()`。
+/// - 返回值写入目标侧 x0（i64 语义）。
+pub fn ioctl_on_fd(
+    entry: &FileDescriptorEntry,
+    request: u64,
+    argp: u64,
+) -> Result<i64, FdReadWriteError> {
+    match &entry.handle {
+        FdHandle::File(_) => {
+            let _ = (request, argp);
+            Err(FdReadWriteError::NotSupported)
+        }
+        FdHandle::Device(dev) => {
+            let mut ctx = DeviceIoctlContext { fd: entry.fd };
+            dev.lock().unwrap().ioctl(&mut ctx, request, argp).map_err(|e| match e {
+                DeviceError::NotSupported => FdReadWriteError::NotSupported,
+                _ => FdReadWriteError::Internal(e.to_string()),
+            })
+        }
+    }
+}
+
+/// 从 fd 合成 stat 信息。
+///
+/// - File handle：根据 VirtFileSource 合成文件 stat（st_mode = S_IFREG）。
+/// - Device handle：调用 `device.fstat()`。
+pub fn fstat_from_fd(
+    entry: &FileDescriptorEntry,
+) -> Result<SyntheticStat, FdReadWriteError> {
+    match &entry.handle {
+        FdHandle::File(fh) => {
+            let (st_size, st_dev, st_ino) = match &fh.source {
+                VirtFileSource::HostPath(_) => {
+                    // 尝试统计宿主文件大小。
+                    (0u64, 0u64, 0u64)
+                }
+                VirtFileSource::Bytes(bytes) => {
+                    (bytes.len() as u64, 0u64, 0u64)
+                }
+                VirtFileSource::Dynamic(_) => {
+                    (0u64, 0u64, 0u64)
+                }
+            };
+            Ok(SyntheticStat {
+                st_mode: 0x8180, // S_IFREG | 0600
+                st_size,
+                st_dev,
+                st_ino,
+            })
+        }
+        FdHandle::Device(dev) => {
+            let ctx = rundroid_driver::context::DeviceStatContext { fd: entry.fd };
+            dev.lock().unwrap().fstat(&ctx).map_err(|_| FdReadWriteError::NotSupported)
+        }
+    }
+}
+
+/// 从 fd 查询 mmap 区域描述。
+///
+/// - File handle：暂不支持（返回 Ok(None)）。
+/// - Device handle：调用 `device.mmap()`，返回设备侧区域描述。
+/// - runtime 负责后续的目标侧 mem_map。
+pub fn mmap_from_fd(
+    entry: &FileDescriptorEntry,
+    length: usize,
+    offset: u64,
+    prot: i32,
+    flags: i32,
+) -> Result<Option<DeviceMappedRegion>, FdReadWriteError> {
+    match &entry.handle {
+        FdHandle::File(_fh) => {
+            // File-backed mmap 暂未实现（Phase 2）。
+            // 对常规文件执行 mmap 在 bootstrap 阶段返回 None，
+            // 调用侧回退为匿名映射。
+            let _ = (_fh, length, offset, prot, flags);
+            Ok(None)
+        }
+        FdHandle::Device(dev) => {
+            let mut ctx = DeviceMmapContext { fd: entry.fd };
+            let req = DeviceMmapRequest {
+                length,
+                offset,
+                prot,
+                flags,
+            };
+            dev.lock().unwrap().mmap(&mut ctx, &req).map_err(|_| FdReadWriteError::NotSupported)
         }
     }
 }

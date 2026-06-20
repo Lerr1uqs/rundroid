@@ -143,11 +143,20 @@ impl SyscallHook for SyscallDispatcher {
             // SAFETY: 同上。
             unsafe { (*cpu_ptr).mem_write(addr, bytes) }
         };
+        let mut map_guest = |addr: u64, len: usize, prot: i32| -> bool {
+            // 把 prot (POSIX PROT_* 位掩码) 转换为 MemPerms 并映射。
+            let read = (prot & 1) != 0;
+            let write = (prot & 2) != 0;
+            let exec = (prot & 4) != 0;
+            let perms = rundroid_backend::MemPerms::from_flags(read, write, exec);
+            // SAFETY: 同上 cpu_ptr 论证。mem_map 可能因地址已占用而失败。
+            unsafe { (*cpu_ptr).mem_map(addr, len, perms).is_ok() }
+        };
 
         let result = {
             let mut linux = self.linux.lock().unwrap();
             linux.dispatch(
-                nr, x0, x1, x2, x3, x4, x5, &mut read_guest, &mut write_guest,
+                nr, x0, x1, x2, x3, x4, x5, &mut read_guest, &mut write_guest, &mut map_guest,
             )
         };
 

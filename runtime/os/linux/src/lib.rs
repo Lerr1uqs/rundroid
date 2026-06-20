@@ -20,9 +20,10 @@ pub mod syscall;
 pub mod vfs;
 
 pub use fd::{
-    FdHandle, FdKind, FileDescriptorEntry,
+    FdHandle, FdKind, FileDescriptorEntry, SharedDevice,
     file_read, file_write, FileReadError, FileWriteError,
-    read_from_fd, write_to_fd, DupError, Fd, FdReadWriteError, FileDescriptorTable,
+    read_from_fd, write_to_fd, ioctl_on_fd, fstat_from_fd, mmap_from_fd,
+    DupError, Fd, FdReadWriteError, FileDescriptorTable,
 };
 pub use syscall::{LinuxRuntime, SyscallResult, ENOSYS, EBADF, EFAULT};
 pub use vfs::{VfsError, VfsMountTable, VfsNode};

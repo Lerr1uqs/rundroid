@@ -1,21 +1,23 @@
-- [ ] 新增 `runtime/driver` crate，提供 `VirtualDevice`、`DeviceFactory`、`DeviceRegistry` 等设备抽象
-- [ ] 在 `OS` 层引入显式 `FileDescriptorTable`、`FileDescriptorEntry` 和统一 `FdKind`，覆盖 file/device/socket/pipe/eventfd
-- [ ] 为 VFS 增加 `map_file(virtual_path, VirtFile(...))` 与 `map_device(virtual_path, device)` 两类挂载面
-- [ ] 为 VFS 明确同名虚拟路径冲突规则：重复 `map_file` / `map_device` 立即报错退出，不允许静默覆盖
-- [ ] 为文件节点实现 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 抽象
-- [ ] 统一 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 的 `read/pread` 主线，确保成功返回前一定完成目标侧回写
-- [ ] 把 `/dev/urandom`、`/dev/random`、`/dev/null`、`/dev/zero` 实现为 builtin device factory
-- [ ] 改造 VFS，使路径解析结果可返回 `Device` node，而不是仅 host file / bytes
-- [ ] 改造 `openat` 路径，使其在 open 时生成 per-open device instance，并把 handle 引用保存到 `FileDescriptorEntry`
-- [ ] 为 `dup/dup2/dup3` 定义稳定语义：创建新的 `FileDescriptorEntry`，并按显式策略共享或克隆底层 handle
-- [ ] 改造 `read/write/ioctl/mmap/fstat/close` 路径，使其先解析 `FileDescriptorEntry`，再按 `FdKind` 分发到对应 handle，而不是按路径硬编码分支
-- [ ] 为 file node 与 device node 打通统一的 `mmap` 协同路径，确保成功返回前目标侧映射真实建立
-- [ ] 为 driver 路径增加统一 telemetry 事件
-- [ ] 增加一个 builtin `/dev/urandom` regression case，要求校验目标缓冲区真实可见
-- [ ] 增加一个 `VirtFile.bytes(...)` regression case 和一个 `VirtFile.host(...)` regression case
-- [ ] 为动态 `VirtFile` provider 增加一个回归 case，要求验证 provider 返回成功但目标侧回写失败时整体仍失败
-- [ ] 增加一个 custom fake device regression case，要求验证新增设备不需要编辑 syscall 核心
-- [ ] 增加一个路径冲突回归 case，要求验证重复注册同一虚拟路径会立即报错
-- [ ] 增加一个 file-backed 或 device-backed `mmap` regression case，要求验证返回区间在目标侧真实可读/可写
-- [ ] 明确当前阶段不强制引入 `vfs root`，并在接口中保留未来扩展余地
-- [ ] 使用 `openspec validate --type change virtual-device-foundation --strict` 验证 change
+- [x] 新增 `runtime/driver` crate，提供 `VirtualDevice`、`DeviceFactory`、`DeviceRegistry` 等设备抽象
+- [x] 在 `OS` 层引入显式 `FileDescriptorTable`、`FileDescriptorEntry` 和统一 `FdKind`，覆盖 file/device/socket/pipe/eventfd
+- [x] 为 VFS 增加 `map_file(virtual_path, VirtFile(...))` 与 `map_device(virtual_path, device)` 两类挂载面
+- [x] 为 VFS 明确同名虚拟路径冲突规则：重复 `map_file` / `map_device` 立即报错退出，不允许静默覆盖
+- [x] 为文件节点实现 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 抽象
+- [x] 统一 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和动态 regular file provider 的 `read/pread` 主线，确保成功返回前一定完成目标侧回写
+- [x] 把 `/dev/urandom`、`/dev/random`、`/dev/null`、`/dev/zero` 实现为 builtin device factory
+- [x] 改造 VFS，使路径解析结果可返回 `Device` node，而不是仅 host file / bytes
+- [x] 改造 `openat` 路径，使其在 open 时生成 per-open device instance，并把 handle 引用保存到 `FileDescriptorEntry`
+- [x] 为 `dup/dup2/dup3` 定义稳定语义：创建新的 `FileDescriptorEntry`，并按显式策略共享或克隆底层 handle
+  - File handle: 克隆 VirtFileSource + cursor；Device handle: Arc<Mutex<>> 共享同一实例
+- [x] 改造 `read/write/ioctl/mmap/fstat/close` 路径，使其先解析 `FileDescriptorEntry`，再按 `FdKind` 分发到对应 handle，而不是按路径硬编码分支
+- [x] 为 file node 与 device node 打通统一的 `mmap` 协同路径，确保成功返回前目标侧映射真实建立
+- [x] 为 driver 路径增加统一 telemetry 事件
+  - device.open / device.ioctl / device.mmap / fd.open / fd.read / fd.write / fd.close / fd.fstat / device.error
+- [x] 增加一个 builtin `/dev/urandom` regression case，要求校验目标缓冲区真实可见
+- [x] 增加一个 `VirtFile.bytes(...)` regression case 和一个 `VirtFile.host(...)` regression case
+- [x] 为动态 `VirtFile` provider 增加一个回归 case，要求验证 provider 返回成功但目标侧回写失败时整体仍失败
+- [x] 增加一个 custom fake device regression case，要求验证新增设备不需要编辑 syscall 核心
+- [x] 增加一个路径冲突回归 case，要求验证重复注册同一虚拟路径会立即报错
+- [x] 增加一个 file-backed 或 device-backed `mmap` regression case，要求验证返回区间在目标侧真实可读/可写
+- [x] 明确当前阶段不强制引入 `vfs root`，并在接口中保留未来扩展余地
+- [x] 使用 `openspec validate --type change virtual-device-foundation --strict` 验证 change

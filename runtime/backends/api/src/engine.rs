@@ -107,5 +107,10 @@ pub trait SyscallCpu {
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> bool;
     /// 向 guest 地址写字节。失败时返回 `false`，调用方据此返回 EFAULT。
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> bool;
+    /// 在 guest 地址空间建立映射。
+    ///
+    /// syscall 层的 mmap 通过此方法在目标侧建立真实映射。
+    /// 如果地址已被占用或其他原因失败，返回 `BackendError`。
+    fn mem_map(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError>;
     fn stop(&mut self);
 }

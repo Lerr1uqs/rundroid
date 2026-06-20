@@ -83,6 +83,15 @@ impl<'a, 'u: 'a> SyscallCpu for UnicornSyscallCpu<'a, 'u> {
     fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> bool {
         self.uc.mem_write(addr, bytes).is_ok()
     }
+    fn mem_map(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError> {
+        self.uc
+            .mem_map(addr, size as u64, translate_perms(perms))
+            .map_err(|_| BackendError::MapFailed {
+                addr,
+                size: size as u64,
+                reason: "syscall mmap rejected by unicorn",
+            })
+    }
     fn stop(&mut self) {
         self.stop_requested = true;
     }
