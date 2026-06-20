@@ -9,4 +9,8 @@
   另外这里是不是兜底太过了？传错不应该报错吗？这部分也在spec
 
 
-  
+runtime可以改为emulator 对外要提供一个unidbg的 emulator
+
+
+
+- SyscallCpu 这名字太不直观了 实际上干的事情压根不是syscall
