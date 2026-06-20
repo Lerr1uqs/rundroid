@@ -57,3 +57,7 @@ CPU ARM 这种首字母缩写的 就尽量全部大写 不要出现 `Cpu` 这种
 
 # 项目管理
 rust 提供 ffi给到python 如果需要运行python 务必使用uv 管理 不要用全局python
+
+# 项目目的
+
+rust提供运行层核心框架 能够打包为python ffi 让python 通过给定的接口去写 hook/breakpoint/tracing/补环境能力 实现执行层和脚本层的解耦 

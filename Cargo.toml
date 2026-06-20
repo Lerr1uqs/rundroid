@@ -14,8 +14,10 @@ members = [
     "runtime/elf/linker",
     "runtime/os/linux",
     "runtime/telemetry",
+    "runtime/driver",
     "runtime/cli",
     "runtime/case-runner",
+    "runtime/bindings/python",
 ]
 
 # 所有 crate 共享以下元信息与版本，避免在每个 package 中重复声明。
@@ -39,7 +41,9 @@ rundroid-elf-loader = { path = "runtime/elf/loader" }
 rundroid-elf-linker = { path = "runtime/elf/linker" }
 rundroid-linux = { path = "runtime/os/linux" }
 rundroid-telemetry = { path = "runtime/telemetry" }
+rundroid-driver = { path = "runtime/driver" }
 rundroid-case-runner = { path = "runtime/case-runner" }
+rundroid-bindings-python = { path = "runtime/bindings/python" }
 
 # 外部依赖（bootstrap 阶段实际用到时再开启，先占位以便后续 crate 复用版本号）。
 thiserror = "2"
@@ -49,6 +53,7 @@ elf = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+pyo3 = { version = "0.24", features = ["extension-module"] }
 
 [profile.release]
 debug = true          # bootstrap 阶段保留符号，便于调试 Unicorn 路径

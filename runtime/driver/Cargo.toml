@@ -1,15 +1,13 @@
 [package]
-name = "rundroid-linux"
+name = "rundroid-driver"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "rundroid Linux 用户态运行时：基础 fd / VFS / syscall"
+description = "rundroid 虚拟设备抽象层：VirtualDevice trait、DeviceRegistry、VirtFile 挂载源"
 
 [dependencies]
-rundroid-core.workspace = true
-rundroid-driver.workspace = true
 rundroid-telemetry.workspace = true
 thiserror.workspace = true

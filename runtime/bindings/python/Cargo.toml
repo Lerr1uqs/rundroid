@@ -1,0 +1,26 @@
+[package]
+name = "rundroid-bindings-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid Python 绑定：通过 PyO3 暴露 Runtime / VFS / 设备注册面"
+
+[lib]
+name = "_rundroid"
+crate-type = ["cdylib"]
+
+[dependencies]
+rundroid-core.workspace = true
+rundroid-backend.workspace = true
+rundroid-backend-unicorn.workspace = true
+rundroid-memory.workspace = true
+rundroid-linux.workspace = true
+rundroid-driver.workspace = true
+rundroid-elf-parser.workspace = true
+rundroid-elf-loader.workspace = true
+rundroid-elf-linker.workspace = true
+rundroid-telemetry.workspace = true
+pyo3.workspace = true

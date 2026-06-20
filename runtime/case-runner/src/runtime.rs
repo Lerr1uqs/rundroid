@@ -64,6 +64,7 @@ impl EventSink for CollectingSink {
             TelemetryEventKind::Memory => "memory",
             TelemetryEventKind::Elf => "elf",
             TelemetryEventKind::Execution => "execution",
+            TelemetryEventKind::FileSystem => "filesystem",
         };
         self.events.lock().unwrap().push(EventRecord {
             name: event.name.to_string(),

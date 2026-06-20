@@ -161,18 +161,32 @@
 
 - `/dev/urandom`
 - `/dev/random`
-- `/dev/srandom`
 - `/dev/null`
 - `/dev/zero`
 
 至少具备稳定挂载与基本行为。
 
-### 4. 设备实例生命周期
+### 4. FileDescriptorTable / FileDescriptorEntry
+
+满足以下条件视为通过：
+
+- `OS` 维护显式 `FileDescriptorTable`
+- `FileDescriptorEntry` 表达 descriptor slot，而不是 file/device/socket 本体
+- `open`、`socket`、`pipe`、`eventfd` 进入同一张表
+- `dup/dup2/dup3` 创建新的 `FileDescriptorEntry`，而不是重新按路径解析对象
+
+以下情况视为不通过：
+
+- syscall 直接靠路径字符串判断对象行为
+- socket/pipe/eventfd 维护一套独立、平行、不可观测的私有 fd 分发表
+- `dup` 语义未定义，或实现依赖偶然对象复制
+
+### 5. 设备实例生命周期
 
 满足以下条件视为通过：
 
 - `open` 返回 per-fd 实例
-- fd table 保存实例句柄
+- `FileDescriptorTable` 保存实例句柄引用
 - 后续 `read/write/ioctl/mmap/close` 按 fd 分发
 
 以下情况视为不通过：
@@ -180,7 +194,17 @@
 - 每次操作都重新按路径猜设备
 - 设备状态无法随 fd 保存
 
+### 6. 挂载冲突规则
+
+满足以下条件视为通过：
+
+- 同一虚拟路径重复注册会立即报错
+- `map_file` 和 `map_device` 同名冲突会立即报错
+- 不存在静默覆盖旧挂载的行为
+
 ## 五、Python stub 验收
+
+这一部分属于 follow-up change 的验收，不作为当前 Rust driver/VFS Phase 1 的通过前提。
 
 ### 1. decorator 语义
 
@@ -292,7 +316,7 @@
 3. 目标缓冲区写入语义可信
 4. `mmap` 语义可信
 5. 文件与设备挂载主线清晰
-6. Python stub 注册主线成立
+6. 路径冲突规则成立
 7. smoke/regression case 能稳定复现并断言目标侧结果
 
 如果以上七项有明显短板，就不能视为 `rundroid` 当前阶段已经达到可交付实现基线。

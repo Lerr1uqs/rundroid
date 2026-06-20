@@ -1,15 +1,17 @@
 //! `rundroid-linux`
 //!
-//! Linux 用户态运行时最小集：覆盖 bootstrap smoke case 所需的
-//! 基础 fd 表 / VFS / syscall 表面。
+//! Linux 用户态运行时：负责 syscall 分发、fd 生命周期、
+//! VFS 虚拟路径挂载和设备注册。
 //!
-//! 实现策略：
-//! - [`fd`] 维护一个 host 端的 fd 表（in-memory），把 guest 的"整数 fd"映射到本层句柄
-//! - [`vfs`] 提供 `/dev/urandom` 等少量确定性"虚拟文件"
-//! - [`syscall`] 把 ARM64 syscall 编号翻译成对 fd/vfs 的调用
+//! # 体系结构
 //!
-//! bootstrap 不追求完整 syscall 覆盖；只覆盖：
-//! openat / close / read / write / mmap / munmap / exit_group / brk / getrandom
+//! - [`syscall`]：ARM64 syscall 分发器（`LinuxRuntime`）
+//! - [`vfs`]：虚拟文件系统挂载表
+//! - [`file_descriptor_table`]：fd 句柄表，统一管理所有 fd 来源
+//! - [`file_descriptor_entry`]：单个 fd 槽位，持有 FdHandle 引用
+//!
+//! 设备行为定义在 `rundroid-driver` crate 中；
+//! 本 crate 负责把设备操作结果落地到目标侧内存。
 
 #![forbid(unsafe_code)]
 
@@ -17,6 +19,10 @@ pub mod fd;
 pub mod syscall;
 pub mod vfs;
 
-pub use fd::{Fd, FdTable, FdType};
-pub use syscall::{LinuxRuntime, SyscallResult};
-pub use vfs::{VfsSource, resolve};
+pub use fd::{
+    FdHandle, FdKind, FileDescriptorEntry,
+    file_read, file_write, FileReadError, FileWriteError,
+    read_from_fd, write_to_fd, DupError, Fd, FdReadWriteError, FileDescriptorTable,
+};
+pub use syscall::{LinuxRuntime, SyscallResult, ENOSYS, EBADF, EFAULT};
+pub use vfs::{VfsError, VfsMountTable, VfsNode};

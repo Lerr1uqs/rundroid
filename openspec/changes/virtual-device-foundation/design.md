@@ -50,7 +50,19 @@
 - [01-system-spec.md](</F:/reverse-workspace/unidbg/agent-output/unidbg-rs-spec/01-system-spec.md:692>)
 - [03-hook-driver-interfaces.md](</F:/reverse-workspace/unidbg/agent-output/unidbg-rs-spec/interfaces/03-hook-driver-interfaces.md:174>)
 
-所以用户这次提出的“类行为 + 显式挂载”不是推翻旧设计，而是给这个设计补一个更顺手的 Python 表面。
+所以用户这次提出的“类行为 + 显式挂载”方向本身是合理的。
+
+但当前 change 不应一次把 Rust driver 重构和 Python binding 一起打包。
+
+这一轮应先收敛为 Phase 1：
+
+- Rust `runtime/driver`
+- VFS 挂载表
+- builtin devices
+- fd handle 分发
+- 路径冲突 fail-fast
+
+Python binding、decorator 和 FFI 回调应作为 follow-up change 单独推进。
 
 ## 结论方案
 
@@ -75,6 +87,12 @@ file IO / device 模拟必须拆成四层：
 - `runtime.fs.map_file(virtual_path, VirtFile(...))`
 - `runtime.fs.map_device(virtual_path, device_class_or_factory)`
 
+并且需要明确一条规则：
+
+- 同一个虚拟路径不允许重复挂载
+- `map_file` 和 `map_device` 若命中同名路径，必须立即报错退出
+- 不允许静默覆盖或按“后注册优先”处理
+
 其中：
 
 - `VirtFile.host(...)` 表示宿主文件来源
@@ -97,7 +115,27 @@ file IO / device 模拟必须拆成四层：
 - `mmap` 成功，意味着目标侧真的出现了可访问映射
 - 如果 backend writeback 或映射失败，source/provider/device 侧即使拿到了数据，也必须整体失败
 
-### 2. decorator 的正确角色
+### 2. Python binding 延后到 follow-up change
+
+Python decorator、Python binding、`PyO3`/FFI 回调这部分是合理方向，但不适合继续留在当前 change 里。
+
+原因：
+
+- 当前仓库没有 Python 实现基础
+- 这部分会显著扩大 review 面
+- 它和 Rust driver/VFS 主线是可拆分的
+
+所以当前 change 只保留 Rust Phase 1。
+
+后续独立 change 再处理：
+
+- Python `VirtualDevice`
+- Python `VirtFile`
+- decorator 元数据
+- FFI/binding 注册
+- `uv` 工程管理
+
+### 3. builtin 设备与 custom 设备的关系
 
 decorator 应该只做“声明类元数据”，不应在 import 时偷偷挂到 runtime 全局表里。
 
@@ -181,72 +219,6 @@ register_devices(runtime, [MyUrandom, ProcSelfMaps])
 
 这两种入口最终都要收敛到 Rust runtime 的同一条注册主线。
 
-### 2.1 Python stub 通过 FFI 挂载到 Rust runtime
-
-这一轮既然要求支持 Python stub 注册设备，就不应该只停在“有个 decorator”。
-
-建议直接把 Python 层定位为：
-
-- Python 负责声明类、编写行为、组织 case 逻辑
-- Rust 负责持有 runtime、mount table、fd 生命周期、目标侧回写、`mmap` 落地
-- 两者通过受控 FFI/binding 交互
-
-也就是说，推荐模型不是“Python 自己维护一套 runtime”，而是：
-
-1. Rust 创建 `Backend` + `OS` 运行实例
-2. Rust 暴露一个 Python 可持有的 runtime handle
-3. Python 调用 binding：
-   - `runtime.fs.map_device("/dev/xxx", MyDevice)`
-   - `runtime.fs.map_file("/path", VirtFile.bytes(...))`
-4. Rust 在 mount table 中记录挂载
-5. 后续目标程序的 `open/read/ioctl/mmap` 仍由 Rust 主导调度
-6. 若命中 Python device/file provider，则 Rust 通过 FFI 回调 Python 方法获取语义结果
-7. 最终目标侧回写、errno、fd 生命周期、telemetry 仍由 Rust 统一提交
-
-这条边界非常重要，因为它保证：
-
-- Python stub 有脚本层开发效率
-- Rust core 保持结果可信
-- 不会把目标内存、fd 生命周期等关键状态分裂到 Python 侧
-
-推荐 binding 形态：
-
-```python
-from rundroid import Runtime
-from rundroid.files import VirtFile
-from rundroid.drivers import VirtualDevice, device
-
-@device("/dev/urandom")
-class MyUrandom(VirtualDevice):
-    def read(self, ctx, size: int) -> bytes:
-        return b"\x41" * size
-
-rt = Runtime(...)
-MyUrandom.register(rt)
-rt.fs.map_file("/proc/version", VirtFile.bytes(b"Linux version 5.x\n"))
-```
-
-这里 `Runtime`、`rt.fs`、`map_device`、`map_file` 都应是 Rust `OS` 运行实例暴露给 Python 的 binding 对象，而不是纯 Python 假对象。
-
-实现技术上，可以接受：
-
-- `PyO3` 直接导出 Python 扩展模块
-- 或 `cffi` / `ctypes` + `cdylib` 的较薄桥接层
-
-bootstrap 阶段更推荐 `PyO3`，原因是：
-
-- 类型模型更清晰
-- Rust <-> Python 对象生命周期更容易约束
-- 后续给 `VirtualDeviceContext`、`VirtFileContext`、telemetry handle 暴露对象接口更自然
-
-但无论选哪种桥接技术，spec 约束都应保持不变：
-
-- Python 不能直接拥有最终目标侧状态控制权
-- FFI 只是注册和回调桥
-- runtime 正确性仍由 Rust 负责
-
-### 3. builtin 设备与 custom 设备的关系
-
 最好的方式是混合模型。
 
 #### builtin 设备
@@ -255,7 +227,6 @@ bootstrap 阶段更推荐 `PyO3`，原因是：
 
 - `/dev/urandom`
 - `/dev/random`
-- `/dev/srandom`
 - `/dev/null`
 - `/dev/zero`
 - `/dev/ashmem`
@@ -268,15 +239,12 @@ bootstrap 阶段更推荐 `PyO3`，原因是：
 
 #### custom 设备
 
-用户自定义设备优先走 Python `VirtualDevice`：
-
-- 便于快速模拟 `ioctl`-heavy target
-- 便于按 case 写一次性设备
-- 便于配合 crackme / app 行为定制
+当前 change 先不引入 Python custom device。  
+后续 change 再把 custom device 扩到 Python 脚本层。
 
 #### override 规则
 
-显式挂载的 custom device 应优先于 builtin。
+Rust 侧显式挂载的 custom device 应优先于 builtin。
 
 推荐优先级：
 
@@ -298,7 +266,8 @@ bootstrap 阶段更推荐 `PyO3`，原因是：
 
 - registry 保存 `DeviceFactory`
 - `open(path)` 时调用 factory，生成一个 per-open device instance
-- fd table 保存 `FdKind::Device(DeviceHandleId)`
+- `FileDescriptorTable` 保存 `FileDescriptorEntry`
+- `FileDescriptorEntry` 持有 `FdKind` 与 handle 引用
 - 后续 `read/write/ioctl/mmap/close` 都按 handle 分发
 
 这点非常关键，因为：
@@ -310,6 +279,42 @@ bootstrap 阶段更推荐 `PyO3`，原因是：
 
 - class / factory 是“设备定义”
 - instance / handle 是“这次 open 出来的会话状态”
+- `FileDescriptorEntry` 是“当前 fd 槽位的引用与元数据”
+
+#### 4.1 `FileDescriptorTable` / `FileDescriptorEntry` 的职责
+
+`FileDescriptorTable` 应该属于 `OS` 层，而不是 `VirtualDevice` 本身。
+
+它的职责是：
+
+- 管理 `fd -> FileDescriptorEntry` 的映射
+- 统一承接 `open`、`socket`、`pipe`、`eventfd`
+- 为 `read/write/ioctl/mmap/fstat/close` 提供统一入口
+- 在 `close` 后移除条目，并控制 fd 何时可被重用
+
+`FileDescriptorEntry` 则是单个 descriptor slot。
+
+它至少应表达：
+
+- `fd`
+- `kind`
+- `handle_ref`
+- `descriptor_flags`
+- `virtual_path: Option<String>`，仅用于路径来源对象的可观测与诊断
+
+需要特别强调：
+
+- `FileDescriptorEntry` 不是 file/device/socket 行为对象
+- `FileDescriptorEntry` 不负责路径解析
+- `FileDescriptorEntry` 只负责把一个 fd 槽位稳定地指向某个已打开 handle
+
+推荐行为语义：
+
+- `open` 为 path-derived node 创建 handle，并插入一个新的 `FileDescriptorEntry`
+- `socket/pipe/eventfd` 也走同一张 `FileDescriptorTable`
+- `dup/dup2/dup3` 创建新的 `FileDescriptorEntry`
+- 新旧 `FileDescriptorEntry` 默认应指向同一 opened handle，descriptor 级 flags 保持独立
+- 只有当最后一个引用该 handle 的 `FileDescriptorEntry` 被关闭时，底层 handle 才真正执行 `close`
 
 ### 5. Rust 侧推荐接口
 
@@ -324,7 +329,6 @@ runtime/driver/
     device.rs
     registry.rs
     mapper.rs
-    fd.rs
     context.rs
     builtin/
       mod.rs
@@ -332,6 +336,11 @@ runtime/driver/
       zero.rs
       null.rs
       ashmem.rs
+runtime/os/linux/
+  src/
+    file_descriptor_table.rs
+    file_descriptor_entry.rs
+    syscall.rs
 ```
 
 核心 trait 建议：
@@ -353,6 +362,14 @@ pub trait VirtualDevice: Send {
 ```rust
 pub type DeviceFactory = Arc<dyn Fn() -> Box<dyn VirtualDevice> + Send + Sync>;
 ```
+
+`FileDescriptorTable` 和 `FileDescriptorEntry` 建议放在 `OS` crate，而不是 `runtime/driver` crate。
+
+原因是：
+
+- 它们服务于所有 fd 来源，而不只服务设备
+- regular file、device、socket、pipe、eventfd 都需要共享这层语义
+- 这能避免把 OS 级句柄表错误地下沉到 driver 层
 
 ### 6. VFS 与 driver 的边界
 
@@ -390,7 +407,7 @@ pub enum VirtFileSource {
 然后：
 
 - `openat` 看到 `Device(...)` -> 向 `DeviceRegistry` 请求 instance
-- 拿到 device handle -> 塞进 fd table
+- 拿到 device handle -> 插入 `FileDescriptorTable`
 - `read/write/ioctl/mmap/close` 一律按 fd kind 分发
 
 这样新增设备时：
@@ -435,118 +452,6 @@ pub enum VirtFileSource {
 - phase 1：只做显式挂载表
 - phase 2：如果 `/system`、`/vendor`、`/proc`、APK 展开目录等场景明显增多，再补 root mount / rootfs 概念
 
-### 7. Python decorator API 建议
-
-建议文件：
-
-```text
-bindings/python/rundroid/drivers.py
-bindings/python/rundroid/decorators.py
-bindings/python/rundroid/files.py
-bindings/python/rundroid/runtime.py
-```
-
-推荐 API：
-
-```python
-class VirtFile:
-    @staticmethod
-    def host(path: str) -> "VirtFile": ...
-    @staticmethod
-    def bytes(data: bytes) -> "VirtFile": ...
-
-class VirtualDevice:
-    def open(self, ctx) -> None: ...
-    def read(self, ctx, size: int) -> bytes: ...
-    def write(self, ctx, data: bytes) -> int: ...
-    def ioctl(self, ctx, request: int, argp: int) -> int: ...
-    def mmap(self, ctx, length: int, prot: int, flags: int, offset: int): ...
-    def fstat(self, ctx): ...
-    def close(self, ctx) -> None: ...
-
-    @classmethod
-    def register(cls, runtime, virtual_path: str | None = None) -> None: ...
-
-def device(path: str | None = None, *, kind: str = "char"):
-    ...
-
-def file_node(path: str | None = None, *, kind: str = "regular"):
-    ...
-```
-
-另外建议明确暴露 runtime binding：
-
-```python
-class Runtime:
-    @property
-    def fs(self) -> "FileSystemBinding": ...
-
-class FileSystemBinding:
-    def map_file(self, virtual_path: str, node) -> None: ...
-    def map_device(self, virtual_path: str, device) -> None: ...
-```
-
-decorator 的职责：
-
-- 校验类是否继承 `VirtualDevice` 或 `VirtFile`
-- 把 `kind` 与 capability 元数据挂到类对象
-- 可选记录默认虚拟路径
-- 收集类上实现了哪些操作
-
-不做的事：
-
-- 不直接改 runtime 全局 registry
-- 不在 import 时抢占某个路径
-
-这里的 `register()` 是可以接受的，因为：
-
-- 它是显式调用
-- 它最终还是通过 Rust binding 执行挂载
-- 它只是把“从 decorator 取默认路径并注册”这一段样板代码封装掉
-
-### 7.1 Python 环境与 `uv`
-
-Python stub 层既然要承担 case 编写和设备快速扩展，就需要一个稳定的 Python 工程管理方式。
-
-建议默认采用 `uv`：
-
-- `bindings/python/` 或 `python/` 目录下维护 `pyproject.toml`
-- case 所需依赖、开发工具、类型检查都由 `uv` 管理
-- 本地开发、CI、回归都通过 `uv run` 执行 Python stub case
-
-推荐形态：
-
-```text
-python/
-  pyproject.toml
-  rundroid/
-    __init__.py
-    runtime.py
-    drivers.py
-    files.py
-    decorators.py
-  cases/
-    devices/
-      test_urandom.py
-      test_proc_version.py
-```
-
-推荐命令：
-
-```powershell
-uv sync
-uv run pytest
-uv run python cases/devices/test_urandom.py
-```
-
-这里 `uv` 管的是：
-
-- Python binding 包装层
-- Python stub case
-- Python 侧依赖与工具链
-
-而不是替代 Rust workspace 或 Cargo。
-
 ### 8. builtin 注册方式
 
 推荐 runtime 在启动时预注册 builtin factory：
@@ -554,14 +459,9 @@ uv run python cases/devices/test_urandom.py
 ```rust
 registry.map_device("/dev/urandom", builtin::urandom_factory())?;
 registry.map_device("/dev/random", builtin::urandom_factory())?;
-registry.map_device("/dev/srandom", builtin::urandom_factory())?;
 registry.map_device("/dev/null", builtin::null_factory())?;
 registry.map_device("/dev/zero", builtin::zero_factory())?;
 ```
-
-Python 层如果需要可见性，可以暴露等价类定义，但实际默认实现仍然走 Rust builtin。
-
-如果用户显式 `map_device("/dev/urandom", MyUrandom)`，则覆盖 builtin。
 
 ### 9. `mmap` 的处理原则
 
@@ -624,10 +524,10 @@ driver 路径必须统一出事件，不允许只在 Python 里 print。
 
 ### Phase 2
 
-- 增加 Python `VirtualDevice` base class
-- 增加 decorator 元数据模型
-- 增加 Rust runtime -> Python binding / FFI 注册面
-- 增加 case 级 `register_devices(runtime)`
+- follow-up change：Python `VirtualDevice`
+- follow-up change：decorator 元数据模型
+- follow-up change：Rust runtime -> Python binding / FFI 注册面
+- follow-up change：Python case 注册主线
 
 ### Phase 3
 

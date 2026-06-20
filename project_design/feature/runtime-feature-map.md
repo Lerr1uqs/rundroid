@@ -106,6 +106,8 @@ Linker 负责：
 它负责：
 
 - syscall 分发
+- `FileDescriptorTable`
+- `FileDescriptorEntry`
 - 地址空间协作
 - `mmap`
 - `read/pread`
@@ -174,21 +176,51 @@ bootstrap 阶段至少内建：
 
 - `/dev/urandom`
 - `/dev/random`
-- `/dev/srandom`
 - `/dev/null`
 - `/dev/zero`
 - `/dev/ashmem`
 
-### 4.5 设备实例模型
+### 4.5 FileDescriptorTable 与 FileDescriptorEntry
+
+系统需要一个显式的 `FileDescriptorTable` 来管理所有 fd。
+
+其中 `FileDescriptorEntry` 代表单个描述符槽位，至少保存：
+
+- fd 编号
+- kind
+- handle 引用
+- descriptor flags
+- 可选的 `virtual_path` 诊断信息
+
+这意味着：
+
+- `open`、`socket`、`pipe`、`eventfd` 都进入同一张表
+- syscall 先解析 `FileDescriptorEntry`，再分发到对应 handle
+- `dup/dup2/dup3` 产生新的 `FileDescriptorEntry`，而不是重跑路径匹配
+
+### 4.6 设备实例模型
 
 设备系统必须区分：
 
 - device definition
 - per-open device instance
 
-fd table 保存的是实例句柄，而不是仅路径信息。
+`FileDescriptorTable` 保存的是实例句柄引用，而不是仅路径信息。
+
+### 4.7 挂载冲突规则
+
+同一个虚拟路径不允许同时注册多个节点来源。
+
+要求：
+
+- `map_file` 与 `map_file` 同名冲突时立即报错
+- `map_device` 与 `map_device` 同名冲突时立即报错
+- `map_file` 与 `map_device` 同名冲突时立即报错
+- 不允许静默覆盖
 
 ## 5. Python stub 扩展
+
+这一部分建议作为 follow-up change 独立推进，不与 Rust driver/VFS 主线混在同一个实现变更中。
 
 ### 5.1 Python 角色
 
@@ -249,7 +281,7 @@ case 至少覆盖：
 - `VirtFile.bytes(...)`
 - `VirtFile.host(...)`
 - `mmap`
-- Python stub 注册设备
+- 路径冲突报错
 
 ### 6.2 scratch memory
 
@@ -321,7 +353,7 @@ case 至少覆盖：
 2. `DT_NEEDED` 依赖图正确
 3. 页权限与 `RELRO` 正确
 4. 文件/设备路径正确
-5. Python stub 注册主线正确
+5. 路径冲突规则正确
 6. smoke case 与 regression case 可信
 
 ## 不在当前阶段强制要求的内容

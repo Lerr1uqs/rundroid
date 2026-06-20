@@ -1,0 +1,25 @@
+[project]
+name = "rundroid"
+version = "0.1.0"
+description = "rundroid Python stub 层：Android native 运行时仿真与设备模拟"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.maturin]
+manifest-path = "../runtime/bindings/python/Cargo.toml"
+module-name = "rundroid._rundroid"

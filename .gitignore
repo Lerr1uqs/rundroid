@@ -9,5 +9,15 @@ resources/smoke/build/
 # 本地机器构建配置，不适用于其他环境
 .cargo/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+.pytest_cache/
+*.egg-info/
+python/.venv/
+
 # 外部 review 文档
 review.md

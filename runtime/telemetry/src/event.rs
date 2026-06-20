@@ -25,6 +25,8 @@ pub enum TelemetryEventKind {
     Elf,
     /// backend 执行、中断、syscall
     Execution,
+    /// 文件系统与虚拟设备操作
+    FileSystem,
 }
 
 impl<'a> TelemetryEvent<'a> {

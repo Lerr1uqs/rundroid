@@ -51,3 +51,28 @@ int rd_get_random(void *buf, int n) {
     for (long i = 0; i < r; i++) cs ^= p[i];
     return cs;
 }
+
+/* case 4：openat(path) → 返回 fd（或负 errno）。
+ * 路径必须是 NUL 结尾的 C 字符串（与 /dev/urandom 相同的调用约定）。 */
+int rd_open(const char *path) {
+    return (int)sys3(56 /* openat */, -100, (long)path, 0);
+}
+
+/* case 5：read(fd, buf, n) → 返回实际读取字节数，并写回 buf。
+ * 返回值 < 0 表示 errno。 */
+int rd_read(int fd, void *buf, int n) {
+    long r = sys3(63 /* read */, fd, (long)buf, n);
+    if (r < 0) return (int)r;
+    return (int)r;
+}
+
+/* case 6：openat + read + close 组合。
+ * 打开指定路径到 buf，返回读取的字节数（< 0 = errno）。
+ * 写入 buf 的内容由 case 回读断言。 */
+int rd_open_read(const char *path, void *buf, int n) {
+    int fd = rd_open(path);
+    if (fd < 0) return fd;
+    int r = rd_read(fd, buf, n);
+    sys3(57 /* close */, fd, 0, 0);
+    return r;
+}

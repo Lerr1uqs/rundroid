@@ -15,6 +15,12 @@ runtime SHALL 为普通文件节点与设备节点提供显式挂载面。
 - **AND** 这些挂载类型 SHALL 通过统一的 VFS 入口管理
 - **AND** 当前阶段不 SHALL 强制要求单一 rootfs 或 `vfs root`
 
+#### Scenario: Path conflicts fail fast
+
+- **WHEN** runtime 试图对同一个虚拟路径重复注册 `map_file`、`map_device` 或等价节点来源
+- **THEN** runtime SHALL 立即返回显式错误
+- **AND** 不 SHALL 静默覆盖原有挂载
+
 #### Scenario: File mounts unify host-path and bytes sources
 
 - **WHEN** runtime 通过 `map_file` 挂载一个普通文件节点
@@ -57,44 +63,6 @@ runtime SHALL 区分设备定义与每次 open 的设备实例。
 - **THEN** runtime SHALL 通过 device factory 创建或获取适当的 device instance
 - **AND** fd table SHALL 保存 device handle
 - **AND** 后续 `read/write/ioctl/mmap/close` SHALL 按 fd 分发，而不是重新按路径分发
-
-### Requirement: Decorator declares metadata only
-
-Python device decorator SHALL 只负责声明元数据。
-
-#### Scenario: Importing a device class does not mutate runtime state
-
-- **WHEN** Python 脚本 import 一个带 device decorator 或 file decorator 的类
-- **THEN** decorator SHALL 仅收集类型和 capability 等元数据
-- **AND** 不 SHALL 在 import 时自动修改 runtime 全局挂载状态
-
-#### Scenario: Decorator may carry a default virtual path
-
-- **WHEN** 用户使用 `@device("/dev/urandom")` 或 `@file_node("/proc/version")` 这类 decorator 形式
-- **THEN** decorator MAY 记录默认虚拟路径作为类元数据的一部分
-- **AND** 该默认路径不 SHALL 在 import 时自动完成挂载
-
-### Requirement: Python stub registers through runtime FFI
-
-Python stub SHALL 通过受控 FFI 桥向 Rust runtime 注册文件节点与设备节点。
-
-#### Scenario: Python registration uses an explicit runtime handle
-
-- **WHEN** Python case 或 stub 想把 `VirtualDevice` 或 `VirtFile` 挂到某个虚拟路径
-- **THEN** 它 SHALL 通过 runtime 提供的 FFI handle 或 binding object 显式调用 `map_device` 或 `map_file`
-- **AND** Rust runtime SHALL 持有最终的 mount table、fd table 与生命周期控制
-
-#### Scenario: Decorator default path can be materialized through registration
-
-- **WHEN** 某个 Python `VirtualDevice` 或 `VirtFile` 类在 decorator 中声明了默认虚拟路径
-- **THEN** Python binding MAY 提供 `register()` 或等价入口，将该默认路径显式注册到 runtime
-- **AND** 最终挂载过程 SHALL 仍由 Rust runtime 完成，而不是由 decorator import 副作用完成
-
-#### Scenario: Python callback does not own core target state
-
-- **WHEN** Python stub 参与 file/device 行为回调
-- **THEN** 目标内存、寄存器、fd 与 syscall 结果的最终提交 SHALL 仍由 Rust runtime 控制
-- **AND** Python 侧不 SHALL 绕过 runtime 直接篡改核心目标侧状态
 
 ### Requirement: Builtin and custom devices share one abstraction
 

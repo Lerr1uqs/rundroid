@@ -11,6 +11,8 @@
 
 - syscall 分发
 - fd 生命周期
+- `FileDescriptorTable`
+- `FileDescriptorEntry`
 - 地址空间协作
 - `read` / `pread` / `getrandom`
 - `mmap`
