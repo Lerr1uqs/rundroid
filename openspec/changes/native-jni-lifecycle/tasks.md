@@ -1,0 +1,12 @@
+- [ ] 新增 `native-jni-lifecycle` capability 的正式 spec
+- [ ] 在 `emulator/jni` 中实现 `NativeRegistry`
+- [ ] 打通 `RegisterNatives` 对 `JNINativeMethod[]` 的读取和绑定
+- [ ] 为 method registry 增加 registered native binding
+- [ ] 实现 `Java_*` mangled symbol fallback 查找
+- [ ] 在模块装载完成后打通 `JNI_OnLoad` 调用链
+- [ ] 校验 `JNI_OnLoad` 返回版本
+- [ ] 增加 telemetry：register_natives / native_lookup / jni_onload
+- [ ] 增加 harness case：`RegisterNatives` 绑定成功
+- [ ] 增加 harness case：未注册方法通过 `Java_*` fallback 命中
+- [ ] 增加 harness case：`JNI_OnLoad` 成功与非法版本失败
+- [ ] 使用 `openspec validate --type change native-jni-lifecycle --strict` 验证 change

@@ -1,0 +1,10 @@
+- [ ] 新增 `jni-abi-surfaces` capability 的正式 spec
+- [ ] 在 `emulator/jni` 中实现 `JavaVmAbi` 与 `JniEnvAbi`
+- [ ] 建立 `_JavaVM`、`_JNIEnv`、invoke table、function table 的 guest memory 分配主线
+- [ ] 为 ABI slot 建立统一元数据模型：name / offset / svc / handler id
+- [ ] 打通 `GetEnv`、`AttachCurrentThread`、`DetachCurrentThread`
+- [ ] 打通 `FindClass`、`GetMethodID`、`GetFieldID` 最小查询主线
+- [ ] 打通 `NewObject`、`Call*Method`、`Get*Field` 的最小 ABI 桥接主线
+- [ ] 增加 ABI slot telemetry
+- [ ] 增加 harness case：guest 通过真实 `_JNIEnv` 表调用最小 JNI 方法
+- [ ] 使用 `openspec validate --type change jni-abi-surfaces --strict` 验证 change

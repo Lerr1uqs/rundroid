@@ -1,0 +1,11 @@
+- [ ] 新增 `android-framework-stubs` capability 的正式 spec
+- [ ] 在 `emulator/jni/framework` 中实现 `FrameworkRegistry`
+- [ ] 建立 class-spec / method-spec / field-spec 数据结构
+- [ ] 建立 `ServiceRegistry`，覆盖 phone/wifi/connectivity/sensor/activity/window/audio 等最小集合
+- [ ] 实现 `Application` / `Context` / `ContextWrapper` 最小 stub
+- [ ] 实现 `PackageManager` / `PackageInfo` / `Signature` / `ApplicationInfo` 最小 stub
+- [ ] 实现 `AssetManager` / `Bundle` / `IBinder` / `IServiceManager` 最小 stub
+- [ ] 实现 `String` / `Class` / primitive wrappers / `ArrayList` / `List` / `Map` / `Set` / `Iterator` / `Enumeration` 最小 stub
+- [ ] 确保 framework stub 从 `ApkContext` 读取包名、版本、签名、资产
+- [ ] 增加 harness cases：`getPackageName()`、`getPackageInfo()`、`Signature.hashCode()`、`getSystemService()`
+- [ ] 使用 `openspec validate --type change android-framework-stubs --strict` 验证 change

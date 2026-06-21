@@ -1,0 +1,9 @@
+- [ ] 新增 `python-javashim` capability 的正式 spec
+- [ ] 在 `python/rundroid/javashim` 中实现 metadata-only decorators
+- [ ] 在 `emulator/bindings/python/javashim.rs` 中实现显式注册桥
+- [ ] 固定 Python override > Rust framework stub > fail-fast unsupported 的优先级
+- [ ] 增加 descriptor/annotation 严格校验
+- [ ] 增加调用返回值验证
+- [ ] 增加 harness case：Python override 覆盖 framework stub
+- [ ] 增加 harness case：错误注解在注册阶段失败
+- [ ] 使用 `openspec validate --type change python-javashim-overrides --strict` 验证 change

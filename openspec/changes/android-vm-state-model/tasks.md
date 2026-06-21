@@ -1,0 +1,13 @@
+- [ ] 新增 `android-vm-model` capability 的正式 spec
+- [ ] 在 `emulator/jni` 中定义 `ClassId`、`ObjectId`、`MethodId`、`FieldId`
+- [ ] 实现 `JClass` 数据结构，覆盖 superclass / interfaces / class kind / name caches
+- [ ] 实现 `JObject` 与 `ObjectStorage`，覆盖 string / wrapper / primitive array / object array / stub instance
+- [ ] 实现 `JMethod` 与 `MethodDispatch`，建立 typed method registry
+- [ ] 实现 `JField` 与 `FieldDispatch`，建立 typed field registry
+- [ ] 实现 `RefTable`，覆盖 local/global/weak refs 与 frame cleanup
+- [ ] 实现 `ExceptionState`，覆盖 pending throwable 的最小语义
+- [ ] 实现 `ApkContext`，覆盖 package/version/manifest/signatures/assets
+- [ ] 在 `Emulator` / `AndroidRuntime` 中接入 `AndroidVm` 所有权模型
+- [ ] 增加 unit tests：class hierarchy、ref semantics、array storage、exception state
+- [ ] 增加 harness case：APK context 对 framework 读取可见
+- [ ] 使用 `openspec validate --type change android-vm-state-model --strict` 验证 change
