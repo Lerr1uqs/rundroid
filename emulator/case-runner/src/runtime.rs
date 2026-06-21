@@ -18,12 +18,15 @@ use rundroid_elf_loader::{
     SegmentMapSpec,
 };
 use rundroid_elf_parser::{ElfCrateParser, ElfParser, ParseInput, ParsedElf};
-use rundroid_jni::{JniRegistry, RefTable};
+use rundroid_jni::{AndroidVM, JniRegistry, ObjectStore, RefTable};
+use rundroid_jni::function_table::JniFunctionTable;
 use rundroid_linux::{LinuxRuntime, SyscallResult};
 use rundroid_memory::{MemoryError, RegionTracker};
 use rundroid_telemetry::{EventSink, TelemetryEvent, TelemetryEventKind, TelemetryMode, TelemetryRouter};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+
+use crate::jni_hook::JniTrampolineHook;
 
 #[derive(Debug, Error)]
 pub enum RuntimeAssemblyError {
@@ -92,6 +95,13 @@ pub struct GuestRuntime {
     pub jni_registry: JniRegistry,
     /// JNI 引用表 — handle → ObjectId 映射。
     pub jni_refs: RefTable,
+    /// JNI 对象存储（共享所有权，供 hook 访问）。
+    pub object_store: Arc<Mutex<ObjectStore>>,
+    /// JNI 函数表 guest 内存布局（装配时映射）。
+    pub jni_function_table: Option<JniFunctionTable>,
+    /// JNI trampoline hook（装配时安装到 engine）。
+    /// 用 Option 包装：需要在 engine 上注册 hook 但 engine 被 GuestRuntime 独占借用。
+    pub jni_env_pointer: Option<u64>,
     /// reserve 游标：bump 分配镜像基址。
     reserve_cursor: u64,
     /// sentinel/stack 是否已经映射（复用避免重叠 mem_map）。
@@ -222,10 +232,77 @@ impl GuestRuntime {
             last_link: None,
             jni_registry: JniRegistry::new(),
             jni_refs: RefTable::new(),
+            object_store: Arc::new(Mutex::new(ObjectStore::new())),
+            jni_function_table: None,
+            jni_env_pointer: None,
             // 镜像装载起点：1 GiB 处，远离 stack/TLS 高端。
             reserve_cursor: 0x4000_0000,
             trampoline_mapped: false,
         })
+    }
+
+    /// 初始化 JNI 环境：映射函数表 + trampoline 到 guest 内存，安装 code hook。
+    ///
+    /// 必须在 `assemble()` 之后、`emu_start()` 之前调用。
+    /// `vm` 是共享的 AndroidVM（registry + objects + refs + exceptions），
+    /// JNI trampoline hook 持有其引用。
+    ///
+    /// # JNI 地址布局
+    ///
+    /// 使用高端地址 0x7F_C000_0000（栈在 0x7F_E000_0000，sentinel 在 0x7F_FFFF_0000）。
+    ///
+    /// # NOTE: 硬编码地址是临时缓解措施
+    ///
+    /// 当前直接用 `engine.mem_map` 抢固定地址。后续应改为通过 guest 自身的
+    /// mmap 或 allocator 分配，避免与 guest .so 装载地址冲突。
+    /// 参见 [`JniFunctionTable`] 的模块级文档。
+    pub fn init_jni(&mut self, vm: Arc<Mutex<AndroidVM>>) -> Result<(), RuntimeAssemblyError> {
+        const JNI_ENV_BASE: u64 = 0x7F_C000_0000;
+        let ft = JniFunctionTable::layout(JNI_ENV_BASE);
+
+        // 1. 映射整块 JNI 区域到 guest 内存（READ + EXEC 以便 trampoline 页可执行）
+        self.engine
+            .mem_map(ft.env_ptr, ft.total_size, MemPerms::READ_EXEC)
+            .map_err(RuntimeAssemblyError::Backend)?;
+
+        // 2. 写入 JNIEnv header + 函数指针表 + trampoline NOP
+        self._write_jni_table(&ft)?;
+
+        // 3. 创建 JniTrampolineHook 并安装为 code hook
+        let hook = JniTrampolineHook::new(ft.clone(), vm);
+        let begin = hook.trampoline_begin();
+        let end = hook.trampoline_end();
+
+        self.engine
+            .install_code_hook(begin, end, Box::new(hook))
+            .map_err(RuntimeAssemblyError::Backend)?;
+
+        self.jni_function_table = Some(ft.clone());
+        self.jni_env_pointer = Some(ft.env_ptr);
+
+        Ok(())
+    }
+
+    /// 写入 JNI 函数表到 guest 内存（通过 engine）。
+    fn _write_jni_table(&mut self, ft: &JniFunctionTable) -> Result<(), RuntimeAssemblyError> {
+        // JNIEnv header: 首 8 字节 = pointer to table_base
+        let env_header = ft.table_base.to_le_bytes();
+        self.engine.mem_write(ft.env_ptr, &env_header)
+            .map_err(|e| RuntimeAssemblyError::Backend(e))?;
+
+        // 函数指针表 + trampoline NOP
+        for i in 0..rundroid_jni::function_table::JNI_TABLE_SIZE {
+            let tramp_addr = ft.trampoline_base + (i as u64) * rundroid_jni::function_table::TRAMPOLINE_SLOT_SIZE;
+            let table_slot = ft.table_base + (i as u64) * 8;
+
+            // 写函数指针表条目
+            self.engine.mem_write(table_slot, &tramp_addr.to_le_bytes()).ok();
+
+            // 写 trampoline NOP
+            self.engine.mem_write(tramp_addr, &rundroid_jni::function_table::ARM64_NOP).ok();
+        }
+
+        Ok(())
     }
 
     /// 装载并链接一个模块（root），按需递归装载 `DT_NEEDED`。
@@ -378,6 +455,7 @@ impl GuestRuntime {
 
         // sentinel + stack 只在第一次调用时映射；后续复用。
         // 否则在同一 runtime 内多次 call 会触发重叠 mem_map。
+        // TODO: 固定地址未来有更好的方式处理
         const SENTINEL_ADDR: u64 = 0x7F_FFFF_0000;
         const STACK_BASE: u64 = 0x7F_E000_0000;
         const STACK_TOP: u64 = STACK_BASE + 0x10_0000;

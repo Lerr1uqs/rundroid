@@ -14,7 +14,7 @@ pub mod error;
 pub mod mem;
 pub mod reg;
 
-pub use engine::{Backend, Engine, GuestCPU, SyscallHook};
+pub use engine::{Backend, CodeHook, Engine, GuestCPU, SyscallHook};
 pub use error::BackendError;
 pub use mem::MemPerms;
 pub use reg::Arm64Reg;

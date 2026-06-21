@@ -148,6 +148,7 @@ impl JType {
     }
 
     /// 返回 JNI descriptor 中此类型的单字符表示（primitive 时）。
+    /// Object/Array 类型返回 None，因为它们的 descriptor 不是单字符。
     pub fn primitive_char(&self) -> Option<char> {
         match self {
             JType::Void => Some('V'),
@@ -160,6 +161,27 @@ impl JType {
             JType::Float => Some('F'),
             JType::Double => Some('D'),
             JType::Object(_) | JType::Array(_) => None,
+        }
+    }
+
+    /// 返回 JNI descriptor 格式的类型字符串。
+    ///
+    /// - primitive: 单字符，如 `"I"`, `"V"`, `"Z"`
+    /// - Object: `"L{class};"`，如 `"Ljava/lang/String;"`
+    /// - Array: `"[{elem}"`，如 `"[I"`, `"[Ljava/lang/String;"`
+    pub fn jni_letter(&self) -> String {
+        match self {
+            JType::Void => "V".into(),
+            JType::Boolean => "Z".into(),
+            JType::Byte => "B".into(),
+            JType::Char => "C".into(),
+            JType::Short => "S".into(),
+            JType::Int => "I".into(),
+            JType::Long => "J".into(),
+            JType::Float => "F".into(),
+            JType::Double => "D".into(),
+            JType::Object(name) => format!("L{};", name),
+            JType::Array(elem) => format!("[{}", elem.jni_letter()),
         }
     }
 }
@@ -297,6 +319,22 @@ impl fmt::Display for MethodSig {
             write!(f, "{arg}")?;
         }
         write!(f, "){}", self.ret)
+    }
+}
+
+impl MethodSig {
+    /// 生成 JNI descriptor 格式的签名字符串（仅参数+返回类型，不含 class/method 名）。
+    ///
+    /// 格式：`"({arg_types}){ret_type}"`，使用 JNI 单字母类型码。
+    /// 例如 `"()I"` (无参数返回 int)、`"(ILjava/lang/String;)V"` (int+String 参数，void 返回)。
+    pub fn descriptor(&self) -> String {
+        let mut s = String::from("(");
+        for arg in &self.args {
+            s.push_str(&arg.jni_letter());
+        }
+        s.push(')');
+        s.push_str(&self.ret.jni_letter());
+        s
     }
 }
 

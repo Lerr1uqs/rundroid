@@ -78,6 +78,27 @@ pub trait Engine {
     ///
     /// 注册必须在 `emu_start` 之前完成；同一段时间内只能挂一个 syscall hook。
     fn install_syscall_hook(&mut self, hook: Box<dyn SyscallHook>) -> Result<(), BackendError>;
+
+    /// 注册代码执行 hook。
+    ///
+    /// 当 guest PC 落在 `[begin, end]` 范围内时，backend 会在**指令执行前**
+    /// 回调 [`CodeHook::on_code`]。
+    ///
+    /// hook 内部可以修改 PC 来重定向执行（例如设置 PC=LR 跳过 trampoline），
+    /// 也可以调用 `cpu.stop()` 来停止执行。
+    ///
+    /// # 参数
+    /// - `begin`: hook 起始地址（包含）
+    /// - `end`: hook 结束地址（包含）
+    /// - `hook`: 回调实现
+    ///
+    /// 注册必须在 `emu_start` 之前完成；同一段时间内只能挂一个 code hook。
+    fn install_code_hook(
+        &mut self,
+        begin: u64,
+        end: u64,
+        hook: Box<dyn CodeHook>,
+    ) -> Result<(), BackendError>;
 }
 
 /// SVC hook 抽象。
@@ -89,6 +110,27 @@ pub trait Engine {
 /// 而不需要让 backend 知道 LinuxRuntime 的存在。
 pub trait SyscallHook: Send {
     fn on_svc(&mut self, cpu: &mut dyn GuestCPU);
+}
+
+/// 代码执行 hook。
+///
+/// 当 guest PC 落在 `[begin, end]` 范围内时，backend 在**指令执行前**回调
+/// [`CodeHook::on_code`]。hook 内部可以：
+/// - 读写寄存器和 guest 内存（通过 [`GuestCPU`]）
+/// - 修改 PC 来重定向执行（例如设置 PC=LR 来跳过 trampoline 返回调用者）
+/// - 调用 `cpu.stop()` 来停止执行
+///
+/// # 使用场景
+///
+/// - JNI 函数表拦截：guest 跳转到 trampoline 页 → code hook 分发 JNI 调用
+/// - Breakpoint：在指定地址停下并检查状态
+/// - Tracing：记录每条指令的执行
+pub trait CodeHook: Send {
+    /// 当 guest 执行到达 `address` 时回调。
+    ///
+    /// `address` 是当前 PC（触发 hook 的地址）。
+    /// hook 可以修改 CPU 状态（寄存器、PC）来实现拦截并重定向。
+    fn on_code(&mut self, cpu: &mut dyn GuestCPU, address: u64);
 }
 
 /// hook 内可对 CPU 做的操作子集。

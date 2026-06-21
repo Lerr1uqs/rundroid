@@ -42,6 +42,7 @@ use rundroid_jni::{
     MethodSig,
     ObjectId,
     ObjectStorage,
+    ObjectStore,
     PythonCallableAnnotations,
     SharedField,
 };
@@ -220,14 +221,17 @@ struct PythonShimAdapter {
     /// (class_name, java_method_name) → python_method_name，
     /// 供 `call_java_method` 查找 Python 方法名。
     method_names: HashMap<(String, String), String>,
+    /// 共享 ObjectStore 引用，供 `wrap_python_method` 闭包通过 ObjectId 查找 Python 实例。
+    objects: Arc<Mutex<ObjectStore>>,
 }
 
 impl PythonShimAdapter {
-    /// 创建空的 adapter。
-    fn new() -> Self {
+    /// 创建 adapter。
+    fn new(objects: Arc<Mutex<ObjectStore>>) -> Self {
         Self {
             class_types: HashMap::new(),
             method_names: HashMap::new(),
+            objects,
         }
     }
 
@@ -331,13 +335,15 @@ impl PyEmulatorBridge {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
             })?;
 
+        let runtime = AndroidRuntime::new();
+        let objects = runtime.objects();
         Ok(Self {
             engine: EngineHolder { engine: Some(engine) },
             linux,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
-            runtime: AndroidRuntime::new(),
-            shim: PythonShimAdapter::new(),
+            runtime,
+            shim: PythonShimAdapter::new(objects),
             next_object_id: 1,
         })
     }
@@ -580,7 +586,8 @@ impl PyEmulatorBridge {
 
             // 用 javashim bridge 创建真实 handler（带运行时返回值校验）
             let sig_ret = sig.ret.clone();
-            let real_handler = javashim::wrap_python_method(py_fn_obj, sig_ret);
+            let objects = Arc::clone(&self.shim.objects);
+            let real_handler = javashim::wrap_python_method(py_fn_obj, sig_ret, objects);
 
             class_def.add_method(sig, is_static, MethodImpl::RustNative(real_handler))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -672,7 +679,7 @@ impl PyEmulatorBridge {
         self.next_object_id += 1;
 
         // 存入 ObjectStore（HostValue 持有 Python 对象引用）
-        self.runtime.vm.objects.insert(
+        self.runtime.vm.objects.lock().unwrap().insert(
             object_id,
             class_name.to_string(),
             ObjectStorage::HostValue { data: Box::new(instance) },
@@ -696,7 +703,7 @@ impl PyEmulatorBridge {
                 format!("实例 handle {handle} 不存在")
             ))?;
 
-        match self.runtime.vm.objects.storage(object_id) {
+        match self.runtime.vm.objects.lock().unwrap().storage(object_id) {
             Some(ObjectStorage::HostValue { data }) => {
                 let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
                     .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -724,7 +731,7 @@ impl PyEmulatorBridge {
             ))?;
 
         // 从 ObjectStore 移除（drop HostValue → Python 对象引用失效）
-        self.runtime.vm.objects.remove(object_id)
+        self.runtime.vm.objects.lock().unwrap().remove(object_id)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("ObjectId {object_id} 不在 ObjectStore 中")
             ))?;
@@ -774,7 +781,8 @@ impl PyEmulatorBridge {
             ))?;
 
         // 2. 从 ObjectStore 取出对象数据
-        let storage = self.runtime.vm.objects.storage(object_id)
+        let store = self.runtime.vm.objects.lock().unwrap();
+        let storage = store.storage(object_id)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("ObjectId {object_id} 不在 ObjectStore 中")
             ))?;
@@ -789,7 +797,7 @@ impl PyEmulatorBridge {
                     ))?;
 
                 // 确定 class name（从 ObjectStore 读取）
-                let class_name = self.runtime.vm.objects.class_name(object_id)
+                let class_name = store.class_name(object_id)
                     .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                         "无法获取对象的 class name"
                     ))?;
@@ -857,8 +865,10 @@ impl PyEmulatorBridge {
             // 非 HostValue 的对象不是通过 new_java_instance 创建的，
             // 没有 Python backing object，无法在此路径调用。
             ObjectStorage::StubInstance { .. } => {
-                let cn = self.runtime.vm.objects.class_name(object_id)
-                    .unwrap_or("<unknown>");
+                let cn = self.runtime.vm.objects.lock().unwrap()
+                    .class_name(object_id)
+                    .unwrap_or("<unknown>")
+                    .to_string();
                 Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                     format!(
                         "handle {handle} 对应的是 Rust StubInstance（class={cn}），\
@@ -963,7 +973,7 @@ impl PyEmulatorBridge {
                 format!("实例 handle {handle} 不存在于 RefTable")
             ))?;
 
-        match self.runtime.vm.objects.storage(object_id) {
+        match self.runtime.vm.objects.lock().unwrap().storage(object_id) {
             Some(ObjectStorage::HostValue { data }) => {
                 let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
                     .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(

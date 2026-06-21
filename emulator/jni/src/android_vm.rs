@@ -19,6 +19,7 @@ use crate::exception::ExceptionState;
 use crate::object_store::ObjectStore;
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // AndroidVM
@@ -40,7 +41,10 @@ pub struct AndroidVM {
     /// class / method / field 注册表。
     pub classes: JniRegistry,
     /// 对象存储（ObjectId → class_name + storage）。
-    pub objects: ObjectStore,
+    ///
+    /// 用 `Arc<Mutex<>>` 包装，支持多个闭包（如 Python shim handler、
+    /// JNI trampoline hook）共享访问对象池。
+    pub objects: Arc<Mutex<ObjectStore>>,
     /// 引用表（handle → ObjectId）。
     pub refs: RefTable,
     /// 当前线程的异常状态。
@@ -56,7 +60,7 @@ impl AndroidVM {
     pub fn new() -> Self {
         Self {
             classes: JniRegistry::new(),
-            objects: ObjectStore::new(),
+            objects: Arc::new(Mutex::new(ObjectStore::new())),
             refs: RefTable::new(),
             exceptions: ExceptionState::new(),
             apk: None,
@@ -94,7 +98,7 @@ mod tests {
     fn new_vm_is_empty() {
         let vm = AndroidVM::new();
         assert!(vm.classes.classes.is_empty());
-        assert!(vm.objects.is_empty());
+        assert!(vm.objects.lock().unwrap().is_empty());
         assert!(vm.refs.is_empty());
         assert!(!vm.exceptions.occurred());
         assert!(vm.apk.is_none());
@@ -127,7 +131,7 @@ mod tests {
         let obj_id = ObjectId(1);
 
         // 在 object store 中创建对象
-        vm.objects.insert(
+        vm.objects.lock().unwrap().insert(
             obj_id,
             "java/lang/String".into(),
             ObjectStorage::String("hello vm".into()),
@@ -140,7 +144,7 @@ mod tests {
         // clear frame 后 local ref 消失，但对象仍在 store 中
         vm.refs.clear_frame();
         assert_eq!(vm.refs.resolve(handle), None);
-        assert!(vm.objects.contains(obj_id));
+        assert!(vm.objects.lock().unwrap().contains(obj_id));
     }
 
     #[test]

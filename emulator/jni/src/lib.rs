@@ -39,6 +39,7 @@ pub mod dispatch;
 pub mod error;
 pub mod exception;
 pub mod field;
+pub mod function_table;
 pub mod javavm;
 pub mod jnienv;
 pub mod object;

@@ -8,7 +8,8 @@
 //! 上层只看到 trait 抽象，从而保留未来切换 / 并存其它 backend 的能力。
 
 use rundroid_backend::{
-    Arm64Reg, Backend, BackendError, Engine as BackendEngine, MemPerms, GuestCPU, SyscallHook,
+    Arm64Reg, Backend, BackendError, CodeHook, Engine as BackendEngine, MemPerms, GuestCPU,
+    SyscallHook,
 };
 use rundroid_core::Arch;
 use std::cell::RefCell;
@@ -38,6 +39,7 @@ impl Backend for UnicornBackend {
                     // 用 Rc<RefCell<>> 让 unicorn 内部 hook 闭包能回调到外部 hook 对象，
                     // 同时保持 'static 生命周期（Unicorn<'static, ()> 要求闭包 'static）。
                     hook_slot: Rc::new(RefCell::new(None)),
+                    code_hook_slot: Rc::new(RefCell::new(None)),
                 }))
             }
             // `Arch` 是 `#[non_exhaustive]`，未来新增架构在此显式拒绝，
@@ -54,6 +56,8 @@ pub struct UnicornEngine {
     uc: Unicorn<'static, ()>,
     /// SVC hook 共享槽位。UnicornEngine 与 unicorn 内部闭包各持一份 Rc。
     hook_slot: Rc<RefCell<Option<Box<dyn SyscallHook>>>>,
+    /// Code hook 共享槽位。
+    code_hook_slot: Rc<RefCell<Option<Box<dyn CodeHook>>>>,
 }
 
 /// hook 闭包内临时借用 Unicorn，用于读写寄存器、停机。
@@ -215,6 +219,36 @@ impl BackendEngine for UnicornEngine {
                 }
             })
             .map_err(|_| BackendError::Init("failed to install syscall hook"))?;
+        Ok(())
+    }
+
+    fn install_code_hook(
+        &mut self,
+        begin: u64,
+        end: u64,
+        hook: Box<dyn CodeHook>,
+    ) -> Result<(), BackendError> {
+        // 把 code hook 装进共享 slot，再注册一个 unicorn CODE hook。
+        // 当 guest PC 落在 [begin, end] 范围内时，unicorn 在指令执行前回调。
+        // hook 内部可以修改 PC 来重定向执行（例如设置 PC=LR 跳过 trampoline）。
+        *self.code_hook_slot.borrow_mut() = Some(hook);
+        let slot = self.code_hook_slot.clone();
+        self.uc
+            .add_code_hook(begin, end, move |uc, address, _insn_size| {
+                let mut borrow = slot.borrow_mut();
+                let Some(hook) = borrow.as_mut() else {
+                    return;
+                };
+                let mut cpu = UnicornGuestCPU {
+                    uc,
+                    stop_requested: false,
+                };
+                hook.on_code(&mut cpu, address);
+                if cpu.stop_requested {
+                    let _ = uc.emu_stop();
+                }
+            })
+            .map_err(|_| BackendError::Init("failed to install code hook"))?;
         Ok(())
     }
 }

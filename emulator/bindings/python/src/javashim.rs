@@ -12,6 +12,13 @@
 //! 这样 `dispatch.rs` 无需感知 Python 存在，
 //! 所有 method dispatch 走同一条 `RustNative` 路径。
 //!
+//! # 实例绑定
+//!
+//! 对于 instance method，闭包通过 `JniArgs::this()` 获取 `ObjectId`，
+//! 再通过捕获的 `Arc<Mutex<ObjectStore>>` 查找 Python 实例，
+//! 将实例绑定为 `self` 后调用 Python 方法。
+//! 对于 static method，`this()` 为 `None`，直接调用未绑定函数。
+//!
 //! # 线程安全性
 //!
 //! 捕获的 `Py<PyAny>` callable 仅在 `Python::with_gil` 内访问，
@@ -21,8 +28,8 @@
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3::IntoPyObjectExt;
-use rundroid_jni::{JniArgs, JniError, JType, JValue};
-use std::sync::Arc;
+use rundroid_jni::{JniArgs, JniError, JType, JValue, ObjectStorage, ObjectStore};
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // PythonCallable — 线程安全的 Python 函数引用
@@ -46,30 +53,64 @@ unsafe impl Send for PythonCallable {}
 /// 将 Python method 函数包装为 Rust-native handler。
 ///
 /// 返回的闭包：
-/// - 接收 `&JniArgs`（类型化 JNI 参数）
-/// - 将 JniArgs 转换为 Python tuple
-/// - 通过 `Python::with_gil` 调用 Python 函数
+/// - 接收 `&JniArgs`（类型化 JNI 参数，含 `this()` 实例 ID）
+/// - 若是 instance method（`this()` 为 `Some`）：
+///   从 `ObjectStore` 查找 Python 实例，绑定 `self` 后调用
+/// - 若是 static method（`this()` 为 `None`）：直接调用未绑定函数
 /// - 将 Python 返回值转换回 `JValue`
 /// - 校验返回值类型匹配声明类型
 ///
 /// # 参数
 /// - `py_fn`: Python callable（可以是 instance method 或普通函数）
 /// - `sig_ret`: 声明的返回值类型（用于运行时校验）
+/// - `objects`: 共享 ObjectStore，用于通过 ObjectId 查找 Python 实例
 pub fn wrap_python_method(
     py_fn: Py<PyAny>,
     sig_ret: JType,
+    objects: Arc<Mutex<ObjectStore>>,
 ) -> Arc<dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync> {
     let callable = PythonCallable { inner: py_fn };
     Arc::new(move |args: &JniArgs| -> Result<JValue, JniError> {
         Python::with_gil(|py| {
             let fn_ref = callable.inner.bind(py);
 
-            // JniArgs → Python tuple（只取 values 做简单映射）
+            // JniArgs → Python tuple（JNI 参数值列表）
             let py_args = jni_args_to_py_tuple(py, args)?;
 
-            // 调用 Python 函数
-            let result = fn_ref
-                .call1((py_args,))
+            // 如果是 instance method（this 非空），查找 Python 实例并绑定 self
+            let result = if let Some(this_oid) = args.this() {
+                // 从 ObjectStore 查找实例
+                let store = objects.lock().unwrap();
+                let storage = store.storage(this_oid);
+                match storage {
+                    Some(ObjectStorage::HostValue { data }) => {
+                        if let Some(instance) = data.downcast_ref::<Py<PyAny>>() {
+                            let bound_instance = instance.bind(py);
+                            // 调用 instance.method(py_args)
+                            // 使用 call1 将 py_args 作为第一个位置参数传入
+                            bound_instance.call_method1(
+                                fn_ref.getattr("__name__")
+                                    .map(|n| n.extract::<String>().unwrap_or_default())
+                                    .unwrap_or_default()
+                                    .as_str(),
+                                (py_args,),
+                            )
+                        } else {
+                            // 非 HostValue：直接调用未绑定函数
+                            fn_ref.call((py_args,), None)
+                        }
+                    }
+                    _ => {
+                        // 实例不在 ObjectStore 中或不是 HostValue：直接调用
+                        fn_ref.call((py_args,), None)
+                    }
+                }
+            } else {
+                // static method：直接调用，将参数元组解包为位置参数
+                fn_ref.call((py_args,), None)
+            };
+
+            let result = result
                 .map_err(|e| JniError::Internal(format!("Python method 调用失败: {e}")))?;
 
             // Python 返回值 → JValue
@@ -88,6 +129,7 @@ pub fn wrap_python_method(
 pub fn wrap_python_method_no_args(
     py_fn: Py<PyAny>,
     sig_ret: JType,
+    _objects: Arc<Mutex<ObjectStore>>,
 ) -> Arc<dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync> {
     let callable = PythonCallable { inner: py_fn };
     Arc::new(move |_args: &JniArgs| -> Result<JValue, JniError> {

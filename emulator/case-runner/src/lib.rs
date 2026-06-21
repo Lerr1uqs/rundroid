@@ -16,6 +16,7 @@
 
 pub mod artifacts;
 pub mod case;
+pub mod jni_hook;
 pub mod manifest;
 pub mod resource;
 pub mod runtime;

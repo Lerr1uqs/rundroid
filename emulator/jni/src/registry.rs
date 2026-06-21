@@ -15,7 +15,7 @@ use crate::dispatch::{MethodImpl, dispatch_call, dispatch_field_get, dispatch_fi
 use crate::error::JniError;
 use crate::field::FieldAccess;
 use crate::refs::RefTable;
-use crate::types::{ClassId, FieldSig, IdAllocator, JValue, MethodSig};
+use crate::types::{ClassId, FieldSig, IdAllocator, JValue, MethodId, MethodSig, ObjectId};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -105,6 +105,30 @@ impl JniRegistry {
     /// 查找 class 定义（可变引用）。
     pub fn find_class_mut(&mut self, name: &str) -> Option<&mut JClassDef> {
         self.classes.get_mut(name)
+    }
+
+    /// 按方法名查找所有同名方法签名（用于 GetMethodID 的重载解析）。
+    ///
+    /// 返回所有匹配名称的 `&MethodSig`（instance + static 均包含）。
+    pub fn methods_by_name<'a>(&'a self, class_name: &str, method_name: &str) -> Vec<&'a MethodSig> {
+        let cls = match self.classes.get(class_name) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        cls.find_methods_by_name(method_name)
+    }
+
+    /// 按 class 和 signature 查找 MethodId。
+    pub fn method_id(&self, class_name: &str, sig: &MethodSig) -> Option<MethodId> {
+        let cls = self.classes.get(class_name)?;
+        cls.method_id(sig)
+    }
+
+    /// 分配一个新的 ObjectId。
+    ///
+    /// 使用内部 `IdAllocator` 统一分配，确保与 class/method/field ID 不冲突。
+    pub fn allocate_object_id(&mut self) -> ObjectId {
+        self.id_alloc.object()
     }
 
     // —— 分发方法 ——

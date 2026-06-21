@@ -16,8 +16,11 @@ use crate::android_vm::AndroidVM;
 use crate::apk_context::ApkContext;
 use crate::class::JClassDef;
 use crate::error::JniError;
+use crate::object_store::ObjectStore;
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
+use crate::types::ObjectId;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // AndroidRuntime
@@ -67,6 +70,22 @@ impl AndroidRuntime {
         &mut self.vm.refs
     }
 
+    /// 获取 object store 的共享引用。
+    ///
+    /// 返回 `Arc<Mutex<ObjectStore>>` 的克隆，供闭包（如 Python shim handler、
+    /// JNI trampoline hook）捕获并共享对象池访问。
+    pub fn objects(&self) -> Arc<Mutex<ObjectStore>> {
+        Arc::clone(&self.vm.objects)
+    }
+
+    /// 分配一个新的 ObjectId。
+    ///
+    /// 使用 `JniRegistry` 内部的 `IdAllocator` 统一分配，
+    /// 确保 ObjectId 不与 class/field/method ID 冲突。
+    pub fn allocate_object_id(&mut self) -> ObjectId {
+        self.vm.classes.allocate_object_id()
+    }
+
     /// 获取 APK context（如果有）。
     pub fn apk(&self) -> Option<&ApkContext> {
         self.vm.apk.as_ref()
@@ -112,7 +131,7 @@ mod tests {
     fn new_runtime_is_empty() {
         let rt = AndroidRuntime::new();
         assert!(rt.classes().classes.is_empty());
-        assert!(rt.vm.objects.is_empty());
+        assert!(rt.vm.objects.lock().unwrap().is_empty());
         assert!(rt.apk().is_none());
     }
 
@@ -172,7 +191,7 @@ mod tests {
 
         // 创建对象
         let obj_id = ObjectId(1);
-        rt.vm.objects.insert(
+        rt.vm.objects.lock().unwrap().insert(
             obj_id,
             "java/lang/Integer".into(),
             ObjectStorage::Wrapper {
