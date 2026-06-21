@@ -1,6 +1,6 @@
-//! runtime 装配点。
+//! emulator 装配点。
 //!
-//! [`Runtime`] 是 bootstrap 主线的入口对象，它的职责刻意保持窄：
+//! [`Emulator`] 是 bootstrap 主线的入口对象，它的职责刻意保持窄：
 //! 持有 [`RuntimeConfig`](crate::config::RuntimeConfig) 并提供 session 工厂。
 //!
 //! backend / memory / telemetry router 的具体实例由后续 task 在装配阶段注入，
@@ -9,17 +9,17 @@
 use crate::config::RuntimeConfig;
 use crate::session::Session;
 
-/// runtime 实例。
-pub struct Runtime {
+/// emulator 实例。
+pub struct Emulator {
     config: RuntimeConfig,
 }
 
-impl Runtime {
+impl Emulator {
     pub fn new(config: RuntimeConfig) -> Self {
         Self { config }
     }
 
-    /// 当前 runtime 的配置（不可变视图）。
+    /// 当前 emulator 的配置（不可变视图）。
     pub fn config(&self) -> &RuntimeConfig {
         &self.config
     }

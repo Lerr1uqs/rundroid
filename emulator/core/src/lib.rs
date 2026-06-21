@@ -3,7 +3,7 @@
 //! runtime 的公共底座，bootstrap 阶段提供：
 //! - [`config::RuntimeConfig`]：跨子系统开关的唯一入口
 //! - [`ids`]：模块 / session 的稳定 ID 类型与分配器
-//! - [`runtime::Runtime`]：runtime 装配点
+//! - [`emulator::Emulator`]：emulator 装配点
 //! - [`session::Session`]：单次执行 session 边界
 //! - [`error`]：runtime 层统一 error model
 //!
@@ -15,15 +15,15 @@
 pub mod arch;
 pub mod backend;
 pub mod config;
+pub mod emulator;
 pub mod error;
 pub mod ids;
-pub mod runtime;
 pub mod session;
 
 pub use arch::Arch;
 pub use backend::BackendKind;
 pub use config::{MemoryConfig, RuntimeConfig};
+pub use emulator::Emulator;
 pub use error::{ConfigError, RuntimeError, SessionError};
 pub use ids::{IdAllocator, ModuleId, SessionId};
-pub use runtime::Runtime;
 pub use session::Session;

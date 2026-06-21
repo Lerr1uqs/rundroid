@@ -55,6 +55,8 @@ CPU ARM 这种首字母缩写的 就尽量全部大写 不要出现 `Cpu` 这种
 
 所有 ut/harness api都必须注释标注清楚 
 
+编写python的时候不要使用 Any作为typing 尽量都要使用typing作为注释
+
 # 项目管理
 rust 提供 ffi给到python 如果需要运行python 务必使用uv 管理 不要用全局python
 

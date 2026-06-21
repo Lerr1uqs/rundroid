@@ -13,12 +13,12 @@ use crate::error::MemoryError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionOrigin {
     /// ELF 镜像的某个 PT_LOAD 段。
-    ElfSegment,
+    ELFSegment,
     /// 主线程栈。
     Stack,
     /// TLS 模板区。
-    Tls,
-    /// 装载器 / runtime 自用的 scratch 区（例如 trampoline）。
+    TLS,
+    /// 装载器 / runtime 自用的 scratch 区（例如 trampoline）。 暂时的
     RuntimeScratch,
 }
 
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn register_and_find() {
         let mut t = RegionTracker::new();
-        t.register(0x1000, 0x1000, RegionOrigin::ElfSegment).unwrap();
+        t.register(0x1000, 0x1000, RegionOrigin::ELFSegment).unwrap();
         t.register(0x5000, 0x2000, RegionOrigin::Stack).unwrap();
         assert_eq!(t.len(), 2);
         assert!(t.find(0x1500).is_some());
@@ -152,7 +152,7 @@ mod tests {
         let mut t = RegionTracker::new();
         t.register(0x1000, 0x1000, RegionOrigin::Stack).unwrap();
         let err = t
-            .register(0x1500, 0x1000, RegionOrigin::Tls)
+            .register(0x1500, 0x1000, RegionOrigin::TLS)
             .unwrap_err();
         assert!(matches!(err, MemoryError::Overlap { .. }));
     }

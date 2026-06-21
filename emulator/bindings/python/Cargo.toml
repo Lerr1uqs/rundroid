@@ -23,4 +23,5 @@ rundroid-elf-parser.workspace = true
 rundroid-elf-loader.workspace = true
 rundroid-elf-linker.workspace = true
 rundroid-telemetry.workspace = true
+rundroid-jni.workspace = true
 pyo3.workspace = true

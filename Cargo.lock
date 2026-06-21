@@ -390,6 +390,7 @@ dependencies = [
  "rundroid-elf-linker",
  "rundroid-elf-loader",
  "rundroid-elf-parser",
+ "rundroid-jni",
  "rundroid-linux",
  "rundroid-memory",
  "rundroid-telemetry",
@@ -405,6 +406,7 @@ dependencies = [
  "rundroid-elf-linker",
  "rundroid-elf-loader",
  "rundroid-elf-parser",
+ "rundroid-jni",
  "rundroid-linux",
  "rundroid-memory",
  "rundroid-telemetry",
@@ -466,6 +468,15 @@ name = "rundroid-elf-parser"
 version = "0.1.0"
 dependencies = [
  "elf",
+ "thiserror",
+]
+
+[[package]]
+name = "rundroid-jni"
+version = "0.1.0"
+dependencies = [
+ "rundroid-telemetry",
+ "serde",
  "thiserror",
 ]
 

@@ -11,7 +11,7 @@
 
 import os
 import pytest
-from rundroid import Runtime, VirtFile, VirtualDevice, device, register
+from rundroid import Emulator, VirtFile, VirtualDevice, device, register
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SMOKE_SO = os.path.join(REPO_ROOT, "resources", "smoke", "build", "libsmoke.so")
@@ -26,8 +26,8 @@ def _write_path(rt, addr, path: str):
 
 @pytest.fixture
 def rt():
-    """创建 Runtime 并在测试后显式关闭，避免 Unicorn 引擎在 FFI Drop 时崩溃。"""
-    r = Runtime("arm64", "unicorn", 42)
+    """创建 Emulator 并在测试后显式关闭，避免 Unicorn 引擎在 FFI Drop 时崩溃。"""
+    r = Emulator("arm64", "unicorn", 42)
     r.load("smoke", open(SMOKE_SO, "rb").read())
     yield r
     r.close()
@@ -87,7 +87,7 @@ def test_get_random(rt):
 
 
 if __name__ == "__main__":
-    r = Runtime("arm64", "unicorn", 42)
+    r = Emulator("arm64", "unicorn", 42)
     r.load("smoke", open(SMOKE_SO, "rb").read())
     test_pure_export(r)
     test_custom_device_open_read(r)

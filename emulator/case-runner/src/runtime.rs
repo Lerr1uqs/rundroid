@@ -18,6 +18,7 @@ use rundroid_elf_loader::{
     SegmentMapSpec,
 };
 use rundroid_elf_parser::{ElfCrateParser, ElfParser, ParseInput, ParsedElf};
+use rundroid_jni::{JniRegistry, RefTable};
 use rundroid_linux::{LinuxRuntime, SyscallResult};
 use rundroid_memory::{MemoryError, RegionTracker};
 use rundroid_telemetry::{EventSink, TelemetryEvent, TelemetryEventKind, TelemetryMode, TelemetryRouter};
@@ -65,6 +66,7 @@ impl EventSink for CollectingSink {
             TelemetryEventKind::Elf => "elf",
             TelemetryEventKind::Execution => "execution",
             TelemetryEventKind::FileSystem => "filesystem",
+            TelemetryEventKind::Jni => "jni",
         };
         self.events.lock().unwrap().push(EventRecord {
             name: event.name.to_string(),
@@ -86,6 +88,10 @@ pub struct GuestRuntime {
     pub config: RuntimeConfig,
     pub graph: ModuleGraph,
     pub last_link: Option<LinkReport>,
+    /// JNI shim registry — class / method / field 注册表。
+    pub jni_registry: JniRegistry,
+    /// JNI 引用表 — handle → ObjectId 映射。
+    pub jni_refs: RefTable,
     /// reserve 游标：bump 分配镜像基址。
     reserve_cursor: u64,
     /// sentinel/stack 是否已经映射（复用避免重叠 mem_map）。
@@ -214,6 +220,8 @@ impl GuestRuntime {
             config,
             graph: ModuleGraph::new(),
             last_link: None,
+            jni_registry: JniRegistry::new(),
+            jni_refs: RefTable::new(),
             // 镜像装载起点：1 GiB 处，远离 stack/TLS 高端。
             reserve_cursor: 0x4000_0000,
             trampoline_mapped: false,
@@ -409,6 +417,38 @@ impl GuestRuntime {
             Vec::new()
         }
     }
+
+    /// 遍历所有已加载模块，查找并调用 `JNI_OnLoad`。
+    ///
+    /// 对于每个导出 `JNI_OnLoad` 符号的模块，
+    /// 记录 telemetry 事件并尝试调用。
+    ///
+    /// # foundation 阶段行为
+    ///
+    /// - 检测到 `JNI_OnLoad` 符号后发出 `jni.call` telemetry 事件
+    /// - 不实际执行 `JNI_OnLoad`（因为需要完整的 `JavaVM*` guest 函数表）
+    /// - 返回找到的 `JNI_OnLoad` 符号所在的模块列表
+    pub fn detect_jni_onload(&mut self) -> Vec<(ModuleId, String, u64)> {
+        let mut found = Vec::new();
+
+        for (&module_id, module) in &self.graph.modules {
+            if let Some(entry) = module.exports.find("JNI_OnLoad") {
+                let soname = module.name.clone();
+                found.push((module_id, soname.clone(), entry.guest_addr));
+
+                self.router.emit(&TelemetryEvent::new(
+                    "jni.call",
+                    TelemetryEventKind::Jni,
+                ));
+                self.router.emit(&TelemetryEvent::new(
+                    "jni.jni_onload_detected",
+                    TelemetryEventKind::Jni,
+                ));
+            }
+        }
+
+        found
+    }
 }
 
 struct LoadCtxAdapter<'a> {
@@ -439,7 +479,7 @@ impl<'a> LoadCtx for LoadCtxAdapter<'a> {
         self.regions.register(
             base,
             aligned,
-            rundroid_memory::RegionOrigin::ElfSegment,
+            rundroid_memory::RegionOrigin::ELFSegment,
         )?;
         *self.next_reserve = base + aligned;
         Ok(base)

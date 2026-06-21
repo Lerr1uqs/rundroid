@@ -1,23 +1,24 @@
 # rundroid bootstrap workspace
-# 顶层使用虚拟 workspace，所有 crate 都位于 runtime/ 下的语义化短名目录中。
+# 顶层使用虚拟 workspace，所有 crate 都位于 emulator/ 下的语义化短名目录中。
 # 命名约定：磁盘目录保持短名（core / elf/parser 等），Cargo package 使用 `rundroid-*` 前缀。
 
 [workspace]
 resolver = "2"
 members = [
-    "runtime/core",
-    "runtime/backends/api",
-    "runtime/backends/unicorn",
-    "runtime/memory",
-    "runtime/elf/parser",
-    "runtime/elf/loader",
-    "runtime/elf/linker",
-    "runtime/os/linux",
-    "runtime/telemetry",
-    "runtime/driver",
-    "runtime/cli",
-    "runtime/case-runner",
-    "runtime/bindings/python",
+    "emulator/core",
+    "emulator/backends/api",
+    "emulator/backends/unicorn",
+    "emulator/memory",
+    "emulator/elf/parser",
+    "emulator/elf/loader",
+    "emulator/elf/linker",
+    "emulator/os/linux",
+    "emulator/telemetry",
+    "emulator/driver",
+    "emulator/cli",
+    "emulator/case-runner",
+    "emulator/bindings/python",
+    "emulator/jni",
 ]
 
 # 所有 crate 共享以下元信息与版本，避免在每个 package 中重复声明。
@@ -32,18 +33,19 @@ authors = ["rundroid contributors"]
 # workspace 级别的公共依赖入口，子 crate 通过 `dep.workspace = true` 引用，
 # 保证版本统一、升级时只需要改一处。
 [workspace.dependencies]
-rundroid-core = { path = "runtime/core" }
-rundroid-backend = { path = "runtime/backends/api" }
-rundroid-backend-unicorn = { path = "runtime/backends/unicorn" }
-rundroid-memory = { path = "runtime/memory" }
-rundroid-elf-parser = { path = "runtime/elf/parser" }
-rundroid-elf-loader = { path = "runtime/elf/loader" }
-rundroid-elf-linker = { path = "runtime/elf/linker" }
-rundroid-linux = { path = "runtime/os/linux" }
-rundroid-telemetry = { path = "runtime/telemetry" }
-rundroid-driver = { path = "runtime/driver" }
-rundroid-case-runner = { path = "runtime/case-runner" }
-rundroid-bindings-python = { path = "runtime/bindings/python" }
+rundroid-core = { path = "emulator/core" }
+rundroid-backend = { path = "emulator/backends/api" }
+rundroid-backend-unicorn = { path = "emulator/backends/unicorn" }
+rundroid-memory = { path = "emulator/memory" }
+rundroid-elf-parser = { path = "emulator/elf/parser" }
+rundroid-elf-loader = { path = "emulator/elf/loader" }
+rundroid-elf-linker = { path = "emulator/elf/linker" }
+rundroid-linux = { path = "emulator/os/linux" }
+rundroid-telemetry = { path = "emulator/telemetry" }
+rundroid-driver = { path = "emulator/driver" }
+rundroid-case-runner = { path = "emulator/case-runner" }
+rundroid-bindings-python = { path = "emulator/bindings/python" }
+rundroid-jni = { path = "emulator/jni" }
 
 # 外部依赖（bootstrap 阶段实际用到时再开启，先占位以便后续 crate 复用版本号）。
 thiserror = "2"

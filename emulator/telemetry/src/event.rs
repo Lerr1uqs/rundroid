@@ -27,6 +27,8 @@ pub enum TelemetryEventKind {
     Execution,
     /// 文件系统与虚拟设备操作
     FileSystem,
+    /// JNI shim 注册、调用、引用管理
+    Jni,
 }
 
 impl<'a> TelemetryEvent<'a> {
