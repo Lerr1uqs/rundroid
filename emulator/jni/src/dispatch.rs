@@ -215,7 +215,7 @@ mod tests {
     use crate::args::JniArgs;
     use crate::class::JClassDef;
     use crate::field::{FieldAccess, RustFieldHandler, SharedField};
-    use crate::types::{JValue, MethodSig, JType, FieldSig};
+    use crate::types::{ClassId, FieldSig, JType, JValue, MethodSig};
     use std::sync::Arc;
 
     fn make_sig(class: &str, name: &str) -> MethodSig {
@@ -234,7 +234,7 @@ mod tests {
 
         let sig = make_sig(class_name, "getValue");
 
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_args| {
             Ok(JValue::Int(42))
         }))).unwrap();
@@ -261,7 +261,7 @@ mod tests {
         let class_name = "test/Class";
         let sig = make_sig(class_name, "foo");
 
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(1))))).unwrap();
         let result = class_def.add_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(2)))));
         assert!(result.is_err());
@@ -278,7 +278,7 @@ mod tests {
         };
 
         let field_access = FieldAccess::RustNative(Arc::new(SharedField::new(JValue::Int(100))));
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_field(field_sig.clone(), false, field_access).unwrap();
         registry.register_class(class_def).unwrap();
 
@@ -331,7 +331,7 @@ mod tests {
 
         // 4. 注册 class + field + method
         let mut registry = JniRegistry::new();
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_field(field_sig.clone(), true, field_access).unwrap();
         class_def.add_method(method_sig.clone(), true, method_impl).unwrap();
         registry.register_class(class_def).unwrap();
@@ -394,7 +394,7 @@ mod tests {
         }));
 
         let mut registry = JniRegistry::new();
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_field(field_sig.clone(), false, field_access).unwrap();
         class_def.add_method(method_sig.clone(), false, method_impl).unwrap();
         registry.register_class(class_def).unwrap();
@@ -478,7 +478,7 @@ mod tests {
 
         // 注册全部
         let mut registry = JniRegistry::new();
-        let mut class_def = JClassDef::new(class_name.into());
+        let mut class_def = JClassDef::new(ClassId(0), class_name.into());
         class_def.add_field(creator_sig.clone(), true, creator).unwrap();
         class_def.add_field(hash_sig.clone(), false, FieldAccess::RustNative(hash_val)).unwrap();
         class_def.add_method(hashcode_sig.clone(), false, hashcode_impl).unwrap();

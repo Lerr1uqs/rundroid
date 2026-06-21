@@ -30,6 +30,90 @@ impl fmt::Display for ObjectId {
 }
 
 // ============================================================================
+// ClassId / MethodId / FieldId — typed ID 体系
+// ============================================================================
+
+/// JNI class 在 Rust 侧的唯一标识。
+///
+/// `ClassId` 对应一个完整的 class definition，
+/// 是 method / field 的聚合根。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ClassId(pub u64);
+
+impl fmt::Display for ClassId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "class#{}", self.0)
+    }
+}
+
+/// JNI method 在 Rust 侧的唯一标识。
+///
+/// `MethodId` 归属于某个 `ClassId`，是 class-local ID。
+/// 不作为与 class 并列的全局顶层权威。
+/// 如果需要在全局范围引用一个 method，使用 `(ClassId, MethodId)` 二元组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct MethodId(pub u64);
+
+impl fmt::Display for MethodId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "method#{}", self.0)
+    }
+}
+
+/// JNI field 在 Rust 侧的唯一标识。
+///
+/// `FieldId` 归属于某个 `ClassId`，是 class-local ID。
+/// 不作为与 class 并列的全局顶层权威。
+/// 如果需要在全局范围引用一个 field，使用 `(ClassId, FieldId)` 二元组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FieldId(pub u64);
+
+impl fmt::Display for FieldId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "field#{}", self.0)
+    }
+}
+
+/// Typed ID 分配器。
+///
+/// 为 `ClassId` 和 `ObjectId` 分配全局唯一 ID。
+///
+/// # 注意：`MethodId` / `FieldId` 不是全局分配
+///
+/// `MethodId` 和 `FieldId` 是 class-local ID，
+/// 由 `JClassDef::add_method()` / `add_field()` 在 class 内部按插入顺序编号。
+/// 这是有意为之——method / field 不作为与 class 并列的顶层权威，
+/// 其 ID 归属 class 作用域，不需要全局唯一。
+///
+/// 如果后续需要全局 method/field 索引（如 telemetry 追踪），
+/// 可以用 `(ClassId, MethodId)` 二元组作为全局 key。
+#[derive(Debug, Default)]
+pub struct IdAllocator {
+    next: u64,
+}
+
+impl IdAllocator {
+    /// 创建新的 ID 分配器（从 1 开始）。
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    /// 分配一个全局唯一的 ClassId。
+    pub fn class(&mut self) -> ClassId {
+        let id = ClassId(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// 分配一个全局唯一的 ObjectId。
+    pub fn object(&mut self) -> ObjectId {
+        let id = ObjectId(self.next);
+        self.next += 1;
+        id
+    }
+}
+
+// ============================================================================
 // JType
 // ============================================================================
 
@@ -231,4 +315,68 @@ impl fmt::Display for FieldSig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}:{}", self.class, self.name, self.ty)
     }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // —— Typed ID 测试 ——
+
+    #[test]
+    fn typed_ids_distinct_types() {
+        // ClassId / ObjectId / MethodId / FieldId 是不同的类型，不能互相赋值
+        let c = ClassId(1);
+        let o = ObjectId(1);
+        let m = MethodId(1);
+        let f = FieldId(1);
+
+        // 同数值但不同类型，各自独立
+        assert_eq!(c.0, 1);
+        assert_eq!(o.0, 1);
+        assert_eq!(m.0, 1);
+        assert_eq!(f.0, 1);
+    }
+
+    #[test]
+    fn id_allocator_sequential() {
+        let mut alloc = IdAllocator::new();
+
+        let c1 = alloc.class();
+        let c2 = alloc.class();
+        assert_eq!(c1.0, 1);
+        assert_eq!(c2.0, 2);
+
+        let o1 = alloc.object();
+        assert_eq!(o1.0, 3);
+        assert_eq!(c1.0, 1); // ClassId 不受后续分配影响
+    }
+
+    #[test]
+    fn id_display_format() {
+        assert_eq!(format!("{}", ClassId(42)), "class#42");
+        assert_eq!(format!("{}", ObjectId(42)), "obj#42");
+        assert_eq!(format!("{}", MethodId(42)), "method#42");
+        assert_eq!(format!("{}", FieldId(42)), "field#42");
+    }
+
+    #[test]
+    fn typed_ids_eq_and_hash() {
+        let a = ClassId(1);
+        let b = ClassId(1);
+        let c = ClassId(2);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+
+        // 可用作 HashMap key
+        let mut map: std::collections::HashMap<ClassId, &str> = std::collections::HashMap::new();
+        map.insert(a, "hello");
+        assert_eq!(map.get(&b), Some(&"hello"));
+    }
+
 }

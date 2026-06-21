@@ -428,6 +428,7 @@ dependencies = [
 name = "rundroid-core"
 version = "0.1.0"
 dependencies = [
+ "rundroid-jni",
  "rundroid-telemetry",
  "thiserror",
 ]

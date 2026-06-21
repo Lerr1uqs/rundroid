@@ -15,7 +15,7 @@ use crate::dispatch::{MethodImpl, dispatch_call, dispatch_field_get, dispatch_fi
 use crate::error::JniError;
 use crate::field::FieldAccess;
 use crate::refs::RefTable;
-use crate::types::{FieldSig, JValue, MethodSig};
+use crate::types::{ClassId, FieldSig, IdAllocator, JValue, MethodSig};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -25,11 +25,18 @@ use std::collections::HashMap;
 /// JNI class / method / field 注册表。
 ///
 /// 注册表不直接接触 backend，只存储元数据和方法实现指针。
-/// 所有 guest 可见的对象状态通过 `RefTable` 和 `JavaObject` 管理。
-#[derive(Default)]
+/// 所有 guest 可见的对象状态通过 `RefTable` 和 `ObjectStore` 管理。
+///
+/// # ID 分配
+///
+/// `JniRegistry` 内部持有 `IdAllocator`，在 `register_class` 时
+/// 自动为 `JClassDef` 分配 `ClassId`（如果尚未分配）。
+#[derive(Debug, Default)]
 pub struct JniRegistry {
     /// 已注册的 class 定义，key 为 slash-separated class name。
     pub classes: HashMap<String, JClassDef>,
+    /// ID 分配器（class/object/method/field 统一分配）。
+    id_alloc: IdAllocator,
 }
 
 impl JniRegistry {
@@ -37,6 +44,7 @@ impl JniRegistry {
     pub fn new() -> Self {
         Self {
             classes: HashMap::new(),
+            id_alloc: IdAllocator::new(),
         }
     }
 
@@ -44,11 +52,16 @@ impl JniRegistry {
 
     /// 注册一个完整的 class 定义。
     ///
+    /// 如果 class 的 `id` 为默认值（`ClassId(0)`），则自动分配新 ID。
     /// 如果 class 已存在则返回 `DuplicateRegistration` 错误。
-    pub fn register_class(&mut self, def: JClassDef) -> Result<(), JniError> {
+    pub fn register_class(&mut self, mut def: JClassDef) -> Result<(), JniError> {
         let name = def.name.clone();
         if self.classes.contains_key(&name) {
             return Err(JniError::DuplicateRegistration(format!("class: {name}")));
+        }
+        // 自动分配 ClassId（如果尚未分配）
+        if def.id == ClassId(0) {
+            def.id = self.id_alloc.class();
         }
         self.classes.insert(name, def);
         Ok(())

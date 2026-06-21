@@ -419,7 +419,7 @@ impl PyEmulator {
         // 保存 Python class 类型引用
         self.class_types.insert(class_name.clone(), cls.clone().unbind());
 
-        let mut class_def = rundroid_jni::JClassDef::new(class_name.clone());
+        let mut class_def = rundroid_jni::JClassDef::new(rundroid_jni::ClassId(0), class_name.clone());
 
         // —— 注册 methods ——
         let methods = cls.getattr("__java_methods__")

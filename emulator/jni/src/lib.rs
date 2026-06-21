@@ -3,15 +3,21 @@
 //! JNI shim foundation — Rust 持有 JNI 核心状态与分派权威，
 //! Python 通过 decorator 声明 class / method / field shim。
 //!
-//! 当前阶段（foundation）提供：
-//! - [`types`]：canonical `JType` / `JValue` / `MethodSig` / `FieldSig` 类型模型
+//! 当前阶段提供：
+//! - [`types`]：canonical `JType` / `JValue` / `MethodSig` / `FieldSig` 类型模型，
+//!   以及 `ClassId` / `ObjectId` / `MethodId` / `FieldId` typed ID 体系
 //! - [`descriptor`]：method / field descriptor 解析器（`MethodSig::parse` / `FieldSig::parse`）
 //! - [`args`]：类型化 JNI 参数获取器
-//! - [`object`] / [`refs`]：最小对象模型和引用表
+//! - [`object`] / [`object_store`]：分层对象模型（string / wrapper / array / stub instance）
+//! - [`refs`]：引用表，显式区分 local / global / weak 生命周期
 //! - [`registry`]：class / method / field registry，collision fail-fast
 //! - [`dispatch`]：统一 Rust-native / Python-shim 分发
 //! - [`verify`]：Python 注解与 Java descriptor 严格匹配校验
 //! - [`jnienv`] / [`javavm`]：最小 `JNIEnv` / `JavaVM` surface
+//! - [`exception`]：异常状态（pending throwable）
+//! - [`apk_context`]：APK context（package / version / manifest / signatures / assets）
+//! - [`android_vm`]：`AndroidVM` — class / object / ref / exception / apk 聚合根
+//! - [`android_runtime`]：`AndroidRuntime` — Emulator 持有的高级整合点
 //!
 //! # 设计原则
 //!
@@ -19,35 +25,48 @@
 //! - 新增 class / method 不需要编辑中心化 switch-case
 //! - registry collision 立即失败，不静默覆盖
 //! - 类型不匹配在注册阶段尽早失败（fail-fast）
+//! - class 是 method / field 的聚合根，不建立独立 authority 的全局 method/field registry
 
 #![forbid(unsafe_code)]
 
+pub mod android_runtime;
+pub mod android_vm;
+pub mod apk_context;
 pub mod args;
 pub mod class;
 pub mod descriptor;
 pub mod dispatch;
 pub mod error;
+pub mod exception;
 pub mod field;
 pub mod javavm;
 pub mod jnienv;
 pub mod object;
+pub mod object_store;
 pub mod refs;
 pub mod registry;
 pub mod types;
 pub mod verify;
 
+pub use android_runtime::AndroidRuntime;
+pub use android_vm::AndroidVM;
+pub use apk_context::{ApkContext, SignatureData};
 pub use args::JniArgs;
-pub use class::{ClassBuilder, JClassDef};
+pub use class::{ClassBuilder, ClassKind, JClassDef, JFieldDef, JMethodDef};
 pub use dispatch::MethodImpl;
 pub use error::JniError;
+pub use exception::{ExceptionRecord, ExceptionState};
 pub use field::{FieldAccess, RustFieldHandler, SharedField};
 pub use javavm::JavaVMSurface;
 pub use jnienv::JniEnvSurface;
-pub use object::JavaObject;
+pub use object::{
+    JavaObject, make_host_value, make_object_array, make_primitive_array,
+    make_string, make_stub, make_wrapper,
+};
+pub use object_store::{ObjectStorage, ObjectStore, ObjectStoreError};
 pub use refs::{RefKind, RefTable};
 pub use registry::JniRegistry;
-pub use types::{FieldSig, JType, JValue, MethodSig, ObjectId};
-pub use verify::PythonCallableAnnotations;
+pub use types::{ClassId, FieldId, FieldSig, IdAllocator, JType, JValue, MethodId, MethodSig, ObjectId};
 
 /// Rust-native method handler 类型别名。
 pub type RustMethodHandler = dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync;

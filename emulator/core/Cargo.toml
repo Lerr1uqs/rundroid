@@ -9,5 +9,6 @@ authors.workspace = true
 description = "rundroid runtime 核心：config / ids / runtime / session / error model"
 
 [dependencies]
+rundroid-jni.workspace = true
 rundroid-telemetry.workspace = true
 thiserror.workspace = true

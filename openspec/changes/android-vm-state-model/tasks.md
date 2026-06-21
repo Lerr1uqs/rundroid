@@ -1,14 +1,14 @@
-- [ ] 新增 `android-vm-model` capability 的正式 spec
-- [ ] 在 `emulator/jni` 中定义 `ClassId`、`ObjectId`、`MethodId`、`FieldId`
-- [ ] 实现 class-centric `JClassDef` 数据结构，覆盖 superclass / interfaces / class kind / name caches
-- [ ] 实现 `JObject` 与 `ObjectStorage`，覆盖 string / wrapper / primitive array / object array / stub instance
-- [ ] 在 `JClassDef` 内建立 instance/static method table 与 instance/static field table
-- [ ] 如需加速查找，仅实现从 descriptor 到 class member 的索引视图，不建立独立 authority 的全局 method/field registry
-- [ ] 实现 `RefTable`，覆盖 local/global/weak refs 与 frame cleanup
-- [ ] 实现 `ExceptionState`，覆盖 pending throwable 的最小语义
-- [ ] 实现 `ApkContext`，覆盖 package/version/manifest/signatures/assets
-- [ ] 在 `Emulator` / `AndroidRuntime` 中接入 `AndroidVM` 所有权模型
-- [ ] 明确 Python `@java_class` / `@java_method` / `register(...)` 到 Rust `JClassDef` 的同步路径
-- [ ] 增加 unit tests：class hierarchy、ref semantics、array storage、exception state
-- [ ] 增加 harness case：APK context 对 framework 读取可见
+- [x] 新增 `android-vm-model` capability 的正式 spec
+- [x] 在 `emulator/jni` 中定义 `ClassId`、`ObjectId`、`MethodId`、`FieldId`
+- [x] 实现 class-centric `JClassDef` 数据结构，覆盖 superclass / interfaces / class kind / name caches
+- [x] 实现 `JObject` 与 `ObjectStorage`，覆盖 string / wrapper / primitive array / object array / stub instance
+- [x] 在 `JClassDef` 内建立 instance/static method table 与 instance/static field table
+- [x] 如需加速查找，仅实现从 descriptor 到 class member 的索引视图，不建立独立 authority 的全局 method/field registry
+- [x] 实现 `RefTable`，覆盖 local/global/weak refs 与 frame cleanup
+- [x] 实现 `ExceptionState`，覆盖 pending throwable 的最小语义
+- [x] 实现 `ApkContext`，覆盖 package/version/manifest/signatures/assets
+- [x] 在 `Emulator` / `AndroidRuntime` 中接入 `AndroidVM` 所有权模型
+- [x] 明确 Python `@java_class` / `@java_method` / `register(...)` 到 Rust `JClassDef` 的同步路径
+- [x] 增加 unit tests：class hierarchy、ref semantics、array storage、exception state
+- [x] 增加 harness case：APK context 对 framework 读取可见
 - [ ] 使用 `openspec validate --type change android-vm-state-model --strict` 验证 change
