@@ -49,9 +49,9 @@ unidbg resources里面有一些可以用于验证的prebuild库
 不要写大量的兜底策略 let-it-failed 方便调试 对于没覆盖没要求到的case直接丢出异常即可
 
 尽量不要这么写： `fn build_exports(image: &ParsedElf, load_bias: u64) -> ExportTable` 不是很面向对象
-最好是 `ExportTable::build(...)` 或者 `ExportTableBuilder(...).set(...).add(...).build(...)`
+最好是 `ExportTable::build(...)` 或者 `ExportTableBuilder(...).set(...).add(...).build(...)` 链式风格
 
-CPU ARM 这种首字母缩写的 就尽量全部大写 不要出现 `Cpu` 这种形式
+CPU ARM 这种首字母缩写的 就尽量全部大写 不要出现 `Cpu` 这种形式 使用 `CPU` `JNI` `ARM` `VMP` 之类的大写缩写更舒服
 
 所有 ut/harness api都必须注释标注清楚 
 

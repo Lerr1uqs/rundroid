@@ -11,6 +11,8 @@
 //! 以下 `unsafe impl Send/Sync` 的前提是：PyEmulator 仅在 Python GIL 线程中访问，
 //! 不会跨线程共享 engine 引用。所有 engine 操作都在 Python 方法调用上下文中执行。
 
+mod javashim;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple, PyType};
 use pyo3::IntoPyObjectExt;
@@ -29,15 +31,16 @@ use rundroid_elf_linker::{
     DefaultLinker, LinkContext, ModuleGraph, RelocationPatch, ResolvedSymbol, SymbolQuery,
 };
 use rundroid_jni::{
+    AndroidRuntime,
+    ClassId,
     FieldAccess,
     FieldSig,
     JniArgs,
     JniError,
-    JniRegistry,
     JValue,
     MethodImpl,
     MethodSig,
-    RefTable,
+    PythonCallableAnnotations,
     SharedField,
 };
 use rundroid_linux::{LinuxRuntime, SyscallResult};
@@ -202,26 +205,31 @@ impl Drop for EngineHolder {
 
 /// Emulator 是 rundroid 的 Python 侧主入口对象。
 ///
-/// 它装配 Unicorn 引擎、Linux syscall runtime、ELF 模块图和 JNI shim registry，
+/// 它装配 Unicorn 引擎、Linux syscall runtime、ELF 模块图和 Android runtime，
 /// 为 Python 脚本层提供完整的 Android Native 执行环境。
+///
+/// # JNI 权威归属
+///
+/// class / method / field 的最终权威存储在 `runtime: AndroidRuntime` 中。
+/// Python `register()` 和 Rust builtin 都进入同一套 [`AndroidRuntime`]。
+///
+/// 以下字段仅为 **binding adapter cache**，不是 authority：
+/// - `class_types` — 仅用于 `new_java_instance` 实例化 Python shim
+/// - `method_names` — 仅用于 Python override 优先分派路径
+/// - `java_instances` — 仅用于 handle → Python 对象映射
 #[pyclass(name = "Emulator")]
 struct PyEmulator {
     engine: EngineHolder,
     linux: Arc<Mutex<LinuxRuntime>>,
     graph: ModuleGraph,
     trampoline_mapped: bool,
-    /// JNI shim registry — class / method / field 注册表。
-    jni_registry: JniRegistry,
-    /// JNI 引用表 — handle → ObjectId。
-    jni_refs: RefTable,
-    /// Java 实例表：handle → Python 对象。
-    /// 当 Python 侧 new_java_instance() 时创建，release_java_instance() 时清除。
+    /// Android Runtime — class / method / field / object 的 canonical authority。
+    runtime: AndroidRuntime,
+    /// Java 实例表：handle → Python 对象（adapter cache，非 authority）。
     java_instances: HashMap<u32, Py<PyAny>>,
-    /// 已注册的 Python class 类型：class_name → PyType，供 new_java_instance 实例化。
+    /// 已注册的 Python class 类型：class_name → PyType（adapter cache，非 authority）。
     class_types: HashMap<String, Py<PyType>>,
-    /// 方法名映射：(class_name, java_method_name) → python_method_name。
-    /// 因为 descriptor 中的 Java method 名（如 "Signature"）可能与
-    /// Python 方法名（如 "signature_init"）不同。
+    /// 方法名映射：(class_name, java_method_name) → python_method_name（adapter cache，非 authority）。
     method_names: HashMap<(String, String), String>,
     /// 下一个实例 handle。
     next_instance_handle: u32,
@@ -269,8 +277,7 @@ impl PyEmulator {
             linux,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
-            jni_registry: JniRegistry::new(),
-            jni_refs: RefTable::new(),
+            runtime: AndroidRuntime::new(),
             java_instances: HashMap::new(),
             class_types: HashMap::new(),
             method_names: HashMap::new(),
@@ -404,8 +411,21 @@ impl PyEmulator {
     /// 注册 Java shim class 的 method 和 field。
     ///
     /// 读取 class 上的 metadata 属性（`__java_class_name__`、`__java_methods__`、
-    /// `__java_static_fields__`），解析 descriptor 并注册到 JNI registry。
-    /// 同时保存 Python class 引用，供后续 `new_java_instance` 实例化。
+    /// `__java_static_fields__`），解析 descriptor，提取 Python 类型注解，
+    /// 做 strict verify，然后将 method/field 注册到 AndroidRuntime。
+    ///
+    /// # 注册流程
+    ///
+    /// 1. 读取 `__java_class_name__`
+    /// 2. 遍历 `__java_methods__`，对每个 method：
+    ///    a. 解析 descriptor → MethodSig
+    ///    b. 从 Python 函数提取 type annotations → PythonCallableAnnotations
+    ///    c. verify annotations vs descriptor（不匹配则 fail-fast）
+    ///    d. 用 `javashim::wrap_python_method` 创建真实 handler
+    ///    e. 注册到 class_def
+    /// 3. 遍历 `__java_static_fields__`，解析并注册 field
+    /// 4. 通过 `register_or_merge_class` 注册到 AndroidRuntime
+    ///    （若 class 已存在则 merge：Python override 替换已有，未覆盖部分保留）
     fn register_java_class(&mut self, cls: &Bound<'_, PyType>) -> PyResult<()> {
         let class_name: String = cls.getattr("__java_class_name__")
             .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -416,10 +436,10 @@ impl PyEmulator {
                 format!("__java_class_name__ 不是有效的字符串: {e}")
             ))?;
 
-        // 保存 Python class 类型引用
+        // 保存 Python class 类型引用（adapter cache）
         self.class_types.insert(class_name.clone(), cls.clone().unbind());
 
-        let mut class_def = rundroid_jni::JClassDef::new(rundroid_jni::ClassId(0), class_name.clone());
+        let mut class_def = rundroid_jni::JClassDef::new(ClassId(0), class_name.clone());
 
         // —— 注册 methods ——
         let methods = cls.getattr("__java_methods__")
@@ -429,7 +449,7 @@ impl PyEmulator {
         let len = methods.len()? as usize;
         for i in 0..len {
             let item = methods.get_item(i)?;
-            // Python tuple: (name, desc, func, is_static)
+            // Python tuple: (python_name, descriptor, py_fn, is_static)
             let method_name: String = item.get_item(0)?.extract()
                 .map_err(|e: PyErr| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                     format!("无法提取 method name: {e}")
@@ -438,13 +458,10 @@ impl PyEmulator {
                 .map_err(|e: PyErr| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                     format!("无法提取 method descriptor: {e}")
                 ))?;
-            let _py_fn_obj = item.get_item(2)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!("无法提取 method 函数: {e}")
-                ))?;
+            let py_fn_obj: Py<PyAny> = item.get_item(2)?.into();
             let is_static: bool = item.get_item(3)?
                 .extract()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                .map_err(|e: PyErr| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
                     format!("无法提取 is_static: {e}")
                 ))?;
 
@@ -456,18 +473,56 @@ impl PyEmulator {
                 sig.class = class_name.clone();
             }
 
-            // 保存 Java method 名 → Python method 名的映射
+            // —— 严格校验：Python 注解 vs Java descriptor ——
+            // 从 Python 函数提取 return type 和 param type 的 JNI descriptor
+            Python::with_gil(|py| {
+                let verify_module = PyModule::import(py, "rundroid.javashim.verify")
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyImportError, _>(
+                        format!("无法导入 verify 模块: {e}")
+                    ))?;
+
+                let ret_jni_raw: Option<String> = verify_module
+                    .call_method1("get_return_type_jni", (py_fn_obj.clone_ref(py),))
+                    .ok()
+                    .and_then(|r| r.extract::<Option<String>>().ok().flatten());
+
+                let param_jni_raw: Vec<String> = verify_module
+                    .call_method1("get_param_types_jni", (py_fn_obj.clone_ref(py),))
+                    .ok()
+                    .and_then(|r| r.extract::<Vec<String>>().ok())
+                    .unwrap_or_default();
+
+                // 如果 Python 函数有 type hint，做 strict verify
+                if let Some(ret_str) = ret_jni_raw {
+                    if !ret_str.is_empty() {
+                        // 解析 JNI descriptor → JType
+                        let ret_type = parse_jtype_from_descriptor(&ret_str)
+                            .unwrap_or_else(|| sig.ret.clone());
+                        let param_types: Vec<rundroid_jni::JType> = param_jni_raw.iter()
+                            .filter_map(|s| parse_jtype_from_descriptor(s))
+                            .collect();
+
+                        let annotations = PythonCallableAnnotations::new(ret_type, param_types);
+                        annotations.verify(&sig)
+                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                                format!("注解校验失败: class=`{}`, member=`{}`, {e}",
+                                    class_name, sig.name)
+                            ))?;
+                    }
+                }
+
+                Ok::<_, PyErr>(())
+            })?;
+
+            // 保存 Java method 名 → Python method 名的映射（adapter cache）
             self.method_names.insert(
                 (class_name.clone(), sig.name.clone()),
                 method_name.clone(),
             );
 
-            // 实际的 method 分派通过 call_java_method() 直接 Python→Python，
-            // Rust registry 只做签名记录占位。此处注册一个空 handler。
-            let real_handler: Arc<dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync> =
-                Arc::new(move |_args: &JniArgs| -> Result<JValue, JniError> {
-                    Ok(JValue::Void)
-                });
+            // 用 javashim bridge 创建真实 handler（带运行时返回值校验）
+            let sig_ret = sig.ret.clone();
+            let real_handler = javashim::wrap_python_method(py_fn_obj, sig_ret);
 
             class_def.add_method(sig, is_static, MethodImpl::RustNative(real_handler))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -519,7 +574,8 @@ impl PyEmulator {
                 ))?;
         }
 
-        self.jni_registry.register_class(class_def)
+        // 注册到 AndroidRuntime（若 class 已存在则 merge）
+        self.runtime.classes_mut().register_or_merge_class(class_def)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("class 注册失败: {e}")
             ))?;
@@ -576,12 +632,17 @@ impl PyEmulator {
 
     /// 调用已注册 Java 实例的方法。
     ///
-    /// 参数：
-    /// - `handle`: `new_java_instance` 返回的实例句柄（0 表示 static method）
-    /// - `method_desc`: method descriptor（如 `"hashCode()I"` 或 `"Signature([B)V"`）
-    /// - `args`: Python tuple 参数列表
+    /// # 查找优先级
     ///
-    /// 方法通过 Python 直接分派到实例上，绕过 Rust registry dispatch。
+    /// 1. **Python override** — 检查 `method_names` adapter cache，
+    ///    如果找到则直接 Python→Python 分派（最高优先级）
+    /// 2. **Rust framework stub** — 通过 `runtime.classes().dispatch_call()`
+    ///    走 Rust registry dispatch（回落路径）
+    ///
+    /// 参数：
+    /// - `handle`: `new_java_instance` 返回的实例句柄
+    /// - `method_desc`: method descriptor（如 `"hashCode()I"`）
+    /// - `args`: Python tuple 参数列表
     #[pyo3(signature = (handle, method_desc, args))]
     fn call_java_method(
         &self,
@@ -593,66 +654,141 @@ impl PyEmulator {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("method descriptor 解析失败: {e}")
             ))?;
-        let java_name = sig.name;
+        let java_name = sig.name.clone();
 
-        // 查找实例所属的 class（从对象的 class name 推导）
-        // 简单实现：遍历 class_types 找到第一个 class
-        // 实际上应该从实例本身获取 class name，这里用 descriptor 中的 class
+        // 确定 class name：优先从 descriptor，其次从 method_names（Python），最后扫 registry（framework stub）
         let class_name = if !sig.class.is_empty() {
             sig.class.clone()
+        } else if let Some(((cn, _), _)) = self.method_names.iter()
+            .find(|((_cn, jn), _)| jn == &java_name)
+        {
+            cn.clone()
         } else {
-            // 从 method_names 反查
-            self.method_names.iter()
-                .find(|((_cn, jn), _)| jn == &java_name)
-                .map(|((cn, _), _)| cn.clone())
+            // 扫描 Rust registry 查找包含该 method 的 class
+            self.runtime.classes().classes.iter()
+                .find(|(_, cls)| {
+                    cls.find_methods_by_name(&java_name).iter().any(|s| s.name == java_name)
+                })
+                .map(|(cn, _)| cn.clone())
                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("无法找到 Java method `{java_name}` 的注册 class")
                 ))?
         };
+
         let lookup_key = (class_name.clone(), java_name.clone());
-        let method_name = self.method_names.get(&lookup_key)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("method `{java_name}` 在 class `{class_name}` 中未注册")
+
+        // —— 优先级 1: Python override（直接 Python→Python 分派）——
+        if let Some(python_method_name) = self.method_names.get(&lookup_key) {
+            let instance = self.java_instances.get(&handle)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("实例 handle {handle} 不存在")
+                ))?;
+
+            // 在 with_gil 内完成调用 + 返回值校验
+            let sig_ret = sig.ret.clone();
+            let result = Python::with_gil(|py| {
+                let bound = instance.bind(py);
+                let call_result = match args.len() {
+                    0 => bound.call_method0(python_method_name),
+                    1 => {
+                        let a0 = args.get_item(0)?;
+                        bound.call_method1(python_method_name, (a0,))
+                    }
+                    _ => bound.call_method(python_method_name, args, None),
+                };
+
+                let ret_obj = call_result
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("method `{python_method_name}` 调用失败: {e}")
+                    ))?;
+
+                // 运行时返回值校验（在 GIL 内完成）
+                let jval = javashim::py_object_to_jvalue(&ret_obj)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e))?;
+                if let Err(e) = javashim::validate_return_value(&jval, &sig_ret) {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        format!("返回值类型校验失败: {e}")
+                    ));
+                }
+
+                Ok::<PyObject, PyErr>(ret_obj.into())
+            })?;
+
+            return Ok(result);
+        }
+
+        // —— 优先级 2: Rust framework stub（走 Rust registry dispatch）——
+        // 确保 sig.class 已填充（dispatch 需要）
+        let mut dispatch_sig = sig.clone();
+        if dispatch_sig.class.is_empty() {
+            dispatch_sig.class = class_name.clone();
+        }
+        // 将 Python args 转换为 JniArgs
+        let jni_args = convert_pyargs_to_jniargs(args)?;
+        // 创建临时 RefTable（dispatch 不需要真实 ref 表，仅满足 API 签名）
+        let mut temp_refs = rundroid_jni::RefTable::new();
+        let result = self.runtime.classes().dispatch_call(&dispatch_sig, &jni_args, &mut temp_refs)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("method `{java_name}` 在 class `{class_name}` 中分派失败: {e}")
             ))?;
 
-        // 查找实例
-        let instance = self.java_instances.get(&handle)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("实例 handle {handle} 不存在")
-            ))?;
+        jvalue_to_pyobject(Ok(result))
+    }
 
-        // 将 PyTuple args 转换为 Python 参数格式
-        Python::with_gil(|py| {
-            // 构造调用参数：(self,) + args
-            let bound = instance.bind(py);
-            match args.len() {
-                0 => {
-                    bound.call_method0(&method_name)
-                        .map(|r| r.into())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            format!("method `{method_name}` 调用失败: {e}")
-                        ))
-                }
-                1 => {
-                    let a0 = args.get_item(0)?;
-                    bound.call_method1(&method_name, (a0,))
-                        .map(|r| r.into())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            format!("method `{method_name}` 调用失败: {e}")
-                        ))
-                }
-                _ => {
-                    bound.call_method(&method_name, args, None)
-                        .map(|r| r.into())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            format!("method `{method_name}` 调用失败: {e}")
-                        ))
-                }
+    /// 注册一个 framework stub class（纯 Rust-native handler）。
+    ///
+    /// 用于 test harness 模拟 Rust builtin class 注册，
+    /// 后续 Python shim 可以通过 `register_or_merge_class` 覆盖其 method/field。
+    #[pyo3(signature = (class_name, methods))]
+    fn register_framework_stub(
+        &mut self,
+        class_name: &str,
+        methods: &Bound<'_, pyo3::types::PyDict>,
+    ) -> PyResult<()> {
+        let mut class_def = rundroid_jni::JClassDef::new(ClassId(0), class_name.to_string());
+
+        for (key, val) in methods.iter() {
+            let desc: String = key.extract()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("method key 必须是字符串: {e}")
+                ))?;
+            let ret_val: i32 = val.extract()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    format!("method value 必须是 int: {e}")
+                ))?;
+
+            let mut sig = MethodSig::parse(&desc)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("descriptor 解析失败: {e}")
+                ))?;
+            if sig.class.is_empty() {
+                sig.class = class_name.to_string();
             }
-        })
+
+            let handler: Arc<dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync> =
+                Arc::new(move |_args: &JniArgs| -> Result<JValue, JniError> {
+                    Ok(JValue::Int(ret_val))
+                });
+
+            class_def.add_method(sig, false, MethodImpl::RustNative(handler))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("framework stub method 注册失败: {e}")
+                ))?;
+        }
+
+        self.runtime.classes_mut().register_class(class_def)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("framework stub class 注册失败: {e}")
+            ))?;
+
+        Ok(())
     }
 
     /// 读取已注册的 static field 值。
+    ///
+    /// 优先从 Rust registry（runtime.classes()）读取。
+    /// 因为 `read_instance_field` 走 Python 实例直接读取，
+    /// 本方法只在没有 Python shim 实例时使用。
     #[pyo3(signature = (class_name, field_desc))]
     fn read_java_field(&self, class_name: &str, field_desc: &str) -> PyResult<PyObject> {
         let mut sig = FieldSig::parse(field_desc)
@@ -663,8 +799,8 @@ impl PyEmulator {
             sig.class = class_name.to_string();
         }
 
-        let result = self.jni_registry.dispatch_static_field_get(&sig)
-            .or_else(|_| self.jni_registry.dispatch_field_get(&sig));
+        let result = self.runtime.classes().dispatch_static_field_get(&sig)
+            .or_else(|_| self.runtime.classes().dispatch_field_get(&sig));
 
         jvalue_to_pyobject(result)
     }
@@ -683,6 +819,61 @@ impl PyEmulator {
                     format!("读取实例 field `{field_name}` 失败: {e}")
                 ))
         })
+    }
+}
+
+/// 将 Python tuple 参数转换为 [`JniArgs`]，用于 Rust registry dispatch。
+fn convert_pyargs_to_jniargs(args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<JniArgs> {
+    let mut values: Vec<JValue> = Vec::new();
+    for item in args.iter() {
+        if item.is_none() {
+            values.push(JValue::Null);
+        } else if let Ok(i) = item.extract::<i32>() {
+            values.push(JValue::Int(i));
+        } else if let Ok(l) = item.extract::<i64>() {
+            values.push(JValue::Long(l));
+        } else if let Ok(b) = item.extract::<bool>() {
+            values.push(JValue::Boolean(b));
+        } else if let Ok(f) = item.extract::<f64>() {
+            values.push(JValue::Double(f));
+        } else if let Ok(_s) = item.extract::<Vec<u8>>() {
+            // bytes → null 占位（暂不支持 ObjectId）
+            values.push(JValue::Null);
+        } else {
+            values.push(JValue::Null);
+        }
+    }
+    Ok(JniArgs::from_vec(values))
+}
+
+/// 将简单的 JNI descriptor 字符串解析为 [`JType`]。
+///
+/// 用于将 Python verify.py 返回的单字符 descriptor（如 `"I"`、`"V"`）
+/// 或简单对象类型（如 `"Ljava/lang/String;"`）转换为 JType。
+/// 只处理单层类型，不支持嵌套数组。
+fn parse_jtype_from_descriptor(desc: &str) -> Option<rundroid_jni::JType> {
+    if desc.is_empty() { return None; }
+    match desc.chars().next().unwrap() {
+        'V' => Some(rundroid_jni::JType::Void),
+        'Z' => Some(rundroid_jni::JType::Boolean),
+        'B' => Some(rundroid_jni::JType::Byte),
+        'C' => Some(rundroid_jni::JType::Char),
+        'S' => Some(rundroid_jni::JType::Short),
+        'I' => Some(rundroid_jni::JType::Int),
+        'J' => Some(rundroid_jni::JType::Long),
+        'F' => Some(rundroid_jni::JType::Float),
+        'D' => Some(rundroid_jni::JType::Double),
+        'L' => {
+            let semi = desc.find(';')?;
+            let class_name = &desc[1..semi];
+            if class_name.is_empty() { return None; }
+            Some(rundroid_jni::JType::Object(class_name.to_string()))
+        }
+        '[' => {
+            let inner = parse_jtype_from_descriptor(&desc[1..])?;
+            Some(rundroid_jni::JType::Array(Box::new(inner)))
+        }
+        _ => None,
     }
 }
 

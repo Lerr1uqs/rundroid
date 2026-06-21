@@ -1,11 +1,11 @@
-- [ ] 新增 `python-javashim` capability 的正式 spec
-- [ ] 在 `python/rundroid/javashim` 中实现 metadata-only decorators
-- [ ] 在 `emulator/bindings/python/javashim.rs` 中实现显式注册桥
-- [ ] 明确桥接输出为 class-centric `JClassDef`，而不是分裂式全局 method/field 注册
-- [ ] 重构 `PyEmulator` 中的 `class_types` / `method_names` / `java_instances`：移出主状态，删除或降级为 binding adapter cache
-- [ ] 固定 Python override > Rust framework stub > fail-fast unsupported 的优先级
-- [ ] 增加 descriptor/annotation 严格校验
-- [ ] 增加调用返回值验证
-- [ ] 增加 harness case：Python override 覆盖 framework stub
-- [ ] 增加 harness case：错误注解在注册阶段失败
-- [ ] 使用 `openspec validate --type change python-javashim-overrides --strict` 验证 change
+- [x] 新增 `python-javashim` capability 的正式 spec
+- [x] 在 `python/rundroid/javashim` 中实现 metadata-only decorators
+- [x] 在 `emulator/bindings/python/javashim.rs` 中实现显式注册桥
+- [x] 明确桥接输出为 class-centric `JClassDef`，而不是分裂式全局 method/field 注册
+- [x] 重构 `PyEmulator` 中的 `class_types` / `method_names` / `java_instances`：移出主状态，删除或降级为 binding adapter cache
+- [x] 固定 Python override > Rust framework stub > fail-fast unsupported 的优先级
+- [x] 增加 descriptor/annotation 严格校验
+- [x] 增加调用返回值验证
+- [x] 增加 harness case：Python override 覆盖 framework stub
+- [x] 增加 harness case：错误注解在注册阶段失败
+- [x] 使用 `openspec validate --type change python-javashim-overrides --strict` 验证 change

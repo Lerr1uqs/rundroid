@@ -55,14 +55,14 @@ pub enum ObjectStorage {
     /// 例如 `Signature`、`PackageInfo` 等 framework class 的实例。
     StubInstance {
         /// Rust 侧持有的任意数据。
-        data: Box<dyn Any + Send>,
+        data: Box<dyn Any + Send + Sync>,
     },
 
     /// 通用 host 侧值——主要用于 Python shim 提供的对象。
     /// 仅在 Rust 侧不需要理解内部结构时使用。
     HostValue {
         /// host 侧持有的任意数据。
-        data: Box<dyn Any + Send>,
+        data: Box<dyn Any + Send + Sync>,
     },
 }
 

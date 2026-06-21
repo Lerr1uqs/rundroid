@@ -176,6 +176,47 @@ impl JClassDef {
         Ok(())
     }
 
+    /// 插入或替换 method（override 语义）。
+    ///
+    /// 与 [`add_method`](Self::add_method) 不同，此方法在签名冲突时
+    /// **替换**已有实现而不返回错误。用于 Python shim override Rust framework stub。
+    /// 同时维护 `method_index` 和 `method_name_cache`。
+    pub fn override_method(&mut self, sig: MethodSig, is_static: bool, imp: MethodImpl) -> Result<(), JniError> {
+        let target = if is_static { &mut self.static_methods } else { &mut self.methods };
+        // 维护索引：只在首次出现时分配新 MethodId
+        let method_id = match self.method_index.get(&sig) {
+            Some(id) => *id,
+            None => {
+                let id = MethodId(self.method_index.len() as u64 + 1);
+                self.method_index.insert(sig.clone(), id);
+                self.method_name_cache
+                    .entry(sig.name.clone())
+                    .or_default()
+                    .push(sig.clone());
+                id
+            }
+        };
+        let def = JMethodDef { id: method_id, sig: sig.clone(), is_static, imp };
+        target.insert(sig, def);
+        Ok(())
+    }
+
+    /// 插入或替换 field（override 语义）。
+    ///
+    /// 与 [`add_field`](Self::add_field) 不同，此方法在签名冲突时
+    /// **替换**已有实现而不返回错误。用于 Python shim override Rust framework stub。
+    pub fn override_field(
+        &mut self,
+        sig: FieldSig,
+        is_static: bool,
+        access: FieldAccess,
+    ) -> Result<(), JniError> {
+        let def = JFieldDef { sig: sig.clone(), is_static, access };
+        let target = if is_static { &mut self.static_fields } else { &mut self.fields };
+        target.insert(sig, def);
+        Ok(())
+    }
+
     /// 按 method name 查找所有重载的签名列表（从 name cache 索引）。
     ///
     /// 返回该名称的所有已注册 MethodSig（包括 instance 和 static）。
@@ -207,7 +248,7 @@ impl JClassDef {
 mod tests {
     use super::*;
     use crate::dispatch::MethodImpl;
-    use crate::field::FieldAccess;
+    use crate::field::{FieldAccess, SharedField};
     use crate::types::JType;
     use crate::JValue;
     use std::sync::Arc;
@@ -374,6 +415,48 @@ mod tests {
         assert_ne!(first.id, ClassId(0));
         assert_ne!(second.id, ClassId(0));
         assert_ne!(first.id, second.id, "不同 class 应拿到不同的 ClassId");
+    }
+
+    // —— override_method / override_field 测试 ——
+
+    #[test]
+    fn override_method_replaces_existing() {
+        let mut def = JClassDef::new(ClassId(1), "test/Override".into());
+        let sig = MethodSig { class: "test/Override".into(), name: "foo".into(), args: vec![], ret: JType::Int };
+
+        // 先添加原始 method
+        def.add_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(1))))).unwrap();
+        assert_eq!(def.methods.len(), 1);
+
+        // override 替换（不报错）
+        def.override_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(999))))).unwrap();
+        // 数量不变（替换而非新增）
+        assert_eq!(def.methods.len(), 1);
+        // method_index 仍然可查
+        assert!(def.method_id(&sig).is_some());
+    }
+
+    #[test]
+    fn override_method_adds_new_when_not_exists() {
+        let mut def = JClassDef::new(ClassId(1), "test/Override".into());
+        let sig = MethodSig { class: "test/Override".into(), name: "bar".into(), args: vec![], ret: JType::Void };
+
+        // override 不存在的方法 → 效果等同 add
+        def.override_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Void)))).unwrap();
+        assert_eq!(def.methods.len(), 1);
+        assert!(def.method_id(&sig).is_some());
+    }
+
+    #[test]
+    fn override_field_replaces_existing() {
+        let mut def = JClassDef::new(ClassId(1), "test/Override".into());
+        let sig = FieldSig { class: "test/Override".into(), name: "val".into(), ty: JType::Int };
+
+        def.add_field(sig.clone(), false, FieldAccess::RustNative(Arc::new(SharedField::new(JValue::Int(10))))).unwrap();
+        assert_eq!(def.fields.len(), 1);
+
+        def.override_field(sig.clone(), false, FieldAccess::RustNative(Arc::new(SharedField::new(JValue::Int(20))))).unwrap();
+        assert_eq!(def.fields.len(), 1);
     }
 }
 

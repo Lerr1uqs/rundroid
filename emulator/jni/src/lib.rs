@@ -67,6 +67,7 @@ pub use object_store::{ObjectStorage, ObjectStore, ObjectStoreError};
 pub use refs::{RefKind, RefTable};
 pub use registry::JniRegistry;
 pub use types::{ClassId, FieldId, FieldSig, IdAllocator, JType, JValue, MethodId, MethodSig, ObjectId};
+pub use verify::PythonCallableAnnotations;
 
 /// Rust-native method handler 类型别名。
 pub type RustMethodHandler = dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync;

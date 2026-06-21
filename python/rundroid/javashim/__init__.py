@@ -24,7 +24,7 @@
 # ```
 
 from .base import JavaObject
-from .decorators import java_class, java_method, java_field
+from .decorators import java_class, java_field, java_method
 from .registry import register
 from .types import (
     JBoolean,
@@ -37,6 +37,12 @@ from .types import (
     JObject,
     JShort,
     JVoid,
+)
+from .verify import (
+    annotation_to_jni_descriptor,
+    extract_type_hints,
+    get_param_types_jni,
+    get_return_type_jni,
 )
 
 __all__ = [
@@ -55,4 +61,8 @@ __all__ = [
     "JDouble",
     "JObject",
     "JVoid",
+    "annotation_to_jni_descriptor",
+    "extract_type_hints",
+    "get_return_type_jni",
+    "get_param_types_jni",
 ]

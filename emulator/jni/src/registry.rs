@@ -172,4 +172,146 @@ impl JniRegistry {
         ClassBuilder::new(self, name)
     }
 
+    /// 注册 class definition，若 class 已存在则合并（override 语义）。
+    ///
+    /// # 合并规则
+    ///
+    /// - `def` 中的 method/field **替换**同名已有实现（Python override 优先）
+    /// - 已有 class 中未被 `def` 覆盖的 method/field **保留**（framework stub 回落）
+    /// - class 不存在时，行为与 [`register_class`](Self::register_class) 相同
+    ///
+    /// 此方法用于实现 **Python override > Rust framework stub > fail-fast** 优先级。
+    pub fn register_or_merge_class(&mut self, mut def: JClassDef) -> Result<(), JniError> {
+        let name = def.name.clone();
+        if let Some(existing) = self.classes.get_mut(&name) {
+            // 合并 method：Python override 替换已有，framework stub 保留
+            for (sig, method_def) in std::mem::take(&mut def.methods) {
+                existing.override_method(sig, method_def.is_static, method_def.imp)?;
+            }
+            for (sig, method_def) in std::mem::take(&mut def.static_methods) {
+                existing.override_method(sig, method_def.is_static, method_def.imp)?;
+            }
+            // 合并 field
+            for (sig, field_def) in std::mem::take(&mut def.fields) {
+                existing.override_field(sig, field_def.is_static, field_def.access)?;
+            }
+            for (sig, field_def) in std::mem::take(&mut def.static_fields) {
+                existing.override_field(sig, field_def.is_static, field_def.access)?;
+            }
+            Ok(())
+        } else {
+            // class 不存在 → 正常注册
+            if def.id == ClassId(0) {
+                def.id = self.id_alloc.class();
+            }
+            self.classes.insert(name, def);
+            Ok(())
+        }
+    }
+
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::class::JClassDef;
+    use crate::dispatch::MethodImpl;
+    use crate::field::{FieldAccess, SharedField};
+    use crate::types::{ClassId, FieldSig, JType, JValue, MethodSig};
+    use std::sync::Arc;
+
+    #[test]
+    fn register_or_merge_new_class() {
+        let mut registry = JniRegistry::new();
+        let def = JClassDef::new(ClassId(0), "test/NewClass".into());
+        registry.register_or_merge_class(def).unwrap();
+        assert!(registry.find_class("test/NewClass").is_some());
+        // ClassId 自动分配
+        assert_ne!(registry.find_class("test/NewClass").unwrap().id, ClassId(0));
+    }
+
+    #[test]
+    fn register_or_merge_existing_class_preserves_unmatched() {
+        let mut registry = JniRegistry::new();
+
+        // 先注册 framework stub class（模拟 Rust builtin）
+        let mut fw_def = JClassDef::new(ClassId(0), "test/Shared".into());
+        let fw_sig = MethodSig {
+            class: "test/Shared".into(),
+            name: "frameworkOnly".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        fw_def.add_method(fw_sig.clone(), false,
+            MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(100))))).unwrap();
+        registry.register_class(fw_def).unwrap();
+
+        // 再注册 Python override class
+        let mut py_def = JClassDef::new(ClassId(0), "test/Shared".into());
+        py_def.add_method(fw_sig.clone(), false,
+            MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(999))))).unwrap();
+        let py_new_sig = MethodSig {
+            class: "test/Shared".into(),
+            name: "pythonOnly".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        py_def.add_method(py_new_sig, false,
+            MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(300))))).unwrap();
+
+        registry.register_or_merge_class(py_def).unwrap();
+
+        let cls = registry.find_class("test/Shared").unwrap();
+        assert_eq!(cls.methods.len(), 2);
+
+        // 验证 Python override 生效
+        let mut refs = RefTable::new();
+        let args = crate::args::JniArgs::new();
+        let result = registry.dispatch_call(&fw_sig, &args, &mut refs).unwrap();
+        assert_eq!(result, JValue::Int(999), "Python override 应生效");
+    }
+
+    #[test]
+    fn register_or_merge_field_override() {
+        let mut registry = JniRegistry::new();
+
+        let mut fw_def = JClassDef::new(ClassId(0), "test/FieldShared".into());
+        let field_sig = FieldSig {
+            class: "test/FieldShared".into(),
+            name: "count".into(),
+            ty: JType::Int,
+        };
+        fw_def.add_field(field_sig.clone(), true,
+            FieldAccess::RustNative(Arc::new(SharedField::new(JValue::Int(0))))).unwrap();
+        registry.register_class(fw_def).unwrap();
+
+        let mut py_def = JClassDef::new(ClassId(0), "test/FieldShared".into());
+        py_def.add_field(field_sig.clone(), true,
+            FieldAccess::RustNative(Arc::new(SharedField::new(JValue::Int(42))))).unwrap();
+        registry.register_or_merge_class(py_def).unwrap();
+
+        let cls = registry.find_class("test/FieldShared").unwrap();
+        assert_eq!(cls.static_fields.len(), 1);
+        let val = registry.dispatch_static_field_get(&field_sig).unwrap();
+        assert_eq!(val, JValue::Int(42), "Python override field 应生效");
+    }
+
+    #[test]
+    fn register_or_merge_preserves_class_id() {
+        let mut registry = JniRegistry::new();
+
+        let fw_def = JClassDef::new(ClassId(0), "test/IdPreserve".into());
+        registry.register_or_merge_class(fw_def).unwrap();
+        let original_id = registry.find_class("test/IdPreserve").unwrap().id;
+
+        let py_def = JClassDef::new(ClassId(0), "test/IdPreserve".into());
+        registry.register_or_merge_class(py_def).unwrap();
+        let after_merge_id = registry.find_class("test/IdPreserve").unwrap().id;
+
+        assert_eq!(original_id, after_merge_id, "merge 不应改变已有 ClassId");
+    }
 }

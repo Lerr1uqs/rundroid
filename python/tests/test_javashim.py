@@ -318,3 +318,77 @@ def test_release_java_instance(emu: "Emulator") -> None:
 
     with pytest.raises(Exception):
         emu.call_java_method(h, "get()I", ())
+
+
+# ============================================================================
+# Override 与 strictness 测试
+# ============================================================================
+
+
+def test_python_override_beats_framework_stub(emu: "Emulator") -> None:
+    """Python shim override 覆盖已注册的 framework stub。
+
+    优先级验证：
+    1. 先注册 framework stub（模拟 Rust builtin）
+    2. 再注册 Python shim（覆盖 frameworkValue，新增 pythonOnly）
+    3. 验证 Python override 优先，framework stub 回落
+    """
+    from rundroid.javashim.base import JavaObject
+    from rundroid.javashim.decorators import java_class, java_method
+    from rundroid.javashim.registry import register
+
+    # Step 1: 注册 framework stub class
+    emu.register_framework_stub("test/SharedClass", {
+        "frameworkValue()I": 100,
+        "frameworkOnly()I": 200,
+    })
+
+    # Step 2: 注册 Python shim（覆盖 frameworkValue，添加 pythonOnly）
+    @java_class("test/SharedClass")
+    class OverrideClass(JavaObject):
+        def __init__(self) -> None:
+            pass
+
+        @java_method("frameworkValue()I")
+        def framework_value(self) -> int:
+            return 999  # Python override 值
+
+        @java_method("pythonOnly()I")
+        def python_only(self) -> int:
+            return 300
+
+    register(emu, [OverrideClass])
+    handle = emu.new_java_instance("test/SharedClass")
+
+    # Python override 生效
+    assert emu.call_java_method(handle, "frameworkValue()I", ()) == 999
+
+    # Framework-only method 仍然可用（回落）
+    assert emu.call_java_method(handle, "frameworkOnly()I", ()) == 200
+
+    # Python-only method 可用
+    assert emu.call_java_method(handle, "pythonOnly()I", ()) == 300
+
+
+def test_bad_annotation_fails_at_registration(emu: "Emulator") -> None:
+    """注解与 descriptor 不匹配在注册阶段 fail-fast。
+
+    descriptor 声明返回值 I(int)，但 Python type hint 声明 str →
+    register() 抛出 ValueError。
+    """
+    from rundroid.javashim.base import JavaObject
+    from rundroid.javashim.decorators import java_class, java_method
+    from rundroid.javashim.registry import register
+
+    @java_class("test/BadAnnotation")
+    class BadClass(JavaObject):
+        def __init__(self) -> None:
+            pass
+
+        # descriptor 说返回值 I(int)，但注解是 str → 不匹配
+        @java_method("badMethod()I")
+        def bad_method(self) -> str:
+            return "hello"
+
+    with pytest.raises((ValueError, TypeError)):
+        register(emu, [BadClass])

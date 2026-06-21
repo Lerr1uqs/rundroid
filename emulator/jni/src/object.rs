@@ -82,7 +82,7 @@ pub fn make_object_array(
 pub fn make_stub(
     id: ObjectId,
     class_name: String,
-    data: Box<dyn std::any::Any + Send>,
+    data: Box<dyn std::any::Any + Send + Sync>,
 ) -> (ObjectId, String, ObjectStorage) {
     (id, class_name, ObjectStorage::StubInstance { data })
 }
@@ -91,7 +91,7 @@ pub fn make_stub(
 pub fn make_host_value(
     id: ObjectId,
     class_name: String,
-    data: Box<dyn std::any::Any + Send>,
+    data: Box<dyn std::any::Any + Send + Sync>,
 ) -> (ObjectId, String, ObjectStorage) {
     (id, class_name, ObjectStorage::HostValue { data })
 }
