@@ -1,0 +1,9 @@
+[package]
+name = "signature-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+java-bind.workspace = true
+java-bind-macros.workspace = true
+inventory.workspace = true

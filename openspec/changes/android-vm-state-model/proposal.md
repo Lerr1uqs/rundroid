@@ -20,10 +20,16 @@
 本次变更引入：
 
 - 新 capability：`android-vm-model`
-- `Emulator` 持有 `AndroidVm` 的稳定所有权模型
-- `JClass` / `JObject` / `JMethod` / `JField` 的 typed data model
+- `Emulator` 持有 `AndroidVM` 的稳定所有权模型
+- class-centric `JClassDef` / `JObject` typed data model
 - `RefTable`、`ExceptionState`、`ApkContext` 的稳定职责
 - primitive array / object array / wrapper / string 的一等建模
+
+这里特别约束：
+
+- `AndroidVM` 以 class 为聚合根
+- method / field 不作为与 class 并列的顶层权威 registry
+- Python `@java_class` / `register(...)` 生成的完整 class definition 必须能直接进入 Rust VM
 
 本次变更不要求：
 
@@ -43,3 +49,8 @@
 ## Impact
 
 完成本 change 后，后续 JNI、framework、Python shim 都必须复用同一套 VM 状态模型，而不是各自维护对象和引用表。
+
+同时：
+
+- Python decorator 注册链路和 Rust VM authority 必须一致
+- 不允许 Python 侧走 class-centric，而 Rust VM 内部又退回 method/field 分裂式 registry

@@ -21,3 +21,6 @@ python/.venv/
 
 # 外部 review 文档
 review.md
+
+# experiment
+experiment/target

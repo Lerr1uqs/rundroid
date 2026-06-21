@@ -17,6 +17,12 @@
 - service registry
 - APK-backed `PackageManager` / `PackageInfo` / `Signature` / `AssetManager` / `Bundle` 等最小 stub 集
 
+这里要求 framework builtin 与 Python shim 不走两套平行结构：
+
+- Rust builtin framework class 必须注册进 Rust 最终 authority
+- 后续 Python override / 补环境也必须写入同一套 class/member 结构
+- 两者区别只在注册入口和优先级，不在底层数据模型
+
 本次变更不要求：
 
 - Python override

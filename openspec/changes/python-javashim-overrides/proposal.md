@@ -13,8 +13,14 @@
 - 新 capability：`python-javashim`
 - metadata-only decorators
 - explicit `register(...)`
+- Python class metadata 到 Rust `JClassDef` 的显式同步桥
 - Python shim 与 framework stub 的 override 优先级
 - strict type verify 与 runtime return validation
+
+这里特别要求：
+
+- Python 只是注册接口，不是最终 authority
+- Rust builtin 和 Python 注册结果必须进入同一套 Rust VM 数据模型
 
 本次变更不要求：
 

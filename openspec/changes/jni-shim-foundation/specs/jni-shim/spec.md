@@ -22,6 +22,13 @@
 - **THEN** bridge 代码 SHALL 位于 `emulator/bindings/python` 或等价 binding 层
 - **AND** bridge SHALL 不成为 JNI 核心状态与分派逻辑的权威归属
 
+#### Scenario: PyEmulator does not own final Java world state
+
+- **WHEN** Python binding 维护 class/member/object 相关辅助状态
+- **THEN** `PyEmulator` 或等价 binding object SHALL NOT 成为最终 Java world state container
+- **AND** 这类状态 SHALL 仅作为 binding adapter cache
+- **AND** 最终 authority SHALL 仍位于 `AndroidRuntime` / `AndroidVM` / JNI runtime state
+
 ### Requirement: Emulator owns JNI integration
 
 对外 emulator 装配层 SHALL 成为 JNI shim foundation 的主入口归属。
@@ -66,6 +73,13 @@ runtime SHALL 通过显式 registry 管理 JNI class / method / field 定义。
 - **THEN** 它 SHALL 通过 registry 注册，而不是编辑中心化 switch-case 分派逻辑
 - **AND** method key SHALL 使用完整 `MethodSig`
 - **AND** field key SHALL 使用完整 `FieldSig`
+
+#### Scenario: Rust builtin and Python registration share one authority
+
+- **WHEN** 实现方通过 Rust builtin 或 Python bridge 注册 class/member
+- **THEN** 两者 SHALL 进入同一套 Rust registry authority
+- **AND** 两者 SHALL 先通过 `Emulator` 持有的 `AndroidRuntime` 完成统一注册
+- **AND** 不 SHALL 演化为 builtin 一套、Python 一套的平行状态系统
 
 #### Scenario: Registration collisions fail fast
 

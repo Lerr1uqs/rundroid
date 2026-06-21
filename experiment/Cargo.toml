@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "java-bind",
+    "java-bind-macros",
+    "examples/signature",
+]
+
+[workspace.dependencies]
+java-bind = { path = "java-bind" }
+java-bind-macros = { path = "java-bind-macros" }
+inventory = "0.3"

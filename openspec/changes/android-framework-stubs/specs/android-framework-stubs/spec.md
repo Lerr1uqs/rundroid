@@ -10,6 +10,13 @@ runtime SHALL 通过 class-oriented spec registry 实现 Android framework stubs
 - **THEN** 它 SHALL 通过 class-spec 注册到 framework registry
 - **AND** 不 SHALL 依赖新的 giant signature switch 作为稳定主线
 
+#### Scenario: Framework builtins enter the same VM authority as Python shims
+
+- **WHEN** runtime 注册 Rust builtin framework class
+- **THEN** 它 SHALL 进入 Rust VM 持有的统一 class/member registry
+- **AND** 它 SHALL 通过 `Emulator` 持有的 `AndroidRuntime` 完成注册
+- **AND** 后续 Python shim override 或补环境 SHALL 复用同一套底层数据结构
+
 ### Requirement: APK-backed package and signature stubs
 
 runtime SHALL 为 package/signature 相关 Android 行为提供 APK-backed stub。

@@ -1,6 +1,8 @@
 - [ ] 新增 `python-javashim` capability 的正式 spec
 - [ ] 在 `python/rundroid/javashim` 中实现 metadata-only decorators
 - [ ] 在 `emulator/bindings/python/javashim.rs` 中实现显式注册桥
+- [ ] 明确桥接输出为 class-centric `JClassDef`，而不是分裂式全局 method/field 注册
+- [ ] 重构 `PyEmulator` 中的 `class_types` / `method_names` / `java_instances`：移出主状态，删除或降级为 binding adapter cache
 - [ ] 固定 Python override > Rust framework stub > fail-fast unsupported 的优先级
 - [ ] 增加 descriptor/annotation 严格校验
 - [ ] 增加调用返回值验证

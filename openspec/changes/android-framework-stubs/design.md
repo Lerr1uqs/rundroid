@@ -28,6 +28,17 @@ pub struct FrameworkClassSpec {
 }
 ```
 
+这层需要和现有 `JClassDef` / `JniRegistry` 收敛，而不是另起一套平行 class 系统。
+
+推荐原则：
+
+- Rust builtin framework class 是 Rust 侧注册入口
+- Python javashim 是 Python 侧注册入口
+- 两类入口都不是最终状态归属
+- 两者最终都写入 Rust VM 持有的统一 class/member authority
+- 两者统一先进入 `Emulator` 持有的 `AndroidRuntime`
+- framework registry 可以是 builtin source catalog，但不是脱离 VM 的第二份最终状态
+
 ## Initial class set
 
 优先覆盖：
@@ -61,3 +72,4 @@ pub struct FrameworkClassSpec {
 2. `getSystemService` 走 service registry
 3. package/signature/asset 行为只从 `ApkContext` 读取
 4. 不允许再新增 giant signature switch 作为正式主线
+5. Rust builtin 与 Python override 必须进入同一套 class/member 数据模型
