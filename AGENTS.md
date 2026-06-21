@@ -44,7 +44,7 @@ unidbg resources里面有一些可以用于验证的prebuild库
 # 代码风格
 注意要有中文注释 函数注释+函数体内部复杂算法注释 如果遇到特殊case需要说明什么情况下有这个case 高内聚低耦合 面向对象编程
 
-不允许使用 get_xxx的方式 直接使用 xxx获取field即可
+不允许使用 get_xxx的方式 直接使用 xxx获取field即可 (除非是Java 签名专属要求 那没办法 此外尽量别用get_xxx)
 
 不要写大量的兜底策略 let-it-failed 方便调试 对于没覆盖没要求到的case直接丢出异常即可
 
