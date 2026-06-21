@@ -28,3 +28,6 @@ class Signature(JavaObject):
 
 两种注册方式 最终都把JavaClassMeta注册给AndroidRuntime/AVM 去做统一管理
 
+有个情况我也说明一下 就是实际上一般来说不需要在python中去实例化这个对象(JavaObject) 实例化一般是在rust层 python只负责定义+注册
+然后执行native的时候rust层会从定义部分去调用对应的函数 目前python层的创建(new_java_instance)更多是为了调试+测试
+
