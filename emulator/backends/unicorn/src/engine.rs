@@ -8,7 +8,7 @@
 //! 上层只看到 trait 抽象，从而保留未来切换 / 并存其它 backend 的能力。
 
 use rundroid_backend::{
-    Arm64Reg, Backend, BackendError, Engine as BackendEngine, MemPerms, SyscallCpu, SyscallHook,
+    Arm64Reg, Backend, BackendError, Engine as BackendEngine, MemPerms, GuestCPU, SyscallHook,
 };
 use rundroid_core::Arch;
 use std::cell::RefCell;
@@ -60,22 +60,29 @@ pub struct UnicornEngine {
 ///
 /// 双生命周期：`'a` 是借用本身的，`'u` 是 Unicorn 数据生命周期；
 /// unicorn 的 callback 给的是 `&mut Unicorn<'u, ()>`，`'u` 在闭包边界由 Rust 推断。
-struct UnicornSyscallCpu<'a, 'u: 'a> {
+struct UnicornGuestCPU<'a, 'u: 'a> {
     uc: &'a mut Unicorn<'u, ()>,
     stop_requested: bool,
 }
 
-impl<'a, 'u: 'a> SyscallCpu for UnicornSyscallCpu<'a, 'u> {
+impl<'a, 'u: 'a> GuestCPU for UnicornGuestCPU<'a, 'u> {
     fn reg_read(&self, reg: Arm64Reg) -> u64 {
-        match translate_reg(reg) {
-            Ok(r) => self.uc.reg_read(r).unwrap_or(0),
-            Err(_) => 0,
-        }
+        // 传错寄存器编号是 bug，应直接 panic（let-it-failed）
+        let r = translate_reg(reg).unwrap_or_else(|_| {
+            panic!("reg_read: 无效的寄存器 {:?}", reg)
+        });
+        // unicorn reg_read 失败时也直接 panic — 读不存在的寄存器是异常状态
+        self.uc.reg_read(r).unwrap_or_else(|e| {
+            panic!("reg_read: unicorn 读寄存器失败: {e:?}")
+        })
     }
     fn reg_write(&mut self, reg: Arm64Reg, value: u64) {
-        if let Ok(r) = translate_reg(reg) {
-            let _ = self.uc.reg_write(r, value);
-        }
+        let r = translate_reg(reg).unwrap_or_else(|_| {
+            panic!("reg_write: 无效的寄存器 {:?}", reg)
+        });
+        self.uc.reg_write(r, value).unwrap_or_else(|e| {
+            panic!("reg_write: unicorn 写寄存器失败: {e:?}")
+        });
     }
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> bool {
         self.uc.mem_read(addr, buf).is_ok()
@@ -198,7 +205,7 @@ impl BackendEngine for UnicornEngine {
                 let Some(hook) = borrow.as_mut() else {
                     return;
                 };
-                let mut cpu = UnicornSyscallCpu {
+                let mut cpu = UnicornGuestCPU {
                     uc,
                     stop_requested: false,
                 };

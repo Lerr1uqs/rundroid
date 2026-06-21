@@ -84,11 +84,11 @@ pub trait Engine {
 ///
 /// 故意设计成"backend 调用 hook"的反向控制流：
 /// backend 拿到 emulator 句柄后调用 hook.on_svc，
-/// hook 用 [`SyscallCpu`] 读写寄存器并决定是否停止。
+/// hook 用 [`GuestCPU`] 读写寄存器并决定是否停止。
 /// 这样上层（case-runner）可以在 hook 里把 syscall 分派到 LinuxRuntime，
 /// 而不需要让 backend 知道 LinuxRuntime 的存在。
 pub trait SyscallHook: Send {
-    fn on_svc(&mut self, cpu: &mut dyn SyscallCpu);
+    fn on_svc(&mut self, cpu: &mut dyn GuestCPU);
 }
 
 /// hook 内可对 CPU 做的操作子集。
@@ -99,7 +99,7 @@ pub trait SyscallHook: Send {
 /// mem_read / mem_write 故意设计为可失败：
 /// syscall 路径上 guest 给的缓冲地址可能未映射，必须把失败上报成 EFAULT，
 /// 否则会出现"写没写成功都返回 N"的假阳性。
-pub trait SyscallCpu {
+pub trait GuestCPU {
     fn reg_read(&self, reg: Arm64Reg) -> u64;
     fn reg_write(&mut self, reg: Arm64Reg, value: u64);
     /// 从 guest 地址读 `buf.len()` 字节填入 `buf`。

@@ -14,7 +14,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple, PyType};
 use pyo3::IntoPyObjectExt;
-use rundroid_backend::{Arm64Reg, Backend, Engine, MemPerms, SyscallCpu, SyscallHook};
+use rundroid_backend::{Arm64Reg, Backend, Engine, MemPerms, GuestCPU, SyscallHook};
 use rundroid_backend_unicorn::UnicornBackend;
 use rundroid_driver::{
     VirtualDevice,
@@ -717,7 +717,7 @@ struct SyscallDispatcherPy {
 }
 
 impl SyscallHook for SyscallDispatcherPy {
-    fn on_svc(&mut self, cpu: &mut dyn SyscallCpu) {
+    fn on_svc(&mut self, cpu: &mut dyn GuestCPU) {
         let nr = cpu.reg_read(Arm64Reg::X(8));
         let x0 = cpu.reg_read(Arm64Reg::X(0));
         let x1 = cpu.reg_read(Arm64Reg::X(1));
@@ -726,7 +726,7 @@ impl SyscallHook for SyscallDispatcherPy {
         let x4 = cpu.reg_read(Arm64Reg::X(4));
         let x5 = cpu.reg_read(Arm64Reg::X(5));
 
-        let cpu_ptr: *mut dyn SyscallCpu = cpu as *mut dyn SyscallCpu;
+        let cpu_ptr: *mut dyn GuestCPU = cpu as *mut dyn GuestCPU;
         let mut read_guest = |addr: u64, len: usize| -> Option<Vec<u8>> {
             let mut buf = vec![0u8; len];
             if unsafe { (*cpu_ptr).mem_read(addr, &mut buf) } { Some(buf) } else { None }

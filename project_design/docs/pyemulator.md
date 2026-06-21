@@ -1,0 +1,3 @@
+call_java_method
+read_java_field
+这些method只是过渡API 实际上主要是为了调试用途 现实里不需要在java调用这些 而需要通过DVM (Dalvik)

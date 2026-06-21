@@ -6,7 +6,7 @@
 //! [`LinkContext`](rundroid_elf_linker::LinkContext)，
 //! 把 elf loader/linker 的副作用落到具体 backend。
 
-use rundroid_backend::{Arm64Reg, Backend, BackendError, Engine, MemPerms, SyscallCpu, SyscallHook};
+use rundroid_backend::{Arm64Reg, Backend, BackendError, Engine, MemPerms, GuestCPU, SyscallHook};
 use rundroid_backend_unicorn::UnicornBackend;
 use rundroid_core::{IdAllocator, ModuleId, RuntimeConfig};
 use rundroid_elf_linker::{
@@ -121,7 +121,7 @@ struct SyscallDispatcher {
 }
 
 impl SyscallHook for SyscallDispatcher {
-    fn on_svc(&mut self, cpu: &mut dyn SyscallCpu) {
+    fn on_svc(&mut self, cpu: &mut dyn GuestCPU) {
         let nr = cpu.reg_read(Arm64Reg::X(8));
         let x0 = cpu.reg_read(Arm64Reg::X(0));
         let x1 = cpu.reg_read(Arm64Reg::X(1));
@@ -130,12 +130,12 @@ impl SyscallHook for SyscallDispatcher {
         let x4 = cpu.reg_read(Arm64Reg::X(4));
         let x5 = cpu.reg_read(Arm64Reg::X(5));
 
-        // read_guest / write_guest 闭包：通过 SyscallCpu 访问 guest 内存。
+        // read_guest / write_guest 闭包：通过 GuestCPU 访问 guest 内存。
         // 不能直接借用 cpu（已经被 dispatch 借了），所以用裸指针 + 局部 unsafe。
         // SAFETY: cpu 在整个 on_svc 调用期间是稳定的，闭包仅在 dispatch 内同步使用。
         // 闭包返回 bool/Option 让 LinuxRuntime 能把"未映射缓冲"上报成 EFAULT，
         // 避免出现"写没写成功都返回 N"的假阳性。
-        let cpu_ptr: *mut dyn SyscallCpu = cpu as *mut dyn SyscallCpu;
+        let cpu_ptr: *mut dyn GuestCPU = cpu as *mut dyn GuestCPU;
         let mut read_guest = |addr: u64, len: usize| -> Option<Vec<u8>> {
             let mut buf = vec![0u8; len];
             // SAFETY: 见上方 cpu_ptr 论证。
