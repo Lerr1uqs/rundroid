@@ -42,6 +42,7 @@ pub mod field;
 pub mod function_table;
 pub mod javavm;
 pub mod jnienv;
+pub mod native_registry;
 pub mod object;
 pub mod object_store;
 pub mod refs;
@@ -57,6 +58,12 @@ pub use class::{ClassBuilder, ClassKind, JClassDef, JFieldDef, JMethodDef};
 pub use dispatch::MethodImpl;
 pub use error::JniError;
 pub use exception::{ExceptionRecord, ExceptionState};
+pub use native_registry::{
+    GuestPtr, NativeRegistry, mangle_java_method, mangle_java_method_overloaded,
+    unmangle_java_symbol, validate_jni_version,
+    JNI_VERSION_1_1, JNI_VERSION_1_2, JNI_VERSION_1_4, JNI_VERSION_1_6, JNI_VERSION_1_8,
+    SUPPORTED_JNI_VERSIONS,
+};
 pub use field::{FieldAccess, RustFieldHandler, SharedField};
 pub use javavm::JavaVMSurface;
 pub use jnienv::JniEnvSurface;

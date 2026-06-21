@@ -23,6 +23,7 @@
 use std::sync::{Arc, Mutex};
 
 use rundroid_backend::{Arm64Reg, CodeHook, GuestCPU};
+use rundroid_telemetry::TelemetryEventKind;
 use rundroid_jni::{
     function_table::{
         self, JniFunctionTable,
@@ -53,11 +54,18 @@ pub struct JniTrampolineHook {
     table: JniFunctionTable,
     /// 共享 VM 状态。
     vm: Arc<Mutex<AndroidVM>>,
+    /// 共享 telemetry 事件收集器（hook 内写、runtime 读）。
+    telemetry: Arc<Mutex<Vec<(String, TelemetryEventKind)>>>,
 }
 
 impl JniTrampolineHook {
     pub fn new(table: JniFunctionTable, vm: Arc<Mutex<AndroidVM>>) -> Self {
-        Self { table, vm }
+        Self { table, vm, telemetry: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// 返回共享的 telemetry 事件收集器引用。
+    pub fn telemetry_sink(&self) -> Arc<Mutex<Vec<(String, TelemetryEventKind)>>> {
+        Arc::clone(&self.telemetry)
     }
 
     pub fn trampoline_begin(&self) -> u64 {
@@ -91,13 +99,14 @@ impl CodeHook for JniTrampolineHook {
         let x4 = cpu.reg_read(Arm64Reg::X(4));
         let x5 = cpu.reg_read(Arm64Reg::X(5));
 
-        // 构造 JniEnvSurface（使用 split borrows 同时借 classes/objects/refs/exceptions）
+        // 构造 JniEnvSurface（使用 split borrows 同时借 classes/objects/refs/exceptions/natives）
         // SAFETY: 这是同一个 struct 的字段级别借用，不冲突
         let AndroidVM {
             classes,
             objects,
             refs,
             exceptions,
+            natives,
             apk: _,
         } = &mut *vm_guard;
 
@@ -106,9 +115,11 @@ impl CodeHook for JniTrampolineHook {
             objects,
             refs,
             exceptions,
+            natives,
         );
 
-        let result = dispatch_jni_call(index, &mut env, cpu, x1, x2, x3, x4, x5);
+        let mut telemetry_events = Vec::new();
+        let result = dispatch_jni_call(index, &mut env, cpu, x1, x2, x3, x4, x5, &mut telemetry_events);
 
         match result {
             Ok(ret_val) => {
@@ -125,6 +136,13 @@ impl CodeHook for JniTrampolineHook {
         // （代码 hook 在指令执行前触发，PC 指向 trampoline）
         let lr = cpu.reg_read(Arm64Reg::Lr);
         cpu.reg_write(Arm64Reg::Pc, lr);
+
+        // 将 telemetry 事件写入共享 collector
+        if !telemetry_events.is_empty() {
+            if let Ok(mut sink) = self.telemetry.lock() {
+                sink.append(&mut telemetry_events);
+            }
+        }
     }
 }
 
@@ -138,6 +156,7 @@ fn dispatch_jni_call(
     x3: u64,
     x4: u64,
     x5: u64,
+    telemetry: &mut Vec<(String, TelemetryEventKind)>,
 ) -> Result<u64, JniError> {
     match index {
         0..=3 => Err(JniError::Internal("JNI reserved slot called".into())),
@@ -383,8 +402,61 @@ fn dispatch_jni_call(
 
         // —— RegisterNatives ——
         JNI_REGISTER_NATIVES => {
-            // Accept any native registration; methods are handled by Rust/Python
-            Ok(0)
+            let class_handle = x1 as u32;
+            let methods_ptr = x2;
+            let n_methods = x3 as usize;
+
+            if methods_ptr == 0 || n_methods == 0 {
+                return Ok(0);
+            }
+
+            // JNINativeMethod 结构 (ARM64, 24 字节):
+            //   offset 0: const char* name       (8 字节)
+            //   offset 8: const char* signature  (8 字节)
+            //   offset 16: void* fnPtr          (8 字节)
+            const ENTRY_SIZE: usize = 24;
+            let mut parsed = Vec::with_capacity(n_methods.min(256));
+
+            for i in 0..n_methods {
+                let entry_addr = methods_ptr + (i * ENTRY_SIZE) as u64;
+
+                let name_ptr = match read_u64_from_guest(cpu, entry_addr) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let sig_ptr = match read_u64_from_guest(cpu, entry_addr + 8) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let fn_ptr = match read_u64_from_guest(cpu, entry_addr + 16) {
+                    Some(v) => v,
+                    None => continue,
+                };
+
+                let name = match read_cstr_from_guest(cpu, name_ptr) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let sig = match read_cstr_from_guest(cpu, sig_ptr) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                parsed.push((name, sig, fn_ptr));
+            }
+
+            let registered = env.register_natives(class_handle, &parsed);
+            if registered > 0 {
+                telemetry.push(("jni.register_natives".into(), TelemetryEventKind::Jni));
+            }
+            // JNI 规范：RegisterNatives 返回 0 表示成功，负值表示失败。
+            // 注册失败的单个方法被静默跳过（Android linker 容错语义），
+            // 只要至少有一个方法注册成功，整体返回成功。
+            if registered > 0 {
+                Ok(0) // JNI_OK
+            } else {
+                Ok(0xFFFF_FFFF_FFFF_FFFFu64 as u64) // JNI_ERR (-1)
+            }
         }
 
         // —— GetJavaVM ——
@@ -399,6 +471,16 @@ fn dispatch_jni_call(
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+/// 从 guest 内存读取一个 u64 值（小端序）。
+fn read_u64_from_guest(cpu: &dyn GuestCPU, addr: u64) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    if cpu.mem_read(addr, &mut buf) {
+        Some(u64::from_le_bytes(buf))
+    } else {
+        None
+    }
+}
 
 /// 从 guest 内存读取以 NUL 结尾的 C 字符串。
 fn read_cstr_from_guest(cpu: &dyn GuestCPU, addr: u64) -> Result<String, JniError> {

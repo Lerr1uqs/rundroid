@@ -14,6 +14,7 @@
 use crate::args::JniArgs;
 use crate::error::JniError;
 use crate::exception::ExceptionState;
+use crate::native_registry::NativeRegistry;
 use crate::object_store::{ObjectStorage, ObjectStore};
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
@@ -24,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 /// JNIEnv surface — guest JNI 函数指针表的 Rust 实现。
 ///
-/// 持有对 registry、object store、ref table 和 exception state 的引用。
-/// 所有 JNI 方法调用和 field 访问都通过此结构完成。
+/// 持有对 registry、object store、ref table、exception state 和
+/// native registry 的引用。所有 JNI 方法调用和 field 访问都通过此结构完成。
 ///
 /// # 生命周期
 ///
@@ -37,6 +38,8 @@ pub struct JniEnvSurface<'r> {
     objects: &'r Arc<Mutex<ObjectStore>>,
     refs: &'r mut RefTable,
     exceptions: &'r mut ExceptionState,
+    /// Native 方法注册表 — RegisterNatives 写入此表。
+    natives: &'r mut NativeRegistry,
 }
 
 impl<'r> JniEnvSurface<'r> {
@@ -52,12 +55,14 @@ impl<'r> JniEnvSurface<'r> {
         objects: &'r Arc<Mutex<ObjectStore>>,
         refs: &'r mut RefTable,
         exceptions: &'r mut ExceptionState,
+        natives: &'r mut NativeRegistry,
     ) -> Self {
         Self {
             registry,
             objects,
             refs,
             exceptions,
+            natives,
         }
     }
 
@@ -259,8 +264,85 @@ impl<'r> JniEnvSurface<'r> {
     }
 
     // ========================================================================
-    // Instance Method 调用（by MethodId）
+    // RegisterNatives / Native binding
     // ========================================================================
+
+    /// RegisterNatives: 将 guest native 函数绑定到已注册的 method。
+    ///
+    /// 对于 `methods` 中的每一项 `(name, descriptor_str, fn_ptr)`：
+    /// 1. 按 class_handle 解析 class name
+    /// 2. 按 name + JNI descriptor 在 registry 中查找 MethodId
+    /// 3. 将 `(MethodId, fn_ptr)` 写入 `NativeRegistry`
+    ///
+    /// 返回成功注册的方法数量。注册失败的项被静默跳过
+    /// （不阻塞 RegisterNatives 调用——符合 Android linker 的容错语义）。
+    ///
+    /// # 优先级
+    ///
+    /// `RegisterNatives` 的注册拥有最高优先级——
+    /// 当 method 后续被 `CallXxxMethod` 调用时，
+    /// runtime 优先查找 native registry，命中则调用 guest 函数，
+    /// 未命中才回落 `MethodImpl`（Rust-native / Python-shim）。
+    pub fn register_natives(
+        &mut self,
+        class_handle: u32,
+        methods: &[(String, String, u64)],
+    ) -> u32 {
+        let class_name = match self.resolve_class_name(class_handle) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+
+        let mut count = 0u32;
+        for (name, desc_str, fn_ptr) in methods {
+            // 查找匹配的 MethodSig
+            let candidates = self.registry.methods_by_name(&class_name, name);
+            let mut matched = None;
+            for sig in candidates {
+                if sig.descriptor() == *desc_str {
+                    matched = Some(sig.clone());
+                    break;
+                }
+            }
+            if matched.is_none() {
+                // 也检查 static methods
+                if let Some(cls) = self.registry.find_class(&class_name) {
+                    for (sig, _def) in &cls.static_methods {
+                        if sig.name == *name && sig.descriptor() == *desc_str {
+                            matched = Some(sig.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(sig) = matched {
+                if let Some(method_id) = self.registry.method_id(&class_name, &sig) {
+                    self.natives.register(method_id, *fn_ptr);
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    /// 检查 method 是否已绑定 native 函数（通过 RegisterNatives）。
+    ///
+    /// 返回 guest 函数地址（如果已注册）。
+    /// 调用方可以在 dispatch 前调用此方法，
+    /// 命中时直接调用 guest 函数而不走 `MethodImpl` 分发。
+    pub fn lookup_native(&self, method_id: MethodId) -> Option<u64> {
+        self.natives.lookup(method_id)
+    }
+
+    /// 检查 method 是否有 native binding（通过 RegisterNatives）。
+    ///
+    /// `has_native` 为 true 表示该 method 的调用应优先走 guest 函数指针，
+    /// 而非 registry 中的 Rust/Python handler。
+    pub fn has_native(&self, method_id: MethodId) -> bool {
+        self.natives.lookup(method_id).is_some()
+    }
 
     /// 按 method_id 和原始 args 调用 instance method（不做类型转换）。
     fn dispatch_by_method_id(
@@ -289,6 +371,17 @@ impl<'r> JniEnvSurface<'r> {
             .ok_or_else(|| JniError::Internal(format!(
                 "MethodId {method_id} 在 class {class_name} 中未找到"
             )))?;
+
+        // 检查 native binding：如果此 method 通过 RegisterNatives 绑定了 guest 函数指针，
+        // 则应优先调用 guest native，而非 Rust/Python handler。
+        // guest native 调用（嵌套 emu_start）尚未实现，此处显式报错避免静默回落。
+        let mid = MethodId(method_id);
+        if self.has_native(mid) {
+            return Err(JniError::Internal(format!(
+                "method {class_name}.{method_id} 已通过 RegisterNatives 绑定 guest native ({:#x})，但 guest native 调用链尚未接入",
+                self.lookup_native(mid).unwrap_or(0)
+            )));
+        }
 
         // 构造 JniArgs（将 raw JValue 参数包装）
         let mut jni_args = JniArgs::from_vec(raw_args.to_vec());
@@ -415,6 +508,15 @@ impl<'r> JniEnvSurface<'r> {
             .ok_or_else(|| JniError::Internal(format!(
                 "Static MethodId {method_id} 在 class {class_name} 中未找到"
             )))?;
+
+        // 检查 native binding（与 instance dispatch 同理）
+        let mid = MethodId(method_id);
+        if self.has_native(mid) {
+            return Err(JniError::Internal(format!(
+                "static method {class_name}.{method_id} 已通过 RegisterNatives 绑定 guest native ({:#x})，但 guest native 调用链尚未接入",
+                self.lookup_native(mid).unwrap_or(0)
+            )));
+        }
 
         let jni_args = JniArgs::from_vec(raw_args.to_vec());
         self.registry.dispatch_static(&method_sig, &jni_args, self.refs)
@@ -712,12 +814,14 @@ mod tests {
         let class_handle = refs.new_local(obj_id);
 
         let mut exceptions = ExceptionState::new();
+        let mut natives = NativeRegistry::new();
 
-        let env = JniEnvSurface::new_with_objects(
+        let mut env = JniEnvSurface::new_with_objects(
             &registry,
             &objects,
             &mut refs,
             &mut exceptions,
+            &mut natives,
         );
 
         // 验证：descriptor() 返回 JNI 格式
@@ -735,5 +839,151 @@ mod tests {
             ret: JType::Void,
         };
         assert_eq!(sig_do.descriptor(), "()V", "descriptor 应为 ()V");
+    }
+
+    /// 验证 RegisterNatives 将 guest 函数绑定到 method，并通过 NativeRegistry 可以查找。
+    #[test]
+    fn register_natives_binds_method_to_native_registry() {
+        let cls_name = "test/NativeTest";
+        let mut registry = JniRegistry::new();
+
+        // 1. 注册 class + static method nativePing()I
+        let mut class_def = JClassDef::new(ClassId(0), cls_name.into());
+        let sig_ping = MethodSig {
+            class: cls_name.into(),
+            name: "nativePing".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        class_def.add_method(sig_ping.clone(), true,
+            MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(42))))).unwrap();
+        registry.register_class(class_def).unwrap();
+
+        // 2. 构造 JniEnvSurface
+        let objects = Arc::new(Mutex::new(ObjectStore::new()));
+        let mut refs = RefTable::new();
+        let mut exceptions = ExceptionState::new();
+        let mut natives = NativeRegistry::new();
+
+        // 创建 class object
+        let class_obj_id = ObjectId(0x1000_0001);
+        objects.lock().unwrap().insert(
+            class_obj_id,
+            "java/lang/Class".into(),
+            ObjectStorage::StubInstance { data: Box::new(cls_name.to_string()) },
+        ).unwrap();
+        let class_handle = refs.new_local(class_obj_id);
+
+        let mut env = JniEnvSurface::new_with_objects(
+            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+        );
+
+        // 3. 调用 register_natives — 模拟 guest 通过 JNI 注册
+        let guest_fn = 0x4000_1000u64;
+        let count = env.register_natives(class_handle, &[
+            ("nativePing".into(), "()I".into(), guest_fn),
+        ]);
+        assert_eq!(count, 1, "应成功注册 1 个方法");
+
+        // 4. 验证 NativeRegistry 中已有绑定
+        let method_id = registry.method_id(cls_name, &sig_ping).unwrap();
+        assert_eq!(env.lookup_native(method_id), Some(guest_fn));
+        assert!(env.has_native(method_id));
+    }
+
+    /// 验证 RegisterNatives 对未注册的方法名静默跳过。
+    #[test]
+    fn register_natives_skips_unknown_method() {
+        let cls_name = "test/UnknownMethod";
+        let mut registry = JniRegistry::new();
+
+        // 注册空 class（无 method）
+        let class_def = JClassDef::new(ClassId(0), cls_name.into());
+        registry.register_class(class_def).unwrap();
+
+        let objects = Arc::new(Mutex::new(ObjectStore::new()));
+        let mut refs = RefTable::new();
+        let mut exceptions = ExceptionState::new();
+        let mut natives = NativeRegistry::new();
+
+        let class_obj_id = ObjectId(0x1000_0002);
+        objects.lock().unwrap().insert(
+            class_obj_id, "java/lang/Class".into(),
+            ObjectStorage::StubInstance { data: Box::new(cls_name.to_string()) },
+        ).unwrap();
+        let class_handle = refs.new_local(class_obj_id);
+
+        let mut env = JniEnvSurface::new_with_objects(
+            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+        );
+
+        // 尝试注册不存在的 method
+        let count = env.register_natives(class_handle, &[
+            ("nonexistent".into(), "()V".into(), 0x5000),
+        ]);
+        assert_eq!(count, 0, "未注册的 method 应被静默跳过");
+    }
+
+    /// 回归：RegisterNatives 绑定后，调用 method 必须报错，不能静默走 Rust handler。
+    #[test]
+    fn register_natives_bound_method_rejects_dispatch_to_rust_handler() {
+        let cls_name = "test/Guarded";
+        let mut registry = JniRegistry::new();
+
+        // 1. 注册 class + instance method getValue()I（Rust handler = 返回 42）
+        let sig = MethodSig {
+            class: cls_name.into(),
+            name: "getValue".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        let mut class_def = JClassDef::new(ClassId(0), cls_name.into());
+        class_def.add_method(sig.clone(), false,
+            MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(42))))).unwrap();
+        registry.register_class(class_def).unwrap();
+
+        let method_id = registry.method_id(cls_name, &sig).unwrap();
+
+        // 2. 创建 instance + class 对象（必须在 env 构造前，避免 refs 双重借用）
+        let objects = Arc::new(Mutex::new(ObjectStore::new()));
+        let mut refs = RefTable::new();
+
+        let obj_id = ObjectId(1);
+        objects.lock().unwrap().insert(
+            obj_id, cls_name.into(),
+            ObjectStorage::StubInstance { data: Box::new(cls_name.to_string()) },
+        ).unwrap();
+        let obj_handle = refs.new_local(obj_id);
+
+        let class_obj_id = ObjectId(0x1000_0003);
+        objects.lock().unwrap().insert(
+            class_obj_id, "java/lang/Class".into(),
+            ObjectStorage::StubInstance { data: Box::new(cls_name.to_string()) },
+        ).unwrap();
+        let class_handle = refs.new_local(class_obj_id);
+
+        let mut exceptions = ExceptionState::new();
+        let mut natives = NativeRegistry::new();
+
+        let mut env = JniEnvSurface::new_with_objects(
+            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+        );
+
+        // 3. 绑定前：正常 dispatch 应返回 42（Rust handler）
+        let before = env.call_int_method_by_id(obj_handle, method_id.0, &[]);
+        assert_eq!(before.unwrap(), 42, "绑定前应正常走 Rust handler");
+
+        // 4. RegisterNatives 绑定 method → guest fn
+        let count = env.register_natives(class_handle, &[
+            ("getValue".into(), "()I".into(), 0x4000_5000),
+        ]);
+        assert_eq!(count, 1, "RegisterNatives 应成功绑定");
+
+        // 5. 绑定后 dispatch：必须报错，不能静默回落 Rust handler
+        let after = env.call_int_method_by_id(obj_handle, method_id.0, &[]);
+        assert!(
+            matches!(after, Err(JniError::Internal(ref msg)) if msg.contains("guest native")),
+            "RegisterNatives 绑定后 dispatch 必须显式报错，不能静默走 Rust handler。实际结果: {after:?}"
+        );
     }
 }

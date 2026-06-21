@@ -42,6 +42,8 @@ pub enum RuntimeAssemblyError {
     Link(#[from] ElfLinkError),
     #[error("entry symbol `{0}` not found in module exports")]
     EntryMissing(String),
+    #[error("JNI_OnLoad failed in module `{module}`: {reason}")]
+    JniOnLoadFailed { module: String, reason: String },
 }
 
 /// 用于序列化到 `events.jsonl` 的一条事件记录。
@@ -102,6 +104,10 @@ pub struct GuestRuntime {
     /// JNI trampoline hook（装配时安装到 engine）。
     /// 用 Option 包装：需要在 engine 上注册 hook 但 engine 被 GuestRuntime 独占借用。
     pub jni_env_pointer: Option<u64>,
+    /// JavaVM guest 指针（JNI_OnLoad 参数）。
+    pub java_vm_pointer: Option<u64>,
+    /// JNI trampoline hook 的 telemetry sink（run 后取出事件）。
+    pub jni_telemetry: Option<Arc<Mutex<Vec<(String, TelemetryEventKind)>>>>,
     /// reserve 游标：bump 分配镜像基址。
     reserve_cursor: u64,
     /// sentinel/stack 是否已经映射（复用避免重叠 mem_map）。
@@ -235,6 +241,8 @@ impl GuestRuntime {
             object_store: Arc::new(Mutex::new(ObjectStore::new())),
             jni_function_table: None,
             jni_env_pointer: None,
+            java_vm_pointer: None,
+            jni_telemetry: None,
             // 镜像装载起点：1 GiB 处，远离 stack/TLS 高端。
             reserve_cursor: 0x4000_0000,
             trampoline_mapped: false,
@@ -260,18 +268,29 @@ impl GuestRuntime {
         const JNI_ENV_BASE: u64 = 0x7F_C000_0000;
         let ft = JniFunctionTable::layout(JNI_ENV_BASE);
 
-        // 1. 映射整块 JNI 区域到 guest 内存（READ + EXEC 以便 trampoline 页可执行）
+        // 1. 映射整块 JNI + JavaVM 区域到 guest 内存
+        //    JavaVM 放在 JNI 区域之后的一页（0x7F_C000_3000）
+        const JAVA_VM_PAGE: usize = 0x1000;
+        let java_vm_addr = ft.env_ptr + ft.total_size as u64;
+        let total_map = ft.total_size + JAVA_VM_PAGE;
+
         self.engine
-            .mem_map(ft.env_ptr, ft.total_size, MemPerms::READ_EXEC)
+            .mem_map(ft.env_ptr, total_map, MemPerms::READ_EXEC)
             .map_err(RuntimeAssemblyError::Backend)?;
 
         // 2. 写入 JNIEnv header + 函数指针表 + trampoline NOP
         self._write_jni_table(&ft)?;
 
-        // 3. 创建 JniTrampolineHook 并安装为 code hook
+        // 3. 写入最小 JavaVM 结构
+        self._write_java_vm(java_vm_addr)?;
+
+        // 4. 创建 JniTrampolineHook 并安装为 code hook
         let hook = JniTrampolineHook::new(ft.clone(), vm);
         let begin = hook.trampoline_begin();
         let end = hook.trampoline_end();
+
+        // 保存 telemetry sink 引用（在 engine run 之后读取事件）
+        self.jni_telemetry = Some(hook.telemetry_sink());
 
         self.engine
             .install_code_hook(begin, end, Box::new(hook))
@@ -279,6 +298,29 @@ impl GuestRuntime {
 
         self.jni_function_table = Some(ft.clone());
         self.jni_env_pointer = Some(ft.env_ptr);
+        self.java_vm_pointer = Some(java_vm_addr);
+
+        Ok(())
+    }
+
+    /// 写入最小 JavaVM 结构到 guest 内存。
+    ///
+    /// JavaVM 结构仅包含一个指向 JNIInvokeInterface 函数表的指针。
+    /// 函数表各槽位填零（bootstrap 阶段不实现 JavaVM 函数），
+    /// JNI_OnLoad 如果尝试调用 JavaVM 函数会崩溃。
+    fn _write_java_vm(&mut self, java_vm_addr: u64) -> Result<(), RuntimeAssemblyError> {
+        // JavaVM 结构: 8 字节 = 指向 InvokeInterface 函数表的指针
+        // 函数表放在 JavaVM 之后的 64 字节处，8 个槽位 × 8 字节 = 64 字节
+        let interface_table_addr = java_vm_addr + 64;
+        let table_bytes = interface_table_addr.to_le_bytes();
+
+        // 写 JavaVM 结构：首 8 字节 → 函数表指针
+        self.engine.mem_write(java_vm_addr, &table_bytes)
+            .map_err(|e| RuntimeAssemblyError::Backend(e))?;
+
+        // 写函数表（全部填零，8 槽位 × 8 字节 = 64 字节）
+        let zeros = vec![0u8; 64];
+        self.engine.mem_write(interface_table_addr, &zeros).ok();
 
         Ok(())
     }
@@ -363,6 +405,11 @@ impl GuestRuntime {
             DefaultLinker::new().link_root(&mut link_ctx, graph, root_id)?
         };
         self.last_link = Some(report);
+
+        // JNI_OnLoad lifecycle：模块装载 + 链接完成后，
+        // 自动检测并调用各模块导出的 JNI_OnLoad。
+        let _onload_results = self.detect_jni_onload()?;
+
         Ok(root_id)
     }
 
@@ -428,6 +475,29 @@ impl GuestRuntime {
         Ok(module_id)
     }
 
+    /// 尝试 Java_* mangled symbol fallback 查找。
+    ///
+    /// 当 method 未通过 `RegisterNatives` 注册、也未在 registry 中找到 Rust/Python handler 时，
+    /// 在已装载模块中查找 `Java_*` mangled 符号名。
+    ///
+    /// 先尝试无重载的短格式，失败再尝试带签名后缀的长格式。
+    pub fn resolve_java_native(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        sig_descriptor: &str,
+    ) -> Option<u64> {
+        use rundroid_jni::native_registry::{mangle_java_method, mangle_java_method_overloaded};
+        // 先尝试无重载的符号
+        let simple = mangle_java_method(class_name, method_name);
+        if let Some(addr) = self.resolve_symbol(&simple) {
+            return Some(addr);
+        }
+        // 再尝试带签名后缀的重载符号
+        let overloaded = mangle_java_method_overloaded(class_name, method_name, sig_descriptor);
+        self.resolve_symbol(&overloaded)
+    }
+
     /// 按名字在已装载模块里查找符号地址。
     pub fn resolve_symbol(&self, name: &str) -> Option<u64> {
         for m in self.graph.modules.values() {
@@ -486,8 +556,20 @@ impl GuestRuntime {
     /// 当前实现把 `trampoline_mapped` 标记放在 runtime 上，
     /// 多次调用共享同一个栈/sentinel 区。
 
-    /// 取出当前累积的 telemetry 事件。
+    /// 将 JNI trampoline hook 中累积的 telemetry 事件写入 runtime router。
+    pub fn flush_jni_telemetry(&mut self) {
+        if let Some(ref sink) = self.jni_telemetry {
+            if let Ok(mut events) = sink.lock() {
+                for (name, kind) in events.drain(..) {
+                    self.router.emit(&TelemetryEvent::new(&name, kind));
+                }
+            }
+        }
+    }
+
+    /// 取出当前累积的 telemetry 事件（合并 JNI hook 事件）。
     pub fn take_events(&mut self) -> Vec<EventRecord> {
+        self.flush_jni_telemetry();
         if let Some(sink) = self.sink.as_ref() {
             let mut g = sink.events.lock().unwrap();
             std::mem::take(&mut *g)
@@ -498,34 +580,70 @@ impl GuestRuntime {
 
     /// 遍历所有已加载模块，查找并调用 `JNI_OnLoad`。
     ///
-    /// 对于每个导出 `JNI_OnLoad` 符号的模块，
-    /// 记录 telemetry 事件并尝试调用。
+    /// 对每个导出 `JNI_OnLoad` 的模块：
+    /// 1. 以 `JavaVM*` 作为第一参数调用该函数
+    /// 2. 校验返回值是否为合法 JNI version
+    /// 3. 输出 telemetry 事件
     ///
-    /// # foundation 阶段行为
-    ///
-    /// - 检测到 `JNI_OnLoad` 符号后发出 `jni.call` telemetry 事件
-    /// - 不实际执行 `JNI_OnLoad`（因为需要完整的 `JavaVM*` guest 函数表）
-    /// - 返回找到的 `JNI_OnLoad` 符号所在的模块列表
-    pub fn detect_jni_onload(&mut self) -> Vec<(ModuleId, String, u64)> {
-        let mut found = Vec::new();
+    /// 返回每个模块的调用结果：`(module_id, soname, version)`。
+    /// 非法 JNI version 或 backend 调用失败会立即返回 `Err`（spec: "SHALL 显式失败"）。
+    pub fn detect_jni_onload(&mut self) -> Result<Vec<(ModuleId, String, u64)>, RuntimeAssemblyError> {
+        use rundroid_jni::native_registry::validate_jni_version;
 
-        for (&module_id, module) in &self.graph.modules {
-            if let Some(entry) = module.exports.find("JNI_OnLoad") {
-                let soname = module.name.clone();
-                found.push((module_id, soname.clone(), entry.guest_addr));
+        let java_vm = self.java_vm_pointer.unwrap_or(0);
+        let mut results = Vec::new();
 
-                self.router.emit(&TelemetryEvent::new(
-                    "jni.call",
-                    TelemetryEventKind::Jni,
-                ));
-                self.router.emit(&TelemetryEvent::new(
-                    "jni.jni_onload_detected",
-                    TelemetryEventKind::Jni,
-                ));
+        // 先收集所有 JNI_OnLoad 地址（避免 borrow 冲突）
+        let onloads: Vec<(ModuleId, String, u64)> = self
+            .graph
+            .modules
+            .iter()
+            .filter_map(|(&id, m)| {
+                m.exports
+                    .find("JNI_OnLoad")
+                    .map(|e| (id, m.name.clone(), e.guest_addr))
+            })
+            .collect();
+
+        for (module_id, soname, addr) in onloads {
+            self.router.emit(&TelemetryEvent::new(
+                "jni.call",
+                TelemetryEventKind::Jni,
+            ));
+            self.router.emit(&TelemetryEvent::new(
+                "jni.jni_onload_call",
+                TelemetryEventKind::Jni,
+            ));
+
+            if java_vm == 0 {
+                return Err(RuntimeAssemblyError::JniOnLoadFailed {
+                    module: soname,
+                    reason: "JavaVM 指针未初始化（init_jni 未调用？）".into(),
+                });
             }
+
+            // 调用 JNI_OnLoad(JavaVM*, void* reserved)
+            let version = self.call_export(addr, &[java_vm, 0])
+                .map_err(|e| RuntimeAssemblyError::JniOnLoadFailed {
+                    module: soname.clone(),
+                    reason: format!("backend 调用失败: {e}"),
+                })?;
+
+            if !validate_jni_version(version) {
+                return Err(RuntimeAssemblyError::JniOnLoadFailed {
+                    module: soname,
+                    reason: format!("非法 JNI version: {version:#010x}"),
+                });
+            }
+
+            results.push((module_id, soname.clone(), version));
+            self.router.emit(&TelemetryEvent::new(
+                "jni.jni_onload_ok",
+                TelemetryEventKind::Jni,
+            ));
         }
 
-        found
+        Ok(results)
     }
 }
 

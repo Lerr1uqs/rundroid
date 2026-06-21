@@ -16,6 +16,7 @@
 
 use crate::apk_context::ApkContext;
 use crate::exception::ExceptionState;
+use crate::native_registry::NativeRegistry;
 use crate::object_store::ObjectStore;
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
@@ -27,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 /// Android VM 状态容器。
 ///
-/// 聚合 class registry、object store、ref table、exception state
-/// 和可选的 APK context。这是 Rust 侧 VM authority 的单一入口。
+/// 聚合 class registry、object store、ref table、exception state、
+/// native registry 和可选的 APK context。这是 Rust 侧 VM authority 的单一入口。
 ///
 /// # 与 `JavaVMSurface` 的关系
 ///
@@ -49,6 +50,8 @@ pub struct AndroidVM {
     pub refs: RefTable,
     /// 当前线程的异常状态。
     pub exceptions: ExceptionState,
+    /// Native 方法注册表 — RegisterNatives 绑定 + Java_* fallback 查找。
+    pub natives: NativeRegistry,
     /// APK context（如果当前上下文绑定到某个 APK）。
     /// framework 场景下（如调用 `PackageManager`）应为 `Some`，
     /// 纯 native 场景下可以为 `None`。
@@ -63,6 +66,7 @@ impl AndroidVM {
             objects: Arc::new(Mutex::new(ObjectStore::new())),
             refs: RefTable::new(),
             exceptions: ExceptionState::new(),
+            natives: NativeRegistry::new(),
             apk: None,
         }
     }
