@@ -60,11 +60,19 @@ CPU ARM 这种首字母缩写的**类名** 就尽量全部大写 不要出现 `C
 # 项目管理
 rust 提供 ffi给到python 如果需要运行python 务必使用uv 管理 不要用全局python
 
+# 测试要求
+
+单元测试 要求从点到面 有丰富的模块内测试复杂度深度和交叉度
+
 # 项目目的
 
 rust提供运行层核心框架 能够打包为python ffi 让python 通过给定的接口去写 hook/breakpoint/tracing/补环境能力 实现执行层和脚本层的解耦 
 
 # 最终想实现的效果
+
+其实就是rust写core 提供api和stub给到python 写python脚本去运行unidbg模拟+补齐环境
+当然也可以添加rs代码作为链接时加入来保证速度（这个后面继续优化 现在先不做）
+
 > 注意下面的API不一定完全需要完全对照 只是当做意思符合
 ```python
 @java_class("android/content/pm/Signature")
@@ -112,3 +120,8 @@ emulator.breakpoint.add(so.base + 0x1234, Breakpoint())
 
 sig = emulator.call("signature([B)V", bytes([0x11, 0x22, 0x33]))
 ```
+
+# 项目文档
+
+project_design/ 项目设计目录 如果用户没有要求严禁更改 如果有事实性冲突 请及时提出
+lessons/ 犯错清单 历史上的错误 经验教训
