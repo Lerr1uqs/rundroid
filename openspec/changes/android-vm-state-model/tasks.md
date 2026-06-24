@@ -11,4 +11,4 @@
 - [x] 明确 Python `@java_class` / `@java_method` / `register(...)` 到 Rust `JClassDef` 的同步路径
 - [x] 增加 unit tests：class hierarchy、ref semantics、array storage、exception state
 - [x] 增加 harness case：APK context 对 framework 读取可见
-- [ ] 使用 `openspec validate --type change android-vm-state-model --strict` 验证 change
+- [x] 使用 `openspec validate --type change android-vm-state-model --strict` 验证 change

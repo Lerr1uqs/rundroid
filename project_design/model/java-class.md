@@ -4,7 +4,7 @@
 一种是外部python script
 ```python
 @java_class("android/content/pm/Signature")
-class Signature(JavaObject):
+class Signature(JavaClass):
 
 	def __init__(self):
 		# 正常进行初始化 复制成员函数 这个Signature会被实例化的
@@ -28,6 +28,8 @@ class Signature(JavaObject):
 
 两种注册方式 最终都把JavaClassMeta注册给AndroidRuntime/AVM 去做统一管理
 
-有个情况我也说明一下 就是实际上一般来说不需要在python中去实例化这个对象(JavaObject) 实例化一般是在rust层 python只负责定义+注册
-然后执行native的时候rust层会从定义部分去调用对应的函数 目前python层的创建(new_java_instance)更多是为了调试+测试
+另外 有时候需要在Python层做 javaclass的生成 + 调用 比如我这里 JavaClass某一个函数 设置了一个 native函数 调用对应的so 那么我在python构造执行的同时 就能执行native的模拟逻辑
+这个和unidbg的设计是一致的
+
+所以也许需要 JavaClass 定义析构函数 能够将自己的销毁情况传递回rust-core
 
