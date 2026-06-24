@@ -13,9 +13,9 @@
 from __future__ import annotations
 
 from typing import Callable, TypeVar, Union
-from .base import JavaObject
+from .base import JavaClass
 
-_JT = TypeVar("_JT", bound=type[JavaObject])
+_JT = TypeVar("_JT", bound=type[JavaClass])
 _F = TypeVar("_F", bound=Callable[..., object])
 
 

@@ -40,7 +40,6 @@ use rundroid_jni::{
     JValue,
     MethodImpl,
     MethodSig,
-    ObjectId,
     ObjectStorage,
     ObjectStore,
     PythonCallableAnnotations,
@@ -50,7 +49,7 @@ use rundroid_linux::{LinuxRuntime, SyscallResult};
 use rundroid_memory::MemoryError;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 // ============================================================================
 // PyVirtFile
@@ -208,19 +207,21 @@ impl Drop for EngineHolder {
 
 /// Python shim 到 Rust runtime 的 adapter。
 ///
-/// 持有 Python 侧实例化、分派所需的缓存映射，
+/// 持有 Python 侧分派所需的缓存映射，
 /// 但不是 class/method/object 的 authority。
 ///
 /// # 线程安全性
 ///
-/// `class_types` 中的 `Py<PyType>` 和 `method_names` 中的字符串
-/// 仅在 Python GIL 线程中访问。
+/// `method_names` 中的字符串仅在 Python GIL 线程中访问。
 struct PythonShimAdapter {
-    /// class_name → PyType，供 `new_java_instance` 实例化 Python 对象。
-    class_types: HashMap<String, Py<PyType>>,
-    /// (class_name, java_method_name) → python_method_name，
-    /// 供 `call_java_method` 查找 Python 方法名。
-    method_names: HashMap<(String, String), String>,
+    /// (class_name, java_method_name, argc) → python_method_name，
+    /// 供 `call_java_method` 判定是否存在 Python instance-method override。
+    ///
+    /// 键含 argc（descriptor 的参数个数）：同名不同签名的重载（如 `foo()I` vs `foo(I)I`）
+    /// 互不干扰——只有签名匹配（这里以 argc 区分，与 Python 侧 argc 分派一致）的 override
+    /// 才命中 Python 路径，否则回落 framework stub。静态方法不进此表（静态方法不在
+    /// `__java_dispatch__`，走 dispatch_call → wrap_python_method 的 static 分支）。
+    method_names: HashMap<(String, String, usize), String>,
     /// 共享 ObjectStore 引用，供 `wrap_python_method` 闭包通过 ObjectId 查找 Python 实例。
     objects: Arc<Mutex<ObjectStore>>,
 }
@@ -229,39 +230,34 @@ impl PythonShimAdapter {
     /// 创建 adapter。
     fn new(objects: Arc<Mutex<ObjectStore>>) -> Self {
         Self {
-            class_types: HashMap::new(),
             method_names: HashMap::new(),
             objects,
         }
     }
 
-    /// 插入 class 类型映射。
-    fn insert_class(&mut self, class_name: String, py_type: Py<PyType>) {
-        self.class_types.insert(class_name, py_type);
-    }
-
-    /// 插入方法名映射。
+    /// 插入方法名映射（instance method 用，argc = descriptor 参数个数）。
     fn insert_method_name(
         &mut self,
         class_name: String,
         java_method_name: String,
+        argc: usize,
         python_method_name: String,
     ) {
         self.method_names.insert(
-            (class_name, java_method_name),
+            (class_name, java_method_name, argc),
             python_method_name,
         );
     }
 
-    /// 查找 class 类型。
-    fn resolve_class_type(&self, class_name: &str) -> Option<&Py<PyType>> {
-        self.class_types.get(class_name)
-    }
-
-    /// 查找 Python 方法名。
-    fn resolve_method_name(&self, class_name: &str, java_method_name: &str) -> Option<&str> {
+    /// 查找是否存在签名匹配的 Python override（仅作存在性判定）。
+    fn resolve_method_name(
+        &self,
+        class_name: &str,
+        java_method_name: &str,
+        argc: usize,
+    ) -> Option<&str> {
         self.method_names
-            .get(&(class_name.to_string(), java_method_name.to_string()))
+            .get(&(class_name.to_string(), java_method_name.to_string(), argc))
             .map(|s| s.as_str())
     }
 }
@@ -281,8 +277,7 @@ impl PythonShimAdapter {
 /// Python `register()` 和 Rust builtin 都进入同一套 [`AndroidRuntime`]。
 ///
 /// 以下字段仅为 **binding adapter cache**，不是 authority：
-/// - `shim.class_types` — 仅用于 `new_java_instance` 实例化 Python shim
-/// - `shim.method_names` — 仅用于 Python override 优先分派路径
+/// - `shim.method_names` — 仅用于 Python override 优先分派路径（`call_java_method`）
 #[pyclass(name = "Emulator")]
 struct PyEmulatorBridge {
     engine: EngineHolder,
@@ -290,12 +285,15 @@ struct PyEmulatorBridge {
     graph: ModuleGraph,
     trampoline_mapped: bool,
     /// Android Runtime — class / method / field / object 的 canonical authority。
-    runtime: AndroidRuntime,
+    ///
+    /// 用 `RwLock` 包裹以支持**递归重入**：`call_java_method`（&self）调用 Python 方法，
+    /// 方法体内可能 `self._avm.new_object(...)` → `register_java_object`（&self）再次访问
+    /// runtime。两者都是 `&self`（pyo3 PyRef，可共存），内部经 read()/write() guard 访问；
+    /// 调用 Python 前必须释放 guard，否则 write 会与持守的 read 自锁。
+    runtime: RwLock<AndroidRuntime>,
     /// Python shim adapter — 持有 Python 侧实例化、分派所需的缓存映射，
     /// 但不是 class/method/object 的 authority。
     shim: PythonShimAdapter,
-    /// ObjectId 分配计数器（内部使用，非 JniRegistry 的 IdAllocator）。
-    next_object_id: u64,
 }
 
 fn backend_err(e: rundroid_backend::BackendError) -> PyErr {
@@ -342,9 +340,8 @@ impl PyEmulatorBridge {
             linux,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
-            runtime,
+            runtime: RwLock::new(runtime),
             shim: PythonShimAdapter::new(objects),
-            next_object_id: 1,
         })
     }
 
@@ -499,9 +496,6 @@ impl PyEmulatorBridge {
                 format!("__java_class_name__ 不是有效的字符串: {e}")
             ))?;
 
-        // 保存 Python class 类型引用（adapter cache，非 authority）
-        self.shim.insert_class(class_name.clone(), cls.clone().unbind());
-
         let mut class_def = rundroid_jni::JClassDef::new(ClassId(0), class_name.clone());
 
         // —— 注册 methods ——
@@ -577,17 +571,24 @@ impl PyEmulatorBridge {
                 Ok::<_, PyErr>(())
             })?;
 
-            // 保存 Java method 名 → Python method 名的映射（adapter cache，非 authority）
-            self.shim.insert_method_name(
-                class_name.clone(),
-                sig.name.clone(),
-                method_name.clone(),
-            );
+            // 记录 instance-method override（adapter cache，非 authority）：
+            // 只缓存 instance method（静态方法不在 __java_dispatch__，走 dispatch_call），
+            // 键含 argc 以区分同名不同签名的重载。
+            if !is_static {
+                self.shim.insert_method_name(
+                    class_name.clone(),
+                    sig.name.clone(),
+                    sig.args.len(),
+                    method_name.clone(),
+                );
+            }
 
             // 用 javashim bridge 创建真实 handler（带运行时返回值校验）
             let sig_ret = sig.ret.clone();
             let objects = Arc::clone(&self.shim.objects);
-            let real_handler = javashim::wrap_python_method(py_fn_obj, sig_ret, objects);
+            let real_handler = javashim::wrap_python_method(
+                py_fn_obj, sig.name.clone(), sig_ret, objects,
+            );
 
             class_def.add_method(sig, is_static, MethodImpl::RustNative(real_handler))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -640,7 +641,7 @@ impl PyEmulatorBridge {
         }
 
         // 注册到 AndroidRuntime（若 class 已存在则 merge）
-        self.runtime.classes_mut().register_or_merge_class(class_def)
+        self.runtime.write().unwrap().classes_mut().register_or_merge_class(class_def)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("class 注册失败: {e}")
             ))?;
@@ -648,47 +649,43 @@ impl PyEmulatorBridge {
         Ok(())
     }
 
-    /// 创建 Java 对象实例。
+    /// 注册一个**已创建**的 Python 对象（JavaObject）到 Rust VM。
     ///
-    /// 根据已注册的 class name，在 Python 侧实例化对应的 shim class
-    /// （调用 `__init__`），然后将 Python 对象存入 `ObjectStore`（`HostValue`），
-    /// 通过 `RefTable::new_global` 分配 handle。
+    /// 这是对象 → VM 注册的**唯一**入口（构造由 Python 侧 `avm.new_object` 驱动，
+    /// 不再由 binding 按 class_name 内部实例化）。
+    ///
+    /// 流程：
+    /// 1. ObjectId 由 AVM 层 `IdAllocator` 分配（`AndroidRuntime::allocate_object_id`），
+    ///    而非 binding 自有的计数器——ObjectId 归 AVM 层，与 class/field/method ID 统一空间。
+    /// 2. 存入 `ObjectStore`（`HostValue` 持有 Python 对象引用 `Py<PyAny>`）。
+    /// 3. 经 `RefTable::new_global` 分配全局 handle（JNI `jobject` 等价物）。
     ///
     /// # 生命周期
     ///
     /// Python 对象引用存储在 `ObjectStore` 的 `HostValue` 中。
     /// 调用 `release_java_instance` 时从 `ObjectStore` 移除并 drop Python 引用。
+    /// handle 是 u32 整数，后续 `call_java_method` 通过它定位实例。
     ///
-    /// handle 是一个 u32 整数，后续 `call_java_method` 通过它定位实例。
-    fn new_java_instance(&mut self, class_name: &str) -> PyResult<u32> {
-        let py_cls = self.shim.resolve_class_type(class_name)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("class `{class_name}` 尚未注册")
-            ))?;
+    /// 取 `&self`（而非 `&mut self`）：本方法会被 Python 方法体经
+    /// `self._avm.new_object(...)` 递归回调——此时外层 `call_java_method`（`&self`，
+    /// pyo3 `PyRef`）仍在栈上，若本方法也是 `&self` 则两个 `PyRef` 可共存；内部经
+    /// `RwLock` write guard 访问 runtime（本方法不调 Python，可持守 write guard）。
+    fn register_java_object(&self, class_name: &str, py_obj: Py<PyAny>) -> PyResult<u32> {
+        let mut rt = self.runtime.write().unwrap();
+        // 1. 由 AVM 层 IdAllocator 分配 ObjectId（与 class/field/method ID 统一空间）
+        let object_id = rt.allocate_object_id();
 
-        let instance = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
-            let obj = py_cls.bind(py).call1(())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("实例化 `{class_name}` 失败: {e}")
-                ))?;
-            Ok(obj.unbind())
-        })?;
-
-        // 分配 ObjectId
-        let object_id = ObjectId(self.next_object_id);
-        self.next_object_id += 1;
-
-        // 存入 ObjectStore（HostValue 持有 Python 对象引用）
-        self.runtime.vm.objects.lock().unwrap().insert(
+        // 2. 存入 ObjectStore（HostValue 持有 Python 对象引用）
+        rt.vm.objects.lock().unwrap().insert(
             object_id,
             class_name.to_string(),
-            ObjectStorage::HostValue { data: Box::new(instance) },
+            ObjectStorage::HostValue { data: Box::new(py_obj) },
         ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
             format!("ObjectStore 插入失败: {e}")
         ))?;
 
-        // 分配 global ref handle
-        let handle = self.runtime.refs_mut().new_global(object_id);
+        // 3. 分配 global ref handle 并返回
+        let handle = rt.refs_mut().new_global(object_id);
 
         Ok(handle)
     }
@@ -698,17 +695,19 @@ impl PyEmulatorBridge {
     /// 通过 `RefTable::resolve` → `ObjectStore::storage` 查找，
     /// 从 `HostValue` 中取出 Python 对象引用。
     fn java_instance(&self, handle: u32) -> PyResult<PyObject> {
-        let object_id = self.runtime.refs().resolve(handle)
+        let rt = self.runtime.read().unwrap();
+        let object_id = rt.refs().resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在")
             ))?;
 
-        match self.runtime.vm.objects.lock().unwrap().storage(object_id) {
+        match rt.vm.objects.lock().unwrap().storage(object_id) {
             Some(ObjectStorage::HostValue { data }) => {
                 let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
                     .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         "HostValue 中的数据类型不是 Py<PyAny>"
                     ))?;
+                // clone_ref 仅 refcount，不回调 engine，持守 read guard 安全
                 Python::with_gil(|py| Ok(py_obj.clone_ref(py).into()))
             }
             _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -725,19 +724,20 @@ impl PyEmulatorBridge {
     ///
     /// 调用后 handle 失效，后续通过该 handle 的操作返回错误。
     fn release_java_instance(&mut self, handle: u32) -> PyResult<()> {
-        let object_id = self.runtime.refs().resolve(handle)
+        let mut rt = self.runtime.write().unwrap();
+        let object_id = rt.refs().resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在于 RefTable")
             ))?;
 
         // 从 ObjectStore 移除（drop HostValue → Python 对象引用失效）
-        self.runtime.vm.objects.lock().unwrap().remove(object_id)
+        rt.vm.objects.lock().unwrap().remove(object_id)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("ObjectId {object_id} 不在 ObjectStore 中")
             ))?;
 
         // 从 RefTable 删除 global ref
-        self.runtime.refs_mut().delete_global(handle)
+        rt.refs_mut().delete_global(handle)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("删除 ref handle 失败: {e}")
             ))?;
@@ -758,7 +758,7 @@ impl PyEmulatorBridge {
     ///      → Rust registry dispatch（framework stub 回落路径）
     ///
     /// 参数：
-    /// - `handle`: `new_java_instance` 返回的实例句柄
+    /// - `handle`: `register_java_object`（经 `avm.new_object`）返回的实例句柄
     /// - `method_desc`: method descriptor（如 `"hashCode()I"`）
     /// - `args`: Python tuple 参数列表
     #[pyo3(signature = (handle, method_desc, args))]
@@ -773,53 +773,83 @@ impl PyEmulatorBridge {
                 format!("method descriptor 解析失败: {e}")
             ))?;
         let java_name = sig.name.clone();
+        let argc = sig.args.len();
 
-        // 1. 解析 handle → ObjectId
-        let object_id = self.runtime.refs().resolve(handle)
+        // 1. 解析 handle → ObjectId（临时 read guard，调用后即释放）
+        let object_id = self.runtime.read().unwrap().refs().resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在于 RefTable")
             ))?;
 
-        // 2. 从 ObjectStore 取出对象数据
-        let store = self.runtime.vm.objects.lock().unwrap();
-        let storage = store.storage(object_id)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("ObjectId {object_id} 不在 ObjectStore 中")
-            ))?;
+        // 2. 锁内：只取出 dispatch 判定所需的 owned 数据，**立即释放锁**。
+        //    关键：必须在任何 Python 调用前释放 objects 锁——方法体内可能
+        //    `self._avm.new_object(...)` → `register_java_object` 再次锁 objects，
+        //    若持锁进 Python 会自锁死锁。故这里只 clone 出 Py 引用（refcount，廉价）
+        //    与 class_name，锁随 block 结束释放。
+        //
+        // 分派目标（owned，可在锁外使用）。
+        enum CallTarget {
+            HostValue { py_obj: Py<PyAny>, class_name: String },
+            StubInstance(String),
+            Unsupported(&'static str),
+        }
+        // 取出 objects 的 Arc（read guard 仅借用于 clone，语句结束即释放），
+        // 之后独立锁 objects，不持守 runtime read guard。
+        let objects = self.runtime.read().unwrap().objects();
+        let target = {
+            let store = objects.lock().unwrap();
+            let storage = store.storage(object_id)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("ObjectId {object_id} 不在 ObjectStore 中")
+                ))?;
+            match storage {
+                ObjectStorage::HostValue { data } => {
+                    let py_ref: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
+                        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            "HostValue 中的数据类型不是 Py<PyAny>"
+                        ))?;
+                    let class_name = store.class_name(object_id)
+                        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                            "无法获取对象的 class name"
+                        ))?
+                        .to_string();
+                    // clone Py 引用（refcount，不触发 Python 方法调用，持锁安全）
+                    let py_obj = Python::with_gil(|py| py_ref.clone_ref(py));
+                    CallTarget::HostValue { py_obj, class_name }
+                }
+                ObjectStorage::StubInstance { .. } => {
+                    let cn = store.class_name(object_id).unwrap_or("<unknown>").to_string();
+                    CallTarget::StubInstance(cn)
+                }
+                other => CallTarget::Unsupported(other.kind_label()),
+            }
+        }; // ← store 锁在此释放
 
-        // 3. 根据 storage 变体分派
-        match storage {
+        // 3. 锁外分派（Python 调用 / framework 回落都可安全重入 objects 锁）
+        match target {
             // —— Python override（HostValue）——
-            ObjectStorage::HostValue { data } => {
-                let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
-                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "HostValue 中的数据类型不是 Py<PyAny>"
-                    ))?;
-
-                // 确定 class name（从 ObjectStore 读取）
-                let class_name = store.class_name(object_id)
-                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "无法获取对象的 class name"
-                    ))?;
-
-                // 查找 Python method 名映射
-                if let Some(python_method_name) = self.shim.resolve_method_name(class_name, &java_name) {
+            CallTarget::HostValue { py_obj, class_name } => {
+                // 存在性判定：签名匹配（argc）的 Python instance-method override？
+                // 同名不同签名（如 foo()I vs foo(I)I）不互相命中——argc 不匹配则回落 framework。
+                if self.shim.resolve_method_name(&class_name, &java_name, argc).is_some() {
                     // —— Python override 路径 ——
+                    // 按 Java 名调用 instance.<java_name>(args)，经 JavaObject.__getattr__
+                    // 复用蓝图 __java_dispatch__（与方向 B 共用，零分歧）。
                     let sig_ret = sig.ret.clone();
                     let result = Python::with_gil(|py| {
                         let bound = py_obj.bind(py);
                         let call_result = match args.len() {
-                            0 => bound.call_method0(python_method_name),
+                            0 => bound.call_method0(&java_name),
                             1 => {
                                 let a0 = args.get_item(0)?;
-                                bound.call_method1(python_method_name, (a0,))
+                                bound.call_method1(&java_name, (a0,))
                             }
-                            _ => bound.call_method(python_method_name, args, None),
+                            _ => bound.call_method(&java_name, args, None),
                         };
 
                         let ret_obj = call_result
                             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("method `{python_method_name}` 调用失败: {e}")
+                                format!("method `{java_name}` 调用失败: {e}")
                             ))?;
 
                         // 运行时返回值校验（在 GIL 内完成）
@@ -835,11 +865,11 @@ impl PyEmulatorBridge {
                     })?;
                     Ok(result)
                 } else {
-                    // —— framework stub 回落路径（HostValue 中无此 method override）——
+                    // —— framework stub 回落路径（HostValue 中无签名匹配的 override）——
                     let resolved_class = if !sig.class.is_empty() {
                         sig.class.clone()
                     } else {
-                        class_name.to_string()
+                        class_name
                     };
 
                     let mut dispatch_sig = sig.clone();
@@ -850,7 +880,9 @@ impl PyEmulatorBridge {
                     let jni_args = convert_pyargs_to_jniargs(args)?;
                     // 创建临时 RefTable（dispatch 不需要真实 ref 表，仅满足 API 签名）
                     let mut temp_refs = rundroid_jni::RefTable::new();
-                    let result = self.runtime.classes().dispatch_call(
+                    // dispatch_call 仅走 framework stub 的 RustNative handler（无 engine 回调），
+                    // 持守 read guard 安全；此分支为非 override 回落，不触发 Python 方法体重入。
+                    let result = self.runtime.read().unwrap().classes().dispatch_call(
                         &dispatch_sig, &jni_args, &mut temp_refs,
                     ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         format!("method `{java_name}` 在 class `{}` 中分派失败: {e}", dispatch_sig.class)
@@ -860,29 +892,22 @@ impl PyEmulatorBridge {
                 }
             }
 
-            // —— 非 Python 实例（StubInstance / String / Wrapper / Array 等）——
+            // —— 非 Python 实例（StubInstance）——
             // call_java_method 是 Python 侧 API，只能操作 Python 实例（HostValue）。
-            // 非 HostValue 的对象不是通过 new_java_instance 创建的，
+            // 非 HostValue 的对象不是经 avm.new_object / register_java_object 创建的，
             // 没有 Python backing object，无法在此路径调用。
-            ObjectStorage::StubInstance { .. } => {
-                let cn = self.runtime.vm.objects.lock().unwrap()
-                    .class_name(object_id)
-                    .unwrap_or("<unknown>")
-                    .to_string();
-                Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                    format!(
-                        "handle {handle} 对应的是 Rust StubInstance（class={cn}），\
-                         不是 Python 实例，不能通过 call_java_method 调用。\
-                         StubInstance 的方法应由 guest 侧 JNI 调用触发。"
-                    )
-                ))
-            }
+            CallTarget::StubInstance(cn) => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                format!(
+                    "handle {handle} 对应的是 Rust StubInstance（class={cn}），\
+                     不是 Python 实例，不能通过 call_java_method 调用。\
+                     StubInstance 的方法应由 guest 侧 JNI 调用触发。"
+                )
+            )),
 
             // —— 其他 storage 变体（不支持直接 Python 调用）——
-            _ => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            CallTarget::Unsupported(kind) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!(
-                    "对象 {object_id} 的 storage 变体（{}）不支持 call_java_method",
-                    storage.kind_label()
+                    "对象 {object_id} 的 storage 变体（{kind}）不支持 call_java_method"
                 )
             )),
         }
@@ -934,7 +959,7 @@ impl PyEmulatorBridge {
 
         // 使用 register_or_merge_class：若 class 已存在则合并（保留已有 override），
         // 否则正常注册
-        self.runtime.classes_mut().register_or_merge_class(class_def)
+        self.runtime.write().unwrap().classes_mut().register_or_merge_class(class_def)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("framework stub class 注册失败: {e}")
             ))?;
@@ -957,8 +982,10 @@ impl PyEmulatorBridge {
             sig.class = class_name.to_string();
         }
 
-        let result = self.runtime.classes().dispatch_static_field_get(&sig)
-            .or_else(|_| self.runtime.classes().dispatch_field_get(&sig));
+        let rt = self.runtime.read().unwrap();
+        let result = rt.classes().dispatch_static_field_get(&sig)
+            .or_else(|_| rt.classes().dispatch_field_get(&sig));
+        drop(rt);
 
         jvalue_to_pyobject(result)
     }
@@ -968,36 +995,50 @@ impl PyEmulatorBridge {
     /// 通过 `RefTable::resolve` → `ObjectStore::storage` 查找 Python 实例，
     /// 然后访问其 Python 属性。
     fn read_instance_field(&self, handle: u32, field_name: &str) -> PyResult<PyObject> {
-        let object_id = self.runtime.refs().resolve(handle)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("实例 handle {handle} 不存在于 RefTable")
-            ))?;
-
-        match self.runtime.vm.objects.lock().unwrap().storage(object_id) {
-            Some(ObjectStorage::HostValue { data }) => {
-                let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
-                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "HostValue 中的数据类型不是 Py<PyAny>"
-                    ))?;
-
-                Python::with_gil(|py| {
-                    py_obj.bind(py).getattr(field_name)
-                        .map(|r| r.into())
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            format!("读取实例 field `{field_name}` 失败: {e}")
-                        ))
-                })
+        // 锁内取出实例 Py 引用（clone），立即释放锁——getattr 会触发 JavaObject.__getattr__
+        // （Python 操作），必须在无锁状态下执行。
+        let py_obj: Py<PyAny> = {
+            let objects = self.runtime.read().unwrap().objects();
+            let object_id = {
+                let rt = self.runtime.read().unwrap();
+                rt.refs().resolve(handle)
+                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("实例 handle {handle} 不存在于 RefTable")
+                    ))?
+            };
+            let store = objects.lock().unwrap();
+            match store.storage(object_id) {
+                Some(ObjectStorage::HostValue { data }) => {
+                    let py_ref: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
+                        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            "HostValue 中的数据类型不是 Py<PyAny>"
+                        ))?;
+                    Python::with_gil(|py| py_ref.clone_ref(py))
+                }
+                Some(storage) => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!(
+                            "handle {handle} 对应的对象（kind={}）不支持直接读取 field",
+                            storage.kind_label()
+                        )
+                    ));
+                }
+                None => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("handle {handle} 对应的对象不在 ObjectStore 中")
+                    ));
+                }
             }
-            Some(storage) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!(
-                    "handle {handle} 对应的对象（kind={}）不支持直接读取 field",
-                    storage.kind_label()
-                )
-            )),
-            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("handle {handle} 对应的对象不在 ObjectStore 中")
-            )),
-        }
+        };
+
+        // 锁外：getattr（Python 操作）
+        Python::with_gil(|py| {
+            py_obj.bind(py).getattr(field_name)
+                .map(|r| r.into())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("读取实例 field `{field_name}` 失败: {e}")
+                ))
+        })
     }
 }
 

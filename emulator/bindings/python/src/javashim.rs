@@ -62,10 +62,14 @@ unsafe impl Send for PythonCallable {}
 ///
 /// # 参数
 /// - `py_fn`: Python callable（可以是 instance method 或普通函数）
+/// - `java_name`: 该方法的 Java 名（descriptor 中 `(` 之前的部分）。
+///   instance 分派时按此名调用 ``instance.<java_name>``，经 ``JavaObject.__getattr__``
+///   复用蓝图 ``__java_dispatch__``（与方向 B 共用，零分歧）。
 /// - `sig_ret`: 声明的返回值类型（用于运行时校验）
 /// - `objects`: 共享 ObjectStore，用于通过 ObjectId 查找 Python 实例
 pub fn wrap_python_method(
     py_fn: Py<PyAny>,
+    java_name: String,
     sig_ret: JType,
     objects: Arc<Mutex<ObjectStore>>,
 ) -> Arc<dyn Fn(&JniArgs) -> Result<JValue, JniError> + Send + Sync> {
@@ -74,40 +78,40 @@ pub fn wrap_python_method(
         Python::with_gil(|py| {
             let fn_ref = callable.inner.bind(py);
 
-            // JniArgs → Python tuple（JNI 参数值列表）
+            // JniArgs → Python tuple（JNI 参数值列表，不含 this）
             let py_args = jni_args_to_py_tuple(py, args)?;
 
-            // 如果是 instance method（this 非空），查找 Python 实例并绑定 self
+            // instance method（this 非空）：按 Java 名调用 instance.<java_name>(*py_args)，
+            // 经 JavaObject.__getattr__ 复用 __java_dispatch__；
+            // static method（this 为空）：直接调用未绑定函数 py_fn(*py_args)。
+            //
+            // 关键：必须在调用 Python 方法**之前**释放 objects 锁——方法体内可能
+            // `self._avm.new_object(...)` → `register_java_object` 再次锁 objects，
+            // 持锁调用会自锁死锁。故锁内只 clone 出 instance 引用（refcount，廉价），
+            // 锁随 block 结束释放，再进 Python 调用。
             let result = if let Some(this_oid) = args.this() {
-                // 从 ObjectStore 查找实例
-                let store = objects.lock().unwrap();
-                let storage = store.storage(this_oid);
-                match storage {
-                    Some(ObjectStorage::HostValue { data }) => {
-                        if let Some(instance) = data.downcast_ref::<Py<PyAny>>() {
-                            let bound_instance = instance.bind(py);
-                            // 调用 instance.method(py_args)
-                            // 使用 call1 将 py_args 作为第一个位置参数传入
-                            bound_instance.call_method1(
-                                fn_ref.getattr("__name__")
-                                    .map(|n| n.extract::<String>().unwrap_or_default())
-                                    .unwrap_or_default()
-                                    .as_str(),
-                                (py_args,),
-                            )
-                        } else {
-                            // 非 HostValue：直接调用未绑定函数
-                            fn_ref.call((py_args,), None)
+                // 锁内：仅 clone 出 instance 引用（若有），立即释放锁
+                let instance_opt: Option<Py<PyAny>> = {
+                    let store = objects.lock().unwrap();
+                    match store.storage(this_oid) {
+                        Some(ObjectStorage::HostValue { data }) => {
+                            data.downcast_ref::<Py<PyAny>>().map(|p| p.clone_ref(py))
                         }
+                        _ => None,
                     }
-                    _ => {
-                        // 实例不在 ObjectStore 中或不是 HostValue：直接调用
-                        fn_ref.call((py_args,), None)
+                }; // ← objects 锁在此释放
+
+                match instance_opt {
+                    Some(instance) => {
+                        // 经 __getattr__(java_name) → __java_dispatch__，py_args 元组展开为位置参数
+                        instance.bind(py).call_method1(&java_name, &py_args)
                     }
+                    // 实例不在 ObjectStore / 非 HostValue：直接调用未绑定函数
+                    None => fn_ref.call(&py_args, None),
                 }
             } else {
-                // static method：直接调用，将参数元组解包为位置参数
-                fn_ref.call((py_args,), None)
+                // static method：直接调用，py_args 元组展开为位置参数
+                fn_ref.call(&py_args, None)
             };
 
             let result = result

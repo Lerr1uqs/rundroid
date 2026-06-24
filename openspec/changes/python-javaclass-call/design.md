@@ -214,6 +214,31 @@ identity 单轨：VM（`ObjectStore`）权威，Python 仅缓存 `_handle`。
 issue #1 的 chaining 在 emulator 上下文：首对象 `Signature(emu.avm)`，后续对象由方法体内
 `self._avm.new_object(...)` 派生（AVM 引用随 `_avm` 字段传递）。
 
+### 决策 6：方向 A 递归重入——锁释放 + `&self` 方法（避免自锁 / pyo3 借用冲突）
+
+方法体内 `self._avm.new_object(Other)` 经 Rust bridge（方向 A，`call_java_method` /
+`wrap_python_method`）触发时，会回调 `register_java_object` 再次访问 `runtime`。
+两层潜在自锁必须同时规避：
+
+1. **ObjectStore Mutex 自锁**：原实现持守 `objects.lock()` 进 Python 调用，方法体内
+   `register_java_object` 再次 `objects.lock()` → 同线程 Mutex 死锁。
+   修法：**锁内只 clone 出所需 owned 数据**（`Py<PyAny>` 引用 + `class_name`），
+   **立即释放锁**，再进 Python 调用。`call_java_method` 与 `wrap_python_method` 都改如此。
+2. **pyo3 `#[pyclass]` 借用冲突**：`call_java_method`（`&self`，`PyRef`）调用 Python 时，
+   方法体内 `register_java_object`（原 `&mut self`，`PyRefMut`）→ pyo3 抛 `Already borrowed`。
+   修法：`runtime` 包成 `RwLock<AndroidRuntime>`，**`register_java_object` 改 `&self`**
+   （write guard 内部访问 runtime）——两个 `&self` 的 `PyRef` 可共存。所有访问 runtime 的
+   方法经 `read()/write()` guard；凡调用 Python 的方法（`call_java_method` 等）必须在
+   Python 调用前释放 guard，否则 write 会与持守的 read 自锁。
+
+### 决策 7：override 命中按 argc（同名不同签名不误命中）
+
+`PythonShimAdapter` 的 override 存在性缓存键含 **argc**：`(class_name, java_name, argc)`，
+仅缓存 instance method（静态方法不进 `__java_dispatch__`，走 `dispatch_call`）。
+`call_java_method` 用 `sig.args.len()` 查询。这样 `foo()I`（Python override，argc 0）与
+`foo(I)I`（framework stub，argc 1）互不干扰：`foo()I` 命中 Python 路径，`foo(I)I` 回落
+framework。与 Python 侧 argc 重载解析一致（同 argc 不同类型仍是首版限制，见 Non-Goal）。
+
 ### 端到端示例（issue #1 复刻）
 
 ```python
@@ -257,6 +282,9 @@ out = Signature(emu.avm).builder().signature(b"abc").build().sign("hello")
 - **`__new__` 返回非 `cls` → Python 不调 `__init__`** → `avm.new_object` 内手动跑
   `java_class.__init__`；不在 `__init__` 做注册。已规避。
 - **`__getattr__` 无限递归** → 仅拦截 `__java_dispatch__` 内的名，其余 `AttributeError`。已规避。
+- **方向 A 递归重入**（方法体内 `new_object` 经 Rust bridge 回调 engine）→ 两层自锁：
+  ObjectStore Mutex（持锁进 Python）+ pyo3 `PyRef`/`PyRefMut` 借用冲突。规避见决策 6。
+- **override 同名不同签名误命中** → 缓存键含 argc，见决策 7。
 - **重载 argc 歧义**（同 argc 不同类型） → 首版按 argc，文档/spec 标注限制；后续可升级
   descriptor 类型匹配。已记录为 Non-Goal。
 - **`isinstance(obj, Signature)` 为 False**（`type(obj) is JavaObject`）→ 如需可读类型，
