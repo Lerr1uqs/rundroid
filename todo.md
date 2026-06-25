@@ -28,3 +28,5 @@
 
 
 - java primitive type到py type的转换？
+
+- JavaClass 是否要添加一个release函数 手动释放
