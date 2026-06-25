@@ -15,7 +15,6 @@ mod javashim;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple, PyType};
-use pyo3::IntoPyObjectExt;
 use rundroid_backend::{Arm64Reg, Backend, Engine, MemPerms, GuestCPU, SyscallHook};
 use rundroid_backend_unicorn::UnicornBackend;
 use rundroid_driver::{
@@ -35,11 +34,15 @@ use rundroid_jni::{
     ClassId,
     FieldAccess,
     FieldSig,
+    IdAllocator,
+    JMethodDef,
     JniArgs,
     JniError,
+    JType,
     JValue,
     MethodImpl,
     MethodSig,
+    ObjectId,
     ObjectStorage,
     ObjectStore,
     PythonCallableAnnotations,
@@ -291,6 +294,12 @@ struct PyEmulatorBridge {
     /// runtime。两者都是 `&self`（pyo3 PyRef，可共存），内部经 read()/write() guard 访问；
     /// 调用 Python 前必须释放 guard，否则 write 会与持守的 read 自锁。
     runtime: RwLock<AndroidRuntime>,
+    /// 共享 ObjectId 分配器——与 `runtime` 内 `object_id_alloc` 同源。
+    ///
+    /// marshalling 闭包（`wrap_python_method`）与 `register_java_builtin` /
+    /// `call_java_method_typed` 等路径捕获此 Arc，为 `str`/`bytes` 自动 coercion
+    /// 及显式 wrapper 构造分配 `ObjectId`，确保与 runtime 分配的对象 ID 同空间。
+    id_alloc: Arc<Mutex<IdAllocator>>,
     /// Python shim adapter — 持有 Python 侧实例化、分派所需的缓存映射，
     /// 但不是 class/method/object 的 authority。
     shim: PythonShimAdapter,
@@ -335,12 +344,14 @@ impl PyEmulatorBridge {
 
         let runtime = AndroidRuntime::new();
         let objects = runtime.objects();
+        let id_alloc = runtime.object_id_allocator();
         Ok(Self {
             engine: EngineHolder { engine: Some(engine) },
             linux,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
             runtime: RwLock::new(runtime),
+            id_alloc,
             shim: PythonShimAdapter::new(objects),
         })
     }
@@ -586,8 +597,9 @@ impl PyEmulatorBridge {
             // 用 javashim bridge 创建真实 handler（带运行时返回值校验）
             let sig_ret = sig.ret.clone();
             let objects = Arc::clone(&self.shim.objects);
+            let id_alloc = Arc::clone(&self.id_alloc);
             let real_handler = javashim::wrap_python_method(
-                py_fn_obj, sig.name.clone(), sig_ret, objects,
+                py_fn_obj, sig.name.clone(), sig_ret, objects, id_alloc,
             );
 
             class_def.add_method(sig, is_static, MethodImpl::RustNative(real_handler))
@@ -670,7 +682,12 @@ impl PyEmulatorBridge {
     /// `self._avm.new_object(...)` 递归回调——此时外层 `call_java_method`（`&self`，
     /// pyo3 `PyRef`）仍在栈上，若本方法也是 `&self` 则两个 `PyRef` 可共存；内部经
     /// `RwLock` write guard 访问 runtime（本方法不调 Python，可持守 write guard）。
-    fn register_java_object(&self, class_name: &str, py_obj: Py<PyAny>) -> PyResult<u32> {
+    ///
+    /// 返回 `(global_handle, object_id)`：handle 供 guest JNI 引用；
+    /// object_id 回填到 JavaObject 的 `_rundroid_oid`，使 marshalling 能识别已注册对象
+    /// （见 `javashim::py_to_jvalue` 的 `_rundroid_oid` 分支），从而让 JavaObject 可跨
+    /// Python↔Rust 编组边界（作参数/返回值），与 `JavaString`/`JavaByteArray` 一致。
+    fn register_java_object(&self, class_name: &str, py_obj: Py<PyAny>) -> PyResult<(u32, u64)> {
         let mut rt = self.runtime.write().unwrap();
         // 1. 由 AVM 层 IdAllocator 分配 ObjectId（与 class/field/method ID 统一空间）
         let object_id = rt.allocate_object_id();
@@ -684,10 +701,34 @@ impl PyEmulatorBridge {
             format!("ObjectStore 插入失败: {e}")
         ))?;
 
-        // 3. 分配 global ref handle 并返回
+        // 3. 分配 global ref handle，连同 object_id 一起返回
         let handle = rt.refs_mut().new_global(object_id);
 
-        Ok(handle)
+        Ok((handle, object_id.0))
+    }
+
+    /// 注册一个 `java/lang/String` 内置对象（用于显式 `JavaString` wrapper）。
+    ///
+    /// 返回 `(global_handle, object_id)`：handle 供 guest JNI 引用，
+    /// object_id 供 Python 侧 marshalling 复用身份（存入 wrapper 的 `_rundroid_oid`）。
+    fn register_java_string(&self, value: String) -> PyResult<(u32, u64)> {
+        let (handle, oid) = self.register_builtin(
+            "java/lang/String",
+            ObjectStorage::String(value),
+        )?;
+        Ok((handle, oid.0))
+    }
+
+    /// 注册一个 `byte[]` 内置对象（用于显式 `JavaByteArray` wrapper）。
+    ///
+    /// 返回 `(global_handle, object_id)`，语义同 [`Self::register_java_string`]。
+    fn register_java_bytes(&self, value: Vec<u8>) -> PyResult<(u32, u64)> {
+        let elements = value.into_iter().map(|b| JValue::Byte(b as i8)).collect();
+        let (handle, oid) = self.register_builtin(
+            "[B",
+            ObjectStorage::PrimitiveArray { jtype: JType::Byte, elements },
+        )?;
+        Ok((handle, oid.0))
     }
 
     /// 获取 Python 实例对象（供 Python 侧直接操作）。
@@ -836,6 +877,8 @@ impl PyEmulatorBridge {
                     // 按 Java 名调用 instance.<java_name>(args)，经 JavaObject.__getattr__
                     // 复用蓝图 __java_dispatch__（与方向 B 共用，零分歧）。
                     let sig_ret = sig.ret.clone();
+                    let objects = Arc::clone(&self.shim.objects);
+                    let id_alloc = Arc::clone(&self.id_alloc);
                     let result = Python::with_gil(|py| {
                         let bound = py_obj.bind(py);
                         let call_result = match args.len() {
@@ -852,8 +895,9 @@ impl PyEmulatorBridge {
                                 format!("method `{java_name}` 调用失败: {e}")
                             ))?;
 
-                        // 运行时返回值校验（在 GIL 内完成）
-                        let jval = javashim::py_object_to_jvalue(&ret_obj)
+                        // 运行时返回值校验（在 GIL 内完成）。
+                        // py_to_jvalue：str/bytes 自动落身份成 Java 对象，不再吞成 Null。
+                        let jval = javashim::py_to_jvalue(py, &ret_obj, &objects, &id_alloc)
                             .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e))?;
                         if let Err(e) = javashim::validate_return_value(&jval, &sig_ret) {
                             return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
@@ -877,7 +921,10 @@ impl PyEmulatorBridge {
                         dispatch_sig.class = resolved_class;
                     }
 
-                    let jni_args = convert_pyargs_to_jniargs(args)?;
+                    // 入参编组：str/bytes 等自动 coercion（落身份成 Java 对象）。
+                    let py = args.py();
+                    let jni_args = javashim::pyargs_to_jniargs(py, args, &self.shim.objects, &self.id_alloc)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e))?;
                     // 创建临时 RefTable（dispatch 不需要真实 ref 表，仅满足 API 签名）
                     let mut temp_refs = rundroid_jni::RefTable::new();
                     // dispatch_call 仅走 framework stub 的 RustNative handler（无 engine 回调），
@@ -888,7 +935,8 @@ impl PyEmulatorBridge {
                         format!("method `{java_name}` 在 class `{}` 中分派失败: {e}", dispatch_sig.class)
                     ))?;
 
-                    jvalue_to_pyobject(Ok(result))
+                    // 返回值编组：JValue::Object 按 storage 还原（String→str、byte[]→bytes）。
+                    javashim::jvalue_to_py(py, &result, &self.shim.objects)
                 }
             }
 
@@ -911,6 +959,98 @@ impl PyEmulatorBridge {
                 )
             )),
         }
+    }
+
+    /// 经类型化 JNI dispatch 调用已注册 Java 实例方法（参数/返回值都过 marshalling）。
+    ///
+    /// 与 [`Self::call_java_method`] 的区别：本方法**始终**走 marshalling——
+    /// Python 参数先编组成 `JniArgs`（`str`/`bytes` 落身份成 Java 对象），
+    /// 再经 registry dispatch 调到注册的 handler（Python `@java_method` 或 framework stub），
+    /// 返回值再按 storage 还原成 Python 值。
+    ///
+    /// 这是端到端验证值编组的入口：等价于 guest 经 JNI 调用一个方法——
+    /// 让 Python 侧 `@java_method` 收到的 `String`/`byte[]` 参数被还原成 `str`/`bytes`，
+    /// 且返回的 `str`/`bytes` 不被吞成 `None`。
+    ///
+    /// # 死锁规避
+    ///
+    /// handler（Python 方法体）可能在方法体内 `self._avm.new_object(...)` →
+    /// `register_java_object` 重入 runtime 的 write guard。故本方法在调用 handler **前**
+    /// 释放 runtime read guard——先在短暂 read guard 内 clone 出 handler 的 `Arc`，
+    /// guard 释放后再无锁调用。
+    #[pyo3(signature = (handle, method_desc, args))]
+    fn call_java_method_typed(
+        &self,
+        handle: u32,
+        method_desc: &str,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<PyObject> {
+        let py = args.py();
+        let sig = MethodSig::parse(method_desc)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("method descriptor 解析失败: {e}")
+            ))?;
+
+        // 1. 短暂 read guard：解析 handle → ObjectId + class_name，取出共享 objects/id_alloc。
+        let (object_id, class_name, objects, id_alloc) = {
+            let rt = self.runtime.read().unwrap();
+            let oid = rt.refs().resolve(handle)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("实例 handle {handle} 不存在于 RefTable")
+                ))?;
+            let class_name = rt.vm.objects.lock().unwrap().class_name(oid)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("ObjectId {oid} 不在 ObjectStore 中")
+                ))?
+                .to_string();
+            (oid, class_name, rt.objects(), Arc::clone(&self.id_alloc))
+        };
+
+        // 2. 解析 dispatch 用的 class（descriptor 带 class 用之，否则用对象 class_name）。
+        let resolved_class = if !sig.class.is_empty() { sig.class.clone() } else { class_name };
+        let mut dispatch_sig = sig.clone();
+        if dispatch_sig.class.is_empty() {
+            dispatch_sig.class = resolved_class.clone();
+        }
+
+        // 3. 短暂 read guard：clone 出 handler Arc，立即释放 guard（避免持守 guard 调 Python 自锁）。
+        let handler = {
+            let rt = self.runtime.read().unwrap();
+            let cls = rt.classes().find_class(&resolved_class)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("class `{resolved_class}` 未注册")
+                ))?;
+            let method: &JMethodDef = cls.methods.get(&dispatch_sig)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("method `{}` 在 class `{}` 中未注册", dispatch_sig.name, resolved_class)
+                ))?;
+            if method.is_static {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("method `{}` 是 static，不能经实例 handle 调用", dispatch_sig.name)
+                ));
+            }
+            match &method.imp {
+                MethodImpl::RustNative(h) => Arc::clone(h),
+                MethodImpl::PythonShim(_) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "PythonShim 方法尚未接入"
+                )),
+            }
+        }; // ← read guard 在此释放
+
+        // 4. 入参编组 + 标记 this（锁外，无 runtime guard）。
+        let mut jni_args = javashim::pyargs_to_jniargs(py, args, &objects, &id_alloc)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e))?;
+        jni_args.set_this(object_id);
+
+        // 5. 调用 handler（无 runtime guard，Python 方法体可安全重入 new_object 等）。
+        //    handler 内部（wrap_python_method）已含返回值类型校验。
+        let result = handler(&jni_args)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("method `{}` 调用失败: {e}", dispatch_sig.name)
+            ))?;
+
+        // 6. 返回值编组（storage-aware：String→str、byte[]→bytes）。
+        javashim::jvalue_to_py(py, &result, &objects)
     }
 
     /// 注册一个 framework stub class（纯 Rust-native handler）。
@@ -986,9 +1126,10 @@ impl PyEmulatorBridge {
         let rt = self.runtime.read().unwrap();
         let result = rt.classes().dispatch_static_field_get(&sig)
             .or_else(|_| rt.classes().dispatch_field_get(&sig));
+        let objects = rt.objects();
         drop(rt);
 
-        jvalue_to_pyobject(result)
+        Python::with_gil(|py| jvalue_result_to_py(py, result, &objects))
     }
 
     /// 获取实例的 Python 属性（field 值）。
@@ -1043,28 +1184,49 @@ impl PyEmulatorBridge {
     }
 }
 
-/// 将 Python tuple 参数转换为 [`JniArgs`]，用于 Rust registry dispatch。
-fn convert_pyargs_to_jniargs(args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<JniArgs> {
-    let mut values: Vec<JValue> = Vec::new();
-    for item in args.iter() {
-        if item.is_none() {
-            values.push(JValue::Null);
-        } else if let Ok(i) = item.extract::<i32>() {
-            values.push(JValue::Int(i));
-        } else if let Ok(l) = item.extract::<i64>() {
-            values.push(JValue::Long(l));
-        } else if let Ok(b) = item.extract::<bool>() {
-            values.push(JValue::Boolean(b));
-        } else if let Ok(f) = item.extract::<f64>() {
-            values.push(JValue::Double(f));
-        } else if let Ok(_s) = item.extract::<Vec<u8>>() {
-            // bytes → null 占位（暂不支持 ObjectId）
-            values.push(JValue::Null);
-        } else {
-            values.push(JValue::Null);
-        }
+// ============================================================================
+// 非 pymethods 的内部方法（私有 helper，不暴露给 Python）
+// ============================================================================
+
+impl PyEmulatorBridge {
+    /// 通用内置对象注册（Python 侧不直接调用，由 string/bytes 专方法复用）。
+    ///
+    /// 分配 ObjectId → 写入 ObjectStore → 分配 global ref handle。
+    /// 持守 write guard（本方法不回调 Python，可安全持守）。
+    fn register_builtin(
+        &self,
+        class_name: &str,
+        storage: ObjectStorage,
+    ) -> PyResult<(u32, ObjectId)> {
+        let mut rt = self.runtime.write().unwrap();
+        let object_id = rt.allocate_object_id();
+        rt.vm.objects.lock().unwrap().insert(
+            object_id,
+            class_name.to_string(),
+            storage,
+        ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("ObjectStore 插入内置对象失败: {e}")
+        ))?;
+        let handle = rt.refs_mut().new_global(object_id);
+        Ok((handle, object_id))
     }
-    Ok(JniArgs::from_vec(values))
+}
+
+/// 将 `Result<JValue, JniError>` 编组回 Python 对象（storage-aware）。
+///
+/// 成功时经 [`javashim::jvalue_to_py`] 还原（String→str、byte[]→bytes、primitive→标量、
+/// Null→None），失败时把 `JniError` 包成 `PyRuntimeError`。
+fn jvalue_result_to_py(
+    py: Python<'_>,
+    result: Result<JValue, JniError>,
+    objects: &Arc<Mutex<ObjectStore>>,
+) -> PyResult<PyObject> {
+    match result {
+        Ok(val) => javashim::jvalue_to_py(py, &val, objects),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            format!("JNI 调用失败: {e}")
+        )),
+    }
 }
 
 /// 将简单的 JNI descriptor 字符串解析为 [`JType`]。
@@ -1095,28 +1257,6 @@ fn parse_jtype_from_descriptor(desc: &str) -> Option<rundroid_jni::JType> {
             Some(rundroid_jni::JType::Array(Box::new(inner)))
         }
         _ => None,
-    }
-}
-
-/// 将 JValue Result 转为 Python 对象。
-fn jvalue_to_pyobject(result: Result<JValue, JniError>) -> PyResult<PyObject> {
-    match result {
-        Ok(val) => Python::with_gil(|py| {
-            let obj: PyObject = match val {
-                JValue::Int(i) => i.into_py_any(py).unwrap(),
-                JValue::Long(l) => l.into_py_any(py).unwrap(),
-                JValue::Float(f) => f.into_py_any(py).unwrap(),
-                JValue::Double(d) => d.into_py_any(py).unwrap(),
-                JValue::Boolean(b) => b.into_py_any(py).unwrap(),
-                JValue::Void | JValue::Null => py.None(),
-                JValue::Object(id) => id.0.into_py_any(py).unwrap(),
-                _ => py.None(),
-            };
-            Ok(obj)
-        }),
-        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            format!("JNI 调用失败: {e}")
-        )),
     }
 }
 

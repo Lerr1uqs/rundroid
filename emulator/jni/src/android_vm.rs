@@ -20,6 +20,7 @@ use crate::native_registry::NativeRegistry;
 use crate::object_store::ObjectStore;
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
+use crate::types::IdAllocator;
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -52,6 +53,18 @@ pub struct AndroidVM {
     pub exceptions: ExceptionState,
     /// Native 方法注册表 — RegisterNatives 绑定 + Java_* fallback 查找。
     pub natives: NativeRegistry,
+    /// ObjectId 分配器（共享）。
+    ///
+    /// 与 `objects` 一样用 `Arc<Mutex<>>` 包装，供 Python binding 的 marshalling
+    /// 闭包（如 `wrap_python_method`）捕获并共享——当 Python `str`/`bytes` 自动
+    /// coercion 成 Java `String`/`byte[]` 对象时，需要分配 `ObjectId` 并写入
+    /// `ObjectStore`。所有对象 ID（Python 实例 / marshalling 产物 / 显式 wrapper）
+    /// 统一经此分配器分配，互不冲突。
+    ///
+    /// 注意：class ID 仍由 `JniRegistry` 内部的 `IdAllocator` 分配（独立计数器），
+    /// 与此对象分配器分离——两者类型不同（`ClassId` vs `ObjectId`）、存储不同
+    /// （registry 按 name 索引 vs ObjectStore 按 ObjectId 索引），不会真正冲突。
+    pub object_id_alloc: Arc<Mutex<IdAllocator>>,
     /// APK context（如果当前上下文绑定到某个 APK）。
     /// framework 场景下（如调用 `PackageManager`）应为 `Some`，
     /// 纯 native 场景下可以为 `None`。
@@ -67,6 +80,7 @@ impl AndroidVM {
             refs: RefTable::new(),
             exceptions: ExceptionState::new(),
             natives: NativeRegistry::new(),
+            object_id_alloc: Arc::new(Mutex::new(IdAllocator::new())),
             apk: None,
         }
     }

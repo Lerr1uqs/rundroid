@@ -40,6 +40,7 @@ from .types import (
     JShort,
     JVoid,
 )
+from .values import JavaByteArray, JavaString
 from .verify import (
     annotation_to_jni_descriptor,
     extract_type_hints,
@@ -50,6 +51,8 @@ from .verify import (
 __all__ = [
     "JavaClass",
     "JavaObject",
+    "JavaString",
+    "JavaByteArray",
     "java_class",
     "java_method",
     "java_field",

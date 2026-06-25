@@ -191,6 +191,9 @@ class JavaObject:
     _java_class: "type[JavaClass]"
     _avm: "AVM"
     _handle: int
+    # Rust ObjectStore 内部 key——marshalling 据此识别已注册对象，使 JavaObject 可跨
+    # Python↔Rust 编组边界（作参数/返回值）。由 ``avm.new_object`` 注册时回填。
+    _rundroid_oid: int
 
     def __getattr__(self, name: str) -> Any:
         # 直接读实例 __dict__，避免访问未初始化属性时触发 __getattr__ 递归。

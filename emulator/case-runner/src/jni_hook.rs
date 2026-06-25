@@ -107,6 +107,7 @@ impl CodeHook for JniTrampolineHook {
             refs,
             exceptions,
             natives,
+            object_id_alloc: _,
             apk: _,
         } = &mut *vm_guard;
 

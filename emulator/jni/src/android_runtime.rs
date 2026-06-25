@@ -78,12 +78,21 @@ impl AndroidRuntime {
         Arc::clone(&self.vm.objects)
     }
 
+    /// 获取 ObjectId 分配器的共享引用。
+    ///
+    /// 返回 `Arc<Mutex<IdAllocator>>` 的克隆，供 Python binding 的 marshalling
+    /// 闭包捕获——`str`/`bytes` 自动 coercion 为 Java 对象时需分配 `ObjectId`。
+    /// 与 `objects()` 配套使用：分配 oid → 写入 ObjectStore。
+    pub fn object_id_allocator(&self) -> Arc<Mutex<crate::types::IdAllocator>> {
+        Arc::clone(&self.vm.object_id_alloc)
+    }
+
     /// 分配一个新的 ObjectId。
     ///
-    /// 使用 `JniRegistry` 内部的 `IdAllocator` 统一分配，
-    /// 确保 ObjectId 不与 class/field/method ID 冲突。
+    /// 经 VM 共享的 `object_id_alloc` 分配，确保与 marshalling 闭包、显式 wrapper
+    /// 构造路径分配的对象 ID 处于同一空间，互不冲突。
     pub fn allocate_object_id(&mut self) -> ObjectId {
-        self.vm.classes.allocate_object_id()
+        self.vm.object_id_alloc.lock().unwrap().object()
     }
 
     /// 获取 APK context（如果有）。
