@@ -463,3 +463,76 @@ def test_pure_python_chain_new_object_no_deadlock(emu: "Emulator") -> None:
     a = A(emu.avm)
     assert a.makeB() == 7  # A.makeB → new B → B.makeC → new C → C.value
 
+
+# ============================================================================
+# MRO descriptor 覆写回归
+# ============================================================================
+
+def test_mro_override_uses_descriptor_not_python_name(emu: "Emulator") -> None:
+    """子类用不同 Python 名覆写父类同一 descriptor 时，按 descriptor 胜出。"""
+    from rundroid.javashim import JavaClass, java_class, java_method, register
+
+    @java_class("test/MRO")
+    class Base(JavaClass):
+        def __init__(self) -> None:
+            pass
+
+        @java_method("foo()I")
+        def base_impl(self) -> int:
+            return 1
+
+    @java_class("test/MRO")
+    class Child(Base):
+        @java_method("foo()I")
+        def child_impl(self) -> int:
+            return 2
+
+    # 最终 class 视图里只保留子类 descriptor 对应的方法
+    assert [(py_name, desc) for py_name, desc, _fn, _is_static in Child.__java_methods__] == [
+        ("child_impl", "foo()I")
+    ]
+    assert [
+        (entry.py_name, entry.desc) for entry in Child.__java_dispatch__["foo"]
+    ] == [("child_impl", "foo()I")]
+
+    # 注册不应再因父子重复 descriptor 失败
+    register(emu, [Child])
+    assert Child(emu.avm).foo() == 2
+
+
+def test_mro_override_keeps_other_overloads(emu: "Emulator") -> None:
+    """子类覆写一个 descriptor 时，其他不同 descriptor 的重载仍保留。"""
+    from rundroid.javashim import JavaClass, java_class, java_method, register
+
+    @java_class("test/MROOverload")
+    class Base(JavaClass):
+        def __init__(self) -> None:
+            pass
+
+        @java_method("foo()I")
+        def base_noarg(self) -> int:
+            return 10
+
+        @java_method("foo(I)I")
+        def base_onearg(self, value: int) -> int:
+            return value + 100
+
+    @java_class("test/MROOverload")
+    class Child(Base):
+        @java_method("foo()I")
+        def child_noarg(self) -> int:
+            return 20
+
+    register(emu, [Child])
+    obj = Child(emu.avm)
+
+    # foo()I 被子类覆写
+    assert obj.foo() == 20
+    # foo(I)I 作为不同 descriptor 的重载仍保留
+    assert obj.foo(5) == 105
+
+    method_pairs = [(py_name, desc) for py_name, desc, _fn, _is_static in Child.__java_methods__]
+    assert method_pairs == [
+        ("child_noarg", "foo()I"),
+        ("base_onearg", "foo(I)I"),
+    ]

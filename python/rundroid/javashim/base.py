@@ -119,17 +119,17 @@ class JavaClass:
         super().__init_subclass__(**kwargs)
         dispatch: Dict[str, List[_Entry]] = {}
         methods: List[Tuple[str, str, Callable[..., Any], bool]] = []
-        seen: set[str] = set()  # py_name 去重：子类覆盖父类同名方法只取最近一层
+        seen_descs: set[str] = set()  # descriptor 去重：同一 Java 方法签名只保留最近一层
 
         # 扫 MRO（跳过 JavaClass / object），逐层收集 @java_method 函数。
-        # 从派生类向基类遍历，配合 seen 保证最近一层定义胜出（Python MRO 语义）。
+        # 从派生类向基类遍历，配合 descriptor 去重保证最近一层定义胜出（Python MRO 语义）。
+        # 注意这里不能按 Python attr_name 去重：
+        # 子类完全可能用不同 Python 名去承载与父类相同的 Java descriptor，
+        # 此时覆写语义应由 descriptor 决定，而不是由 Python 名决定。
         for klass in cls.__mro__:
             if klass is JavaClass or klass is object:
                 continue
             for attr_name, raw in vars(klass).items():
-                if attr_name in seen:
-                    continue
-
                 # 解出底层函数 + 判定是否 static（classmethod 视同 instance）
                 if isinstance(raw, staticmethod):
                     fn = raw.__func__
@@ -146,8 +146,10 @@ class JavaClass:
                 desc = _resolve_method_descriptor(raw, fn)
                 if desc is None:
                     continue  # 非 @java_method 方法，跳过
+                if desc in seen_descs:
+                    continue  # 同一 descriptor 已被更近一层类占用，父类实现跳过
 
-                seen.add(attr_name)
+                seen_descs.add(desc)
                 methods.append((attr_name, desc, fn, is_static))
 
                 # 静态方法不进 Python 侧分派表：静态方法走 guest→Python 方向 A
