@@ -41,6 +41,7 @@ class Emulator:
         return AVM(self._engine)
 
     def __getattr__(self, name: str) -> Any:
+        # TODO: 这个属于过度兜底 未来可以移除
         # 仅在正常属性查找失败时触发：透传机器层方法到 engine。
         # ``avm`` property / ``_engine`` 等已在 __dict__ / 类上，不会进到这里。
         return getattr(self._engine, name)

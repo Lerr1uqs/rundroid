@@ -974,6 +974,7 @@ impl PyEmulatorBridge {
     /// 本方法只在没有 Python shim 实例时使用。
     #[pyo3(signature = (class_name, field_desc))]
     fn read_java_field(&self, class_name: &str, field_desc: &str) -> PyResult<PyObject> {
+        // TODO: "bar", "I" 没有考虑签名？
         let mut sig = FieldSig::parse(field_desc)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("field descriptor 解析失败: {e}")

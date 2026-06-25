@@ -27,3 +27,4 @@
 78 +这不只是“未来优化项”，而是当前 adapter 设计已经和上游 typed-signature 约束冲突。
 
 
+- java primitive type到py type的转换？
