@@ -72,7 +72,22 @@ Python 侧输入/输出优先支持原生值：
 - 自动 coercion 会丢失身份，不能覆盖所有场景。
 - wrapper 作为 opt-in 不会破坏脚本便利性。
 
-### 决策 3：Rust 侧以 `ObjectStorage` 为最终 authority，Python 侧只做语义层封装
+### 决策 3：wrapper 负责生命周期，且必须禁止循环引用
+
+显式 wrapper SHALL 持有稳定句柄，并提供 `release()` 作为显式释放入口；同时实现 `__del__`
+作为最后兜底。wrapper SHALL 禁止形成 Python 循环引用。
+
+当前 change 不实现循环引用自动检测，只把“禁止循环引用”作为设计约束写入文档和实现规范；
+后续如需检测，可单独开 change 补充。
+
+理由：
+
+- 身份对象的生命周期必须可控，否则 `String` / `byte[]` 会长期滞留在 ObjectStore。
+- `__del__` 适合自动补漏，但不应作为唯一释放语义。
+- 禁止 wrapper 形成循环引用后，Python 生命周期可以更稳定地映射到 JNI 释放。
+- 先不做自动检测可以保持实现范围收敛，避免把 marshalling change 扩大成 GC 分析问题。
+
+### 决策 4：Rust 侧以 `ObjectStorage` 为最终 authority，Python 侧只做语义层封装
 
 所有 `String` / `byte[]` / wrapper 的真实载体仍由 Rust `ObjectStore` 持有。
 Python 侧只负责：
@@ -85,21 +100,28 @@ Python 侧只负责：
 - 现有 Rust foundation 已经有 `make_string`、`make_wrapper`、`make_primitive_array`。
 - authority 继续留在 Rust，避免 Python 侧自建第二套对象真相。
 
-### 决策 4：对 `JValue::Object` 回 Python 必须做 storage-aware 分发
+### 决策 5：对 `JValue::Object` 回 Python 必须做 storage-aware 分发
 
 回 Python 时不再统一返回 `None`，而是按 `ObjectStorage` 分发：
 
 - `ObjectStorage::String` → Python `str`
 - `ObjectStorage::PrimitiveArray(Byte)` → Python `bytes`
 - `ObjectStorage::Wrapper` → 对应 Python 标量或 wrapper
-- 其他对象 → 保留为 Python `JavaObject` / handle wrapper（按现有对象模型）
+- `ObjectStorage::HostValue(Py<PyAny>)` → 原 Python 对象（JavaObject 回传）
+- 其他对象 / dangling OID → **fail-fast 抛异常**（不降级 `None`，满足 Req 6 + Constraints）
+
+未覆盖的 storage 变体（非 Byte `PrimitiveArray`、`ObjectArray`、`StubInstance`、
+非 `Py<PyAny>` 的 `HostValue`、dangling OID）按 Req 6 直接抛异常，
+其中 dangling OID → `PyRuntimeError`（运行时状态不一致），其余 → `PyTypeError`。
 
 理由：
 
 - `None` 会吞掉真实参数与返回值。
 - 编组层必须知道对象的 storage 类型，否则对象语义全丢。
+- "保留为 JavaObject handle wrapper" 需要 handle wrapper 基础设施，本 change 不具备；
+  改为 fail-fast 更符合项目「let-it-failed」风格，且避免静默丢失数据。
 
-### 决策 5：`convert_pyargs_to_jniargs` 与 `py_object_to_jvalue` 共用一个类型规则表
+### 决策 6：`convert_pyargs_to_jniargs` 与 `py_object_to_jvalue` 共用一个类型规则表
 
 两个方向的编组规则必须成对实现，避免“进得去、回不来”：
 

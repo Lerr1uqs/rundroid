@@ -64,6 +64,22 @@ Python 侧 SHALL 提供显式 wrapper，用于 identity-sensitive 的内置 Java
 - **WHEN** 用户需要保留 byte array 对象身份
 - **THEN** Python SHALL 提供一个显式的 byte array wrapper 创建路径
 
+### Requirement: Explicit wrappers SHALL manage release through Python lifecycle hooks
+
+显式 wrapper SHALL 提供显式 `release()`，并在不形成循环引用时通过 `__del__` 触发释放兜底。
+
+#### Scenario: Wrapper release is explicit and idempotent
+
+- **WHEN** 用户手动调用 wrapper 的 `release()`
+- **THEN** 对应的 JNI / ObjectStore 资源 SHALL 被释放
+- **AND** 再次调用 `release()` SHALL NOT 引发重复释放错误
+
+#### Scenario: Wrapper __del__ triggers best-effort release
+
+- **WHEN** wrapper 被 Python GC 回收且未形成循环引用
+- **THEN** `__del__` SHALL 尝试触发释放
+- **AND** SHALL NOT 依赖循环引用场景才能完成释放
+
 ### Requirement: Marshalling SHALL remain fail-fast on unsupported values
 
 对未支持的值类型，binding SHALL 直接报错，不得静默降级为 `Null`。

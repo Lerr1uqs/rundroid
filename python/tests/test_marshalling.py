@@ -608,3 +608,96 @@ def test_returned_wrapper_degrades_to_str(emu: "Emulator") -> None:
     # 入参 wrapper 复用 oid（不新建）；返回侧 String storage → str
     assert out == "wrapped"
     assert isinstance(out, str)
+
+
+# ============================================================================
+# Req 5：wrapper 生命周期（release / __del__）
+# ============================================================================
+
+
+def test_java_string_release_is_idempotent(emu: "Emulator") -> None:
+    """``JavaString.release()`` 幂等：两次调用不抛，首次确实清了底层资源。"""
+    from rundroid.javashim import JavaString
+
+    js = emu.avm.new_string("release-me")
+    handle = js._handle
+
+    # 首次 release 不抛
+    js.release()
+
+    # 二次 release 幂等，不抛
+    js.release()
+
+    # 验证首次 release 确实清理了 RefTable：直接调底层应报 ValueError
+    with pytest.raises(ValueError):
+        emu.avm.release_java_instance(handle)
+
+
+def test_java_byte_array_release_is_idempotent(emu: "Emulator") -> None:
+    """``JavaByteArray.release()`` 幂等：同 JavaString 语义。"""
+    from rundroid.javashim import JavaByteArray
+
+    jb = emu.avm.new_bytes(b"\xde\xad")
+    handle = jb._handle
+
+    jb.release()
+    jb.release()  # 幂等
+
+    with pytest.raises(ValueError):
+        emu.avm.release_java_instance(handle)
+
+
+def test_java_string_del_triggers_release(emu: "Emulator") -> None:
+    """``JavaString.__del__`` 在 GC 回收后触发底层释放。"""
+    from rundroid.javashim import JavaString
+
+    js = emu.avm.new_string("gc-me")
+    handle = js._handle
+    assert not js._released
+
+    # CPython refcount: del 立即触发 __del__
+    del js
+    # gc.collect 兜底（非 CPython 实现或循环引用场景）
+    import gc
+    gc.collect()
+
+    # __del__ 应已触发 release → handle 已从 RefTable 移除
+    with pytest.raises(ValueError):
+        emu.avm.release_java_instance(handle)
+
+
+# ============================================================================
+# Req 6：fail-fast —— dangling OID 回 Python 时抛异常（非静默 None）
+# ============================================================================
+
+
+def test_dangling_oid_return_to_python_raises(emu: "Emulator") -> None:
+    """wrapper release 后再经 marshalling 传参→dangling OID→RuntimeError（非 None）。
+
+    同时验证：
+    - Part A：``jvalue_object_to_py`` 对 dangling OID 抛 RuntimeError（fail-fast）
+    - Part B：``release()`` 真的从 ObjectStore 移除了条目
+    """
+    from rundroid.javashim import JavaClass, java_class, java_method, register
+    from rundroid.javashim import JavaString
+
+    js = emu.avm.new_string("will-dangle")
+    js.release()  # oid 从 ObjectStore + RefTable 移除
+
+    @java_class("test/Sink")
+    class Sink(JavaClass):
+        def __init__(self) -> None:
+            self.received: object = None
+
+        @java_method("take(Ljava/lang/String;)V")
+        def take(self, s: str) -> None:
+            self.received = s
+
+    register(emu, [Sink])
+    handle = Sink(emu.avm)._handle
+
+    # dangling OID 被传入 → jvalue_object_to_py 命中 storage(oid)==None → RuntimeError
+    with pytest.raises(RuntimeError, match="dangling OID"):
+        emu.avm.call_java_method_typed(
+            handle, "take(Ljava/lang/String;)V", (js,)
+        )

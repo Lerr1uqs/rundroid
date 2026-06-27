@@ -21,7 +21,43 @@ if TYPE_CHECKING:
     from ..avm import AVM
 
 
-class JavaString:
+class _JavaValueWrapper:
+    """Java 内置值 wrapper 的公共基类——承载生命周期管理。
+
+    ``release()`` 幂等释入底层 JNI / ObjectStore 资源；
+    ``__del__`` 作为 GC 回收时的 best-effort 兜底（设计决策 3）。
+
+    不持有 ``Py<PyAny>`` 引用（Rust 侧存的是 ``String`` / ``Vec<JValue>``），
+    不会与 AVM / engine 形成循环引用——满足「禁止循环引用」设计约束。
+    """
+
+    _avm: AVM
+    _handle: int
+    _rundroid_oid: int
+    _released: bool
+
+    def release(self) -> None:
+        """显式释放底层 JNI / ObjectStore 资源（幂等，不抛重复释放错误）。"""
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._avm.release_java_instance(self._handle)
+        except Exception:
+            # best-effort：底层资源可能已被清理（如 emulator teardown），不破坏幂等语义
+            pass
+
+    def __del__(self) -> None:
+        """GC 回收兜底（best-effort，禁止依赖循环引用 / 解释器 teardown 下不抛）。"""
+        if getattr(self, "_released", True):
+            return  # 已显式释放，或 __init__ 未跑完（_released 缺失）→ 跳过
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+class JavaString(_JavaValueWrapper):
     """``java/lang/String`` 的显式 wrapper（identity 敏感）。
 
     携带：
@@ -38,9 +74,11 @@ class JavaString:
 
     def __init__(self, avm: "AVM", value: str) -> None:
         handle, oid = avm.register_java_string(value)
+        self._avm = avm
         self._handle = handle
         self._rundroid_oid = oid
         self._value = value
+        self._released = False
 
     @property
     def value(self) -> str:
@@ -51,7 +89,7 @@ class JavaString:
         return f"JavaString({self._value!r}, oid={self._rundroid_oid})"
 
 
-class JavaByteArray:
+class JavaByteArray(_JavaValueWrapper):
     """``byte[]`` 的显式 wrapper（identity 敏感）。语义同 :class:`JavaString`。"""
 
     _handle: int
@@ -59,9 +97,11 @@ class JavaByteArray:
 
     def __init__(self, avm: "AVM", value: bytes) -> None:
         handle, oid = avm.register_java_bytes(value)
+        self._avm = avm
         self._handle = handle
         self._rundroid_oid = oid
         self._value = bytes(value)
+        self._released = False
 
     @property
     def value(self) -> bytes:

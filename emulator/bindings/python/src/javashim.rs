@@ -183,7 +183,7 @@ pub fn wrap_python_method_no_args(
 //   Object(byte[])  → bytes
 //   Object(Wrapper) → 对应 Python 标量
 //   Object(HostValue)→ 原 Python 对象（JavaObject 回传）
-//   其它 Object     → None           （本 change 不覆盖的数组/对象）
+//   其它 Object     → Err            fail-fast，未覆盖的 storage 直接报错（Req 6）
 
 /// 把 Python `str` 落成 `ObjectStore` 中的 `java/lang/String`，返回其 `ObjectId`。
 ///
@@ -244,6 +244,7 @@ pub fn py_to_jvalue(
         }
     }
     // 注意：bool 必须在 int 之前判断（Python bool 是 int 的子类，extract::<i32>() 也会成功）
+    // TODO: 这地方难道没办法改成match范式？
     if let Ok(b) = obj.extract::<bool>() {
         return Ok(JValue::Boolean(b));
     }
@@ -375,8 +376,8 @@ enum OwnedObject {
     Primitive(JValue),
     /// HostValue 持有的 Python 对象（JavaObject 回传）。
     PyObj(Py<PyAny>),
-    /// 本 change 未覆盖的 storage（如 int[]/Object[]/StubInstance）。
-    Unsupported,
+    /// 未覆盖的 storage / dangling OID —— 携带描述用于 fail-fast 报错。
+    Unsupported(String),
 }
 
 /// 将单个 [`JValue`] 转换为 Python 对象（storage-aware）。
@@ -403,15 +404,21 @@ pub fn jvalue_to_py(
 }
 
 /// 将 `JValue::Object(oid)` 按 storage 类型还原成 Python 值。
+///
+/// 对已覆盖的 storage（String / byte[] / Wrapper / HostValue<Py>）按类型分发还原；
+/// 对未覆盖的 storage 和 dangling OID，fail-fast 抛异常（Req 6）。
 fn jvalue_object_to_py(
     py: Python<'_>,
     oid: ObjectId,
     objects: &Arc<Mutex<ObjectStore>>,
 ) -> PyResult<PyObject> {
-    // 锁内：按 storage clone 出 owned 数据，立即释放锁。
+    // 锁内：按 storage clone 出 owned 数据 / 错误描述，立即释放锁再 act。
     let owned = {
         let store = objects.lock().unwrap();
         match store.storage(oid) {
+            None => OwnedObject::Unsupported(format!(
+                "ObjectId {oid} 不在 ObjectStore 中（dangling OID）"
+            )),
             Some(ObjectStorage::String(s)) => OwnedObject::Str(s.clone()),
             Some(ObjectStorage::PrimitiveArray { jtype: JType::Byte, elements }) => {
                 // byte[] → bytes（仅 Byte 数组；其它 primitive 数组本 change 不覆盖）
@@ -424,12 +431,22 @@ fn jvalue_object_to_py(
                     .collect();
                 OwnedObject::Bytes(bytes)
             }
+            Some(ObjectStorage::PrimitiveArray { jtype, .. }) => OwnedObject::Unsupported(
+                format!("ObjectStorage::PrimitiveArray({jtype:?}) 不支持（仅 byte[] 已实现）")
+            ),
             Some(ObjectStorage::Wrapper { value, .. }) => OwnedObject::Primitive(value.clone()),
             Some(ObjectStorage::HostValue { data }) => match data.downcast_ref::<Py<PyAny>>() {
                 Some(p) => OwnedObject::PyObj(p.clone_ref(py)),
-                None => OwnedObject::Unsupported,
+                None => OwnedObject::Unsupported(
+                    "ObjectStorage::HostValue 的 data 非 Py<PyAny>，无法还原为 Python 对象".into()
+                ),
             },
-            _ => OwnedObject::Unsupported,
+            Some(ObjectStorage::ObjectArray { .. }) => OwnedObject::Unsupported(
+                "ObjectStorage::ObjectArray 未实现 Python 投影".into()
+            ),
+            Some(ObjectStorage::StubInstance { .. }) => OwnedObject::Unsupported(
+                "ObjectStorage::StubInstance 未实现 Python 投影".into()
+            ),
         }
     }; // ← objects 锁在此释放
 
@@ -438,7 +455,106 @@ fn jvalue_object_to_py(
         OwnedObject::Bytes(b) => b.into_py_any(py),
         OwnedObject::Primitive(v) => jvalue_to_py(py, &v, objects),
         OwnedObject::PyObj(p) => Ok(p.into()),
-        // 未覆盖的 storage：回 None（本 change 不要求 int[]/Object[] 等的 Python 投影）
-        OwnedObject::Unsupported => Ok(py.None()),
+        OwnedObject::Unsupported(desc) => {
+            // dangling OID 是运行时状态不一致 → RuntimeError；其余是类型未覆盖 → TypeError
+            if desc.contains("dangling OID") {
+                Err(pyo3::exceptions::PyRuntimeError::new_err(desc))
+            } else {
+                Err(pyo3::exceptions::PyTypeError::new_err(desc))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 辅助：构造一个注入了指定 storage 的 ObjectStore，返回 (store, oid)。
+    fn store_with(oid_val: u64, storage: ObjectStorage) -> (Arc<Mutex<ObjectStore>>, ObjectId) {
+        let mut alloc = IdAllocator::new();
+        let oid = alloc.object();
+        // 确保分配的 oid 与期望一致（构造用）
+        assert_eq!(oid.0, oid_val, "IdAllocator 应从 1 递增");
+        let mut store = ObjectStore::new();
+        store
+            .insert(oid, "test/Fake".into(), storage)
+            .unwrap();
+        (Arc::new(Mutex::new(store)), oid)
+    }
+
+    #[test]
+    fn test_jvalue_object_dangling_oid_raises_runtime_error() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let store = Arc::new(Mutex::new(ObjectStore::new()));
+            let result = jvalue_object_to_py(py, ObjectId(999), &store);
+            assert!(result.is_err(), "dangling OID 应抛异常而非返回 None");
+            let err = result.unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+        });
+    }
+
+    #[test]
+    fn test_jvalue_object_object_array_raises_type_error() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let storage = ObjectStorage::ObjectArray {
+                class_name: "java/lang/String".into(),
+                elements: vec![],
+            };
+            let (store, oid) = store_with(1, storage);
+            let result = jvalue_object_to_py(py, oid, &store);
+            assert!(result.is_err(), "ObjectArray 应抛 TypeError");
+            let err = result.unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn test_jvalue_object_stub_instance_raises_type_error() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let storage = ObjectStorage::StubInstance {
+                data: Box::new("stub data"),
+            };
+            let (store, oid) = store_with(1, storage);
+            let result = jvalue_object_to_py(py, oid, &store);
+            assert!(result.is_err(), "StubInstance 应抛 TypeError");
+            let err = result.unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn test_jvalue_object_non_byte_primitive_array_raises_type_error() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let storage = ObjectStorage::PrimitiveArray {
+                jtype: JType::Int,
+                elements: vec![JValue::Int(1), JValue::Int(2)],
+            };
+            let (store, oid) = store_with(1, storage);
+            let result = jvalue_object_to_py(py, oid, &store);
+            assert!(result.is_err(), "非 Byte 的 PrimitiveArray 应抛 TypeError");
+            let err = result.unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn test_jvalue_object_host_value_non_py_raises_type_error() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            // HostValue 内部 data 非 Py<PyAny>（放入一个 String）
+            let storage = ObjectStorage::HostValue {
+                data: Box::new("not a py object".to_string()),
+            };
+            let (store, oid) = store_with(1, storage);
+            let result = jvalue_object_to_py(py, oid, &store);
+            assert!(result.is_err(), "非 Py HostValue 应抛 TypeError");
+            let err = result.unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
     }
 }
