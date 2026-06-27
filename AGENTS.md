@@ -73,7 +73,7 @@ rust提供运行层核心框架 能够打包为python ffi 让python 通过给定
 其实就是rust写core 提供api和stub给到python 写python脚本去运行unidbg模拟+补齐环境
 当然也可以添加rs代码作为链接时加入来保证速度（这个后面继续优化 现在先不做）
 
-> 注意下面的API不一定完全需要完全对照 只是当做意思符合
+> 注意下面的API不一定完全需要完全对照 只是当做意思符合 后续随时会变 只参考语义不要参考命名即可
 ```python
 @java_class("android/content/pm/Signature")
 class Signature(JavaObject): # 注册后 native层调用会走到这里 
@@ -104,6 +104,8 @@ emulator = (
         .build()
 )
 
+emulator.avm.register_java_classes([Signature])
+
 SharedLibrary so = emulator.load_library("path/to/file")
 emulator.jni_onload(so)
 
@@ -118,7 +120,8 @@ class Breakpoint(BreakpointInterface):
 
 emulator.breakpoint.add(so.base + 0x1234, Breakpoint())
 
-sig = emulator.call("signature([B)V", bytes([0x11, 0x22, 0x33]))
+jclass = emulator.avm.find_class("android/content/pm/Signature")
+sig = emulator.avm.new_object(jclass, bytes([0x11, 0x22, 0x33])) # call the constructor: "android/content/pm/Signature->signature([B)V"
 ```
 
 # 项目文档
