@@ -70,6 +70,11 @@ pub struct FrameworkClassSpec {
 
 1. framework behavior 通过 class spec 注册
 2. `getSystemService` 走 service registry
-3. package/signature/asset 行为只从 `ApkContext` 读取
+3. package/signature/asset 行为优先从 `ApkContext` 读取（preferred，非强制）
+   - 当前 change 中 `ApkContext` 是缓解手段/并行线：框架 stub 可手动注入包名、签名等数据，
+     不强依赖 APK 解析能力。
+   - 后续单独 change 实现 APK 提取（manifest / signature certificate / assets）后，
+     `ApkContext` 可选择 load 给定的 APK 文件，为 stub 提供真实数据源。
+   - 在 APK 提取就绪之前，所有包/签名相关 stub 必须支持**无 APK 运行**（mock 数据路径）。
 4. 不允许再新增 giant signature switch 作为正式主线
 5. Rust builtin 与 Python override 必须进入同一套 class/member 数据模型
