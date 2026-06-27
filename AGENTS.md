@@ -57,6 +57,12 @@ CPU ARM 这种首字母缩写的**类名** 就尽量全部大写 不要出现 `C
 
 编写python的时候不要使用 Any作为typing 尽量都要使用typing作为注释
 
+# 规范要求
+
+android jni linux部分都需要参考这些项目的spec规范要求
+
+so/build/binary之类的artifact文件需要加入gitignore
+
 # 项目管理
 rust 提供 ffi给到python 如果需要运行python 务必使用uv 管理 不要用全局python
 
