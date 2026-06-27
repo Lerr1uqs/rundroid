@@ -1,12 +1,12 @@
-- [ ] 新增 `android-framework-stubs` capability 的正式 spec
-- [ ] 在 `emulator/jni/framework` 中实现 `FrameworkRegistry`
-- [ ] 建立 class-spec / method-spec / field-spec 数据结构，并映射到统一 Rust class/member authority
-- [ ] 建立 `ServiceRegistry`，覆盖 phone/wifi/connectivity/sensor/activity/window/audio 等最小集合
-- [ ] 实现 `Application` / `Context` / `ContextWrapper` 最小 stub
-- [ ] 实现 `PackageManager` / `PackageInfo` / `Signature` / `ApplicationInfo` 最小 stub
-- [ ] 实现 `AssetManager` / `Bundle` / `IBinder` / `IServiceManager` 最小 stub
-- [ ] 实现 `String` / `Class` / primitive wrappers / `ArrayList` / `List` / `Map` / `Set` / `Iterator` / `Enumeration` 最小 stub
-- [ ] 确保 framework stub 从 `ApkContext` 读取包名、版本、签名、资产
-- [ ] 明确 Rust builtin 与 Python javashim 共用同一套 class/member 数据结构与注册主线
-- [ ] 增加 harness cases：`getPackageName()`、`getPackageInfo()`、`Signature.hashCode()`、`getSystemService()`
-- [ ] 使用 `openspec validate --type change android-framework-stubs --strict` 验证 change
+- [x] 新增 `android-framework-stubs` capability 的正式 spec
+- [x] 在 `emulator/jni/framework` 中实现 `FrameworkRegistry`
+- [x] 建立 class-spec / method-spec / field-spec 数据结构，并映射到统一 Rust class/member authority
+- [x] 建立 `ServiceRegistry`，覆盖 phone/wifi/connectivity/sensor/activity/window/audio 等最小集合
+- [x] 实现 `Application` / `Context` / `ContextWrapper` 最小 stub
+- [x] 实现 `PackageManager` / `PackageInfo` / `Signature` / `ApplicationInfo` 最小 stub
+- [x] 实现 `AssetManager` / `Bundle` / `IBinder` / `IServiceManager` 最小 stub
+- [x] 实现 `String` / `Class` / primitive wrappers / `ArrayList` / `List` / `Map` / `Set` / `Iterator` / `Enumeration` 最小 stub
+- [x] 确保 framework stub 从 `ApkContext` 读取包名、版本、签名、资产
+- [x] 明确 Rust builtin 与 Python javashim 共用同一套 class/member 数据结构与注册主线
+- [x] 增加 harness cases：`getPackageName()`、`getPackageInfo()`、`Signature.hashCode()`、`getSystemService()`
+- [x] 使用 `openspec validate --type change android-framework-stubs --strict` 验证 change

@@ -18,6 +18,8 @@
 //! - [`apk_context`]：APK context（package / version / manifest / signatures / assets）
 //! - [`android_vm`]：`AndroidVM` — class / object / ref / exception / apk 聚合根
 //! - [`android_runtime`]：`AndroidRuntime` — Emulator 持有的高级整合点
+//! - [`framework`]：Android framework stubs — class-spec 驱动的 framework registry，
+//!   builtin class 经 `install()` 收敛进 `JniRegistry` 统一 authority
 //!
 //! # 设计原则
 //!
@@ -39,6 +41,7 @@ pub mod dispatch;
 pub mod error;
 pub mod exception;
 pub mod field;
+pub mod framework;
 pub mod function_table;
 pub mod javavm;
 pub mod jnienv;
@@ -58,6 +61,10 @@ pub use class::{ClassBuilder, ClassKind, JClassDef, JFieldDef, JMethodDef};
 pub use dispatch::MethodImpl;
 pub use error::JniError;
 pub use exception::{ExceptionRecord, ExceptionState};
+pub use framework::{
+    FrameworkClassSpec, FrameworkClassSpecBuilder, FrameworkConstructorSpec, FrameworkFieldSpec,
+    FrameworkMethodSpec, FrameworkRegistry, ServiceEntry, ServiceRegistry,
+};
 pub use native_registry::{
     GuestPtr, NativeRegistry, mangle_java_method, mangle_java_method_overloaded,
     unmangle_java_symbol, validate_jni_version,
