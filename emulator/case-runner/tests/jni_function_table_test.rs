@@ -5,7 +5,6 @@
 //! guest 侧通过 `(*env)->FindClass / GetStaticMethodID / CallStaticIntMethod`
 //! 调用 JNI 函数表，验证完整 dispatch 链路。
 
-use rundroid_backend::MemPerms;
 use rundroid_case_runner::GuestRuntime;
 use rundroid_core::RuntimeConfig;
 use rundroid_jni::{
@@ -240,4 +239,58 @@ fn test_jni_full_flow_counter() {
         "jni_full_flow 应返回 0x{:X}（100<<16|101），实际返回 0x{ret:X}",
         expected
     );
+}
+
+/// 验证 guest 通过 JavaVM invoke table 调 GetEnv 拿到有效 JNIEnv*。
+///
+/// guest 侧 `test_get_env_via_javavm(JavaVM*)`：
+/// 1. `(*vm)->GetEnv(vm, &env, JNI_VERSION_1_6)` → 期望 JNI_OK + env 非空
+/// 2. 用返回的 env 调 GetVersion / FindClass 验证 env 对当前 VM 有效
+///
+/// 覆盖 jni-abi-surfaces 的 JavaVMABI invoke table 主线（GetEnv 入口）。
+#[test]
+fn test_get_env_via_javavm() {
+    let (vm,) = build_test_vm();
+    let config = RuntimeConfig::default();
+    let mut rt = GuestRuntime::assemble(config).unwrap();
+    rt.init_jni(vm).unwrap();
+
+    let bytes = read_fixture();
+    rt.load_and_link("libjnitest.so", &bytes, &mut |_| None).unwrap();
+
+    let entry = rt.resolve_symbol("test_get_env_via_javavm")
+        .expect("test_get_env_via_javavm 符号未找到");
+
+    // 传入 JavaVM* 作为 x0，guest 通过 invoke table 调 GetEnv
+    let java_vm_ptr = rt.java_vm_pointer.unwrap();
+    let ret = rt.call_export(entry, &[java_vm_ptr]).unwrap();
+
+    assert_eq!(ret, 0, "test_get_env_via_javavm 应返回 0（成功），实际返回 {ret}");
+}
+
+/// 验证 JavaVM invoke table 的 AttachCurrentThread / DetachCurrentThread 端到端。
+///
+/// guest 侧 `test_attach_via_javavm(JavaVM*)`：
+/// 1. `(*vm)->AttachCurrentThread(vm, &env, NULL)` → JNI_OK + env 非空
+/// 2. 用 attach 返回的 env 调 FindClass 验证 env 有效
+/// 3. `(*vm)->DetachCurrentThread(vm)` → JNI_OK
+///
+/// 覆盖 jni-abi-surfaces task 5 三个 invoke 入口的另两个（GetEnv 见上）。
+#[test]
+fn test_attach_detach_via_javavm() {
+    let (vm,) = build_test_vm();
+    let config = RuntimeConfig::default();
+    let mut rt = GuestRuntime::assemble(config).unwrap();
+    rt.init_jni(vm).unwrap();
+
+    let bytes = read_fixture();
+    rt.load_and_link("libjnitest.so", &bytes, &mut |_| None).unwrap();
+
+    let entry = rt.resolve_symbol("test_attach_via_javavm")
+        .expect("test_attach_via_javavm 符号未找到");
+
+    let java_vm_ptr = rt.java_vm_pointer.unwrap();
+    let ret = rt.call_export(entry, &[java_vm_ptr]).unwrap();
+
+    assert_eq!(ret, 0, "test_attach_via_javavm 应返回 0（成功），实际返回 {ret}");
 }

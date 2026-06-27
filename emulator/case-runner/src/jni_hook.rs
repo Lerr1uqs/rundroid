@@ -26,41 +26,64 @@ use rundroid_backend::{Arm64Reg, CodeHook, GuestCPU};
 use rundroid_telemetry::TelemetryEventKind;
 use rundroid_jni::{
     function_table::{
-        self, JniFunctionTable,
-        JNI_CALL_BOOLEAN_METHOD, JNI_CALL_BYTE_METHOD, JNI_CALL_CHAR_METHOD,
-        JNI_CALL_DOUBLE_METHOD, JNI_CALL_FLOAT_METHOD, JNI_CALL_INT_METHOD,
-        JNI_CALL_LONG_METHOD, JNI_CALL_OBJECT_METHOD, JNI_CALL_SHORT_METHOD,
-        JNI_CALL_STATIC_BOOLEAN_METHOD, JNI_CALL_STATIC_INT_METHOD,
-        JNI_CALL_STATIC_LONG_METHOD, JNI_CALL_STATIC_OBJECT_METHOD,
-        JNI_CALL_STATIC_VOID_METHOD, JNI_CALL_VOID_METHOD,
-        JNI_DELETE_GLOBAL_REF, JNI_DELETE_LOCAL_REF,
-        JNI_EXCEPTION_CLEAR, JNI_EXCEPTION_OCCURRED,
-        JNI_FIND_CLASS, JNI_GET_FIELD_ID, JNI_GET_INT_FIELD, JNI_GET_JAVA_VM,
-        JNI_GET_METHOD_ID, JNI_GET_OBJECT_CLASS, JNI_GET_OBJECT_FIELD,
-        JNI_GET_STATIC_FIELD_ID, JNI_GET_STATIC_METHOD_ID,
-        JNI_GET_STRING_UTF_CHARS, JNI_GET_VERSION,
+        JNI_ALLOC_OBJECT, JNI_CALL_BOOLEAN_METHOD, JNI_CALL_BYTE_METHOD,
+        JNI_CALL_CHAR_METHOD, JNI_CALL_DOUBLE_METHOD, JNI_CALL_FLOAT_METHOD,
+        JNI_CALL_INT_METHOD, JNI_CALL_LONG_METHOD, JNI_CALL_OBJECT_METHOD,
+        JNI_CALL_SHORT_METHOD, JNI_CALL_STATIC_BOOLEAN_METHOD,
+        JNI_CALL_STATIC_INT_METHOD, JNI_CALL_STATIC_LONG_METHOD,
+        JNI_CALL_STATIC_OBJECT_METHOD, JNI_CALL_STATIC_VOID_METHOD,
+        JNI_CALL_VOID_METHOD, JNI_DELETE_GLOBAL_REF, JNI_DELETE_LOCAL_REF,
+        JNI_EXCEPTION_CLEAR, JNI_EXCEPTION_OCCURRED, JNI_FIND_CLASS,
+        JNI_GET_FIELD_ID, JNI_GET_INT_FIELD, JNI_GET_JAVA_VM, JNI_GET_METHOD_ID,
+        JNI_GET_OBJECT_CLASS, JNI_GET_OBJECT_FIELD, JNI_GET_STATIC_FIELD_ID,
+        JNI_GET_STATIC_METHOD_ID, JNI_GET_STRING_UTF_CHARS, JNI_GET_VERSION,
         JNI_NEW_GLOBAL_REF, JNI_NEW_LOCAL_REF, JNI_NEW_OBJECT, JNI_NEW_STRING_UTF,
         JNI_REGISTER_NATIVES, JNI_SET_INT_FIELD, JNI_SET_OBJECT_FIELD,
-        JNI_ALLOC_OBJECT,
     },
-    AndroidVM, JniEnvSurface,
+    apply_attach_current_thread, apply_detach_current_thread, apply_get_env,
+    validate_jni_version, AndroidVM, JNIEnvABI, JavaVMABI, JavaVMThreadState,
+    JniEnvSurface, JniSlotHandler, JNI_ERR, JNI_EDETACHED, JNI_EVERSION, JNI_OK,
+    JNI_INVOKE_ATTACH_CURRENT_THREAD, JNI_INVOKE_DETACH_CURRENT_THREAD,
+    JNI_INVOKE_GET_ENV,
 };
 use rundroid_jni::error::JniError;
 use rundroid_jni::types::JValue;
 
 /// JNI trampoline 的 CodeHook 实现。
+///
+/// 持有 guest 可见的 JNIEnv / JavaVM ABI 布局（[`JNIEnvABI`] / [`JavaVMABI`]）、
+/// 共享 VM 状态、当前线程 attach 状态，以及 telemetry 收集器。
+///
+/// [`CodeHook::on_code`] 按 guest PC 落点分流：
+/// - 落在 JNIEnv trampoline 区 → [`Self::dispatch_env`]（函数表入口）
+/// - 落在 JavaVM trampoline 区 → [`Self::dispatch_invoke`]（invoke table 入口）
+/// - 其它（数据区误入）→ fail-fast
 pub struct JniTrampolineHook {
-    /// guest 内存布局信息。
-    table: JniFunctionTable,
+    /// JNIEnv ABI 布局（函数表 + trampoline）。
+    env_abi: JNIEnvABI,
+    /// JavaVM ABI 布局（invoke table + trampoline）。
+    vm_abi: JavaVMABI,
     /// 共享 VM 状态。
     vm: Arc<Mutex<AndroidVM>>,
+    /// 当前线程 attach 状态（GetEnv/Attach/Detach 状态机）。
+    thread_state: JavaVMThreadState,
     /// 共享 telemetry 事件收集器（hook 内写、runtime 读）。
     telemetry: Arc<Mutex<Vec<(String, TelemetryEventKind)>>>,
 }
 
 impl JniTrampolineHook {
-    pub fn new(table: JniFunctionTable, vm: Arc<Mutex<AndroidVM>>) -> Self {
-        Self { table, vm, telemetry: Arc::new(Mutex::new(Vec::new())) }
+    /// 构造 trampoline hook。
+    ///
+    /// 主线程默认已 attach（runtime 在 `JNI_OnLoad` 前 attach 主线程）。
+    pub fn new(env_abi: JNIEnvABI, vm_abi: JavaVMABI, vm: Arc<Mutex<AndroidVM>>) -> Self {
+        let thread_state = JavaVMThreadState::main_thread(env_abi.env_ptr());
+        Self {
+            env_abi,
+            vm_abi,
+            vm,
+            thread_state,
+            telemetry: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// 返回共享的 telemetry 事件收集器引用。
@@ -68,39 +91,62 @@ impl JniTrampolineHook {
         Arc::clone(&self.telemetry)
     }
 
-    pub fn trampoline_begin(&self) -> u64 {
-        self.table.trampoline_base
-    }
-
-    pub fn trampoline_end(&self) -> u64 {
-        self.table.trampoline_base
-            + (function_table::JNI_TABLE_SIZE as u64) * function_table::TRAMPOLINE_SLOT_SIZE
-            - 1
-    }
-
-    /// 获取 JNIEnv guest 指针（供传入 guest native 方法）。
-    pub fn env_ptr(&self) -> u64 {
-        self.table.env_ptr
+    /// push 一条 telemetry 事件到共享收集器。
+    fn emit(&self, name: String, kind: TelemetryEventKind) {
+        if let Ok(mut sink) = self.telemetry.lock() {
+            sink.push((name, kind));
+        }
     }
 }
 
 impl CodeHook for JniTrampolineHook {
     fn on_code(&mut self, cpu: &mut dyn GuestCPU, address: u64) {
-        let index = self.table.function_index(address);
+        // 按地址分流：jni trampoline / javavm trampoline / 异常（数据区误入）。
+        let result = if address <= self.env_abi.trampoline_end() {
+            self.dispatch_env(cpu, address)
+        } else if address >= self.vm_abi.trampoline_begin()
+            && address <= self.vm_abi.trampoline_end()
+        {
+            self.dispatch_invoke(cpu, address)
+        } else {
+            Err(JniError::Internal(format!(
+                "code hook 触发于非 trampoline 地址 0x{address:X}（数据区误入？）"
+            )))
+        };
 
-        // 锁 VM 并构造 JniEnvSurface
-        let mut vm_guard = self.vm.lock().unwrap();
+        self.finish(cpu, result);
+    }
+}
 
-        // 读 CPU 寄存器（JNI 调用参数，x0 = JNIEnv*）
-        let _x0 = cpu.reg_read(Arm64Reg::X(0)); // JNIEnv* (我们管理的 guest 指针)
+impl JniTrampolineHook {
+    /// 分派 JNIEnv function table 入口（FindClass / Call*Method / Field / ...）。
+    ///
+    /// slot 元数据驱动：先查 [`JNIEnvABI::slot_spec`]，未列入或 `Unimplemented` 的
+    /// slot 直接 fail-fast 并 telemetry 报名；`Bridge` slot 才进入实际 dispatch。
+    fn dispatch_env(&mut self, cpu: &mut dyn GuestCPU, address: u64) -> Result<u64, JniError> {
+        let index = self.env_abi.function_index(address);
+
+        // catalog 查询：报名 + 是否已桥接。
+        let (slot_name, is_bridge) = match JNIEnvABI::slot_spec(index) {
+            Some(spec) => (spec.name, spec.handler == JniSlotHandler::Bridge),
+            None => ("unknown", false),
+        };
+        self.emit(format!("jni.abi_slot.{slot_name}"), TelemetryEventKind::Jni);
+        if !is_bridge {
+            return Err(JniError::Internal(format!(
+                "JNIEnv slot {slot_name} (#{index}) 尚未实现"
+            )));
+        }
+
+        // 读 JNI 调用参数（x0 = JNIEnv* 由我们管理，从 x1 起为实参）。
         let x1 = cpu.reg_read(Arm64Reg::X(1));
         let x2 = cpu.reg_read(Arm64Reg::X(2));
         let x3 = cpu.reg_read(Arm64Reg::X(3));
         let x4 = cpu.reg_read(Arm64Reg::X(4));
         let x5 = cpu.reg_read(Arm64Reg::X(5));
 
-        // 构造 JniEnvSurface（使用 split borrows 同时借 classes/objects/refs/exceptions/natives）
-        // SAFETY: 这是同一个 struct 的字段级别借用，不冲突
+        // 锁 VM 并构造 JniEnvSurface（字段级 split borrow，互不冲突）。
+        let mut vm_guard = self.vm.lock().unwrap();
         let AndroidVM {
             classes,
             objects,
@@ -111,39 +157,102 @@ impl CodeHook for JniTrampolineHook {
             apk: _,
         } = &mut *vm_guard;
 
-        let mut env = JniEnvSurface::new_with_objects(
-            classes,
-            objects,
-            refs,
-            exceptions,
-            natives,
-        );
+        let mut env = JniEnvSurface::new_with_objects(classes, objects, refs, exceptions, natives);
 
         let mut telemetry_events = Vec::new();
-        let result = dispatch_jni_call(index, &mut env, cpu, x1, x2, x3, x4, x5, &mut telemetry_events);
+        let result =
+            dispatch_jni_call(index, &mut env, cpu, x1, x2, x3, x4, x5, &mut telemetry_events);
 
-        match result {
-            Ok(ret_val) => {
-                cpu.reg_write(Arm64Reg::X(0), ret_val);
-            }
-            Err(_err) => {
-                // JNI 调用失败：写 -1 到 x0
-                cpu.reg_write(Arm64Reg::X(0), 0xFFFF_FFFF_FFFF_FFFF);
-            }
-        }
-
-        // 跳过 trampoline：设置 PC=LR 返回调用者
-        // 注意：在 CodeHook 中，PC 寄存器可能尚未改变
-        // （代码 hook 在指令执行前触发，PC 指向 trampoline）
-        let lr = cpu.reg_read(Arm64Reg::Lr);
-        cpu.reg_write(Arm64Reg::Pc, lr);
-
-        // 将 telemetry 事件写入共享 collector
+        // 合并 dispatch_jni_call 内部产生的事件（如 register_natives）。
         if !telemetry_events.is_empty() {
             if let Ok(mut sink) = self.telemetry.lock() {
                 sink.append(&mut telemetry_events);
             }
         }
+        result
+    }
+
+    /// 分派 JavaVM invoke table 入口（GetEnv / AttachCurrentThread / DetachCurrentThread）。
+    ///
+    /// 纯状态逻辑（版本校验、attach 状态转换）走 [`JavaVMThreadState`] 系列；
+    /// "把 env_ptr 写入 guest 出参 + 返回码写回 x0" 由本方法完成。
+    fn dispatch_invoke(
+        &mut self,
+        cpu: &mut dyn GuestCPU,
+        address: u64,
+    ) -> Result<u64, JniError> {
+        let index = self.vm_abi.function_index(address);
+
+        let slot_name = JavaVMABI::slot_spec(index)
+            .map(|s| s.name)
+            .unwrap_or("unknown");
+        self.emit(format!("jni.abi_slot.{slot_name}"), TelemetryEventKind::Jni);
+
+        // x0 = JavaVM*（由我们管理，忽略）；x1 = 出参 void** / JNIEnv**；x2 = version / args。
+        let out_ptr = cpu.reg_read(Arm64Reg::X(1));
+        let version = cpu.reg_read(Arm64Reg::X(2));
+
+        match index {
+            // GetEnv(JavaVM*, void** env, jint version) → JNI_OK + *env = env_ptr
+            JNI_INVOKE_GET_ENV => match apply_get_env(&self.thread_state, version) {
+                Ok(env_ptr) => {
+                    if !cpu.mem_write(out_ptr, &env_ptr.to_le_bytes()) {
+                        return Err(JniError::Internal(format!(
+                            "GetEnv: 写 env 出参失败 @ 0x{:X}",
+                            out_ptr
+                        )));
+                    }
+                    Ok(JNI_OK)
+                }
+                Err(_) => {
+                    // 区分版本非法 vs 未 attach，映射到对应 JNI 错误码（不静默吞错）。
+                    let code = if validate_jni_version(version) {
+                        JNI_EDETACHED
+                    } else {
+                        JNI_EVERSION
+                    };
+                    self.emit("jni.abi_slot.GetEnv.failed".into(), TelemetryEventKind::Jni);
+                    Ok(code)
+                }
+            },
+
+            // AttachCurrentThread(JavaVM*, JNIEnv** env, void*) → JNI_OK + *env = env_ptr
+            JNI_INVOKE_ATTACH_CURRENT_THREAD => {
+                let env_ptr = apply_attach_current_thread(&mut self.thread_state)?;
+                if !cpu.mem_write(out_ptr, &env_ptr.to_le_bytes()) {
+                    return Err(JniError::Internal(
+                        "AttachCurrentThread: 写 env 出参失败".into(),
+                    ));
+                }
+                Ok(JNI_OK)
+            }
+
+            // DetachCurrentThread(JavaVM*) → JNI_OK
+            JNI_INVOKE_DETACH_CURRENT_THREAD => {
+                apply_detach_current_thread(&mut self.thread_state)?;
+                Ok(JNI_OK)
+            }
+
+            _ => Err(JniError::Internal(format!(
+                "JavaVM invoke slot {slot_name} (#{index}) 尚未实现"
+            ))),
+        }
+    }
+
+    /// 收尾：写返回值到 x0（错误时写 [`JNI_ERR`]），PC=LR 返回调用者。
+    fn finish(&mut self, cpu: &mut dyn GuestCPU, result: Result<u64, JniError>) {
+        match result {
+            Ok(ret) => {
+                cpu.reg_write(Arm64Reg::X(0), ret);
+            }
+            Err(err) => {
+                self.emit(format!("jni.abi_slot.error: {err}"), TelemetryEventKind::Jni);
+                cpu.reg_write(Arm64Reg::X(0), JNI_ERR);
+            }
+        }
+        // 跳过 trampoline：设置 PC=LR 返回调用者（code hook 在指令执行前触发）。
+        let lr = cpu.reg_read(Arm64Reg::Lr);
+        cpu.reg_write(Arm64Reg::Pc, lr);
     }
 }
 

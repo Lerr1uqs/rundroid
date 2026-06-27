@@ -205,3 +205,99 @@ int jni_full_flow(JNIEnv* env) {
     }
     return (r1 << 16) | (r2 & 0xFFFF);
 }
+
+/* ============================================================
+ * JavaVM invoke table 验证（rundroid jni-abi-surfaces）
+ *
+ * guest 通过 `(*vm)->GetEnv(vm, &env, version)` 从 JavaVM invoke table
+ * 取 JNIEnv*，验证 JavaVMABI 的 GetEnv/AttachCurrentThread 入口。
+ * ============================================================ */
+
+/* ---- JavaVM — 仅首字段（invoke 函数指针表） ---- */
+typedef struct {
+    void** functions;  /* JNIInvokeInterface* (void*[8]) */
+} JavaVM;
+
+/* ---- JavaVM invoke table 索引（与 rundroid abi.rs JNI_INVOKE_* 一致）----
+ * JNIInvokeInterface: 前 3 槽 reserved NULL，随后
+ *   DestroyJavaVM=3, AttachCurrentThread=4, DetachCurrentThread=5, GetEnv=6
+ */
+#define JNI_INVOKE_ATTACH_CURRENT_THREAD 4
+#define JNI_INVOKE_DETACH_CURRENT_THREAD 5
+#define JNI_INVOKE_GET_ENV 6
+
+/* 从 invoke table 按索引取函数指针并调用 */
+#define JNI_VM_CALL(vm, idx, ftype, ...) \
+    ((ftype)(((JavaVM*)(vm))->functions[idx]))(__VA_ARGS__)
+
+/**
+ * test_get_env_via_javavm:
+ *   验证通过 JavaVM invoke table 调 GetEnv 能拿到有效 JNIEnv*。
+ *   GetEnv(vm, &env, JNI_VERSION_1_6) → 返回 JNI_OK(0)、env 非空；
+ *   再用该 env 调 GetVersion + FindClass 验证 env 对当前 VM 有效。
+ *
+ *   返回 0 表示成功；负值表示各阶段失败码。
+ */
+int test_get_env_via_javavm(JavaVM* vm) {
+    JNIEnv* env = 0;
+    jint ret = JNI_VM_CALL(vm, JNI_INVOKE_GET_ENV,
+        jint (*)(JavaVM*, void**, jint),
+        vm, (void**)&env, 0x00010006);
+    if (ret != 0) {
+        return -100 - (ret & 0x7F);  /* GetEnv 返回非 JNI_OK */
+    }
+    if (env == 0) {
+        return -1;
+    }
+    /* 用 GetEnv 返回的 env 调 GetVersion，验证 env 对当前 VM 有效 */
+    jint version = JNI_CALL(env, JNI_GET_VERSION, jint (*)(JNIEnv*), env);
+    if (version != 0x00010006) {
+        return -2;
+    }
+    /* 再 FindClass 进一步验证 env 完整可用 */
+    jclass cls = JNI_CALL(env, JNI_FIND_CLASS,
+        jclass (*)(JNIEnv*, const char*),
+        env, "test/JniTest");
+    if (cls == 0) {
+        return -3;
+    }
+    return 0;
+}
+
+/**
+ * test_attach_via_javavm:
+ *   验证 JavaVM invoke table 的 AttachCurrentThread / DetachCurrentThread 端到端
+ *   （覆盖 GetEnv 之外的另两个 invoke 入口）。
+ *
+ *   1. AttachCurrentThread(vm, &env, NULL) → JNI_OK + env 非空
+ *   2. 用 attach 返回的 env 调 FindClass 验证 env 有效
+ *   3. DetachCurrentThread(vm) → JNI_OK
+ *
+ *   返回 0 表示成功；负值表示各阶段失败码。
+ */
+int test_attach_via_javavm(JavaVM* vm) {
+    JNIEnv* env = 0;
+    jint ret = JNI_VM_CALL(vm, JNI_INVOKE_ATTACH_CURRENT_THREAD,
+        jint (*)(JavaVM*, void**, void*),
+        vm, (void**)&env, (void*)0);
+    if (ret != 0) {
+        return -100 - (ret & 0x7F);  /* AttachCurrentThread 返回非 JNI_OK */
+    }
+    if (env == 0) {
+        return -1;
+    }
+    /* 用 attach 返回的 env 调 FindClass 验证 env 有效 */
+    jclass cls = JNI_CALL(env, JNI_FIND_CLASS,
+        jclass (*)(JNIEnv*, const char*),
+        env, "test/JniTest");
+    if (cls == 0) {
+        return -2;
+    }
+    /* DetachCurrentThread(JavaVM*) → JNI_OK */
+    jint ret2 = JNI_VM_CALL(vm, JNI_INVOKE_DETACH_CURRENT_THREAD,
+        jint (*)(JavaVM*), vm);
+    if (ret2 != 0) {
+        return -300 - (ret2 & 0x7F);
+    }
+    return 0;
+}

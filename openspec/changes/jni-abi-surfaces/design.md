@@ -15,13 +15,13 @@ JNI ABI surfaces 是 Android VM 能否“像真的”工作的核心。
 推荐结构：
 
 ```rust
-pub struct JavaVmAbi {
+pub struct JavaVMABI {
     pub java_vm_ptr: GuestPtr,
     pub invoke_table_ptr: GuestPtr,
     pub slots: Vec<JavaVmSlot>,
 }
 
-pub struct JniEnvAbi {
+pub struct JNIEnvABI {
     pub jni_env_ptr: GuestPtr,
     pub function_table_ptr: GuestPtr,
     pub slots: Vec<JniSlot>,

@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod abi;
 pub mod android_runtime;
 pub mod android_vm;
 pub mod apk_context;
@@ -72,6 +73,12 @@ pub use native_registry::{
     SUPPORTED_JNI_VERSIONS,
 };
 pub use field::{FieldAccess, RustFieldHandler, SharedField};
+pub use abi::{
+    apply_attach_current_thread, apply_detach_current_thread, apply_get_env, JNIEnvABI,
+    JavaVMABI, JavaVMThreadState, JniSlotHandler, JniSlotSpec, JNI_ENV_SLOTS,
+    JNI_INVOKE_ATTACH_CURRENT_THREAD, JNI_INVOKE_DETACH_CURRENT_THREAD, JNI_INVOKE_GET_ENV,
+    JNI_INVOKE_SLOTS, JNI_ERR, JNI_EDETACHED, JNI_EVERSION, JNI_OK,
+};
 pub use javavm::JavaVMSurface;
 pub use jnienv::JniEnvSurface;
 pub use object::{

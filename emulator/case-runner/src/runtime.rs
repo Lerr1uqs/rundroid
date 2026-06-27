@@ -18,8 +18,7 @@ use rundroid_elf_loader::{
     SegmentMapSpec,
 };
 use rundroid_elf_parser::{ElfCrateParser, ElfParser, ParseInput, ParsedElf};
-use rundroid_jni::{AndroidVM, JniRegistry, ObjectStore, RefTable};
-use rundroid_jni::function_table::JniFunctionTable;
+use rundroid_jni::{AndroidVM, JavaVMABI, JNIEnvABI, JniRegistry, ObjectStore, RefTable};
 use rundroid_linux::{LinuxRuntime, SyscallResult};
 use rundroid_memory::{MemoryError, RegionTracker};
 use rundroid_telemetry::{EventSink, TelemetryEvent, TelemetryEventKind, TelemetryMode, TelemetryRouter};
@@ -44,6 +43,8 @@ pub enum RuntimeAssemblyError {
     EntryMissing(String),
     #[error("JNI_OnLoad failed in module `{module}`: {reason}")]
     JniOnLoadFailed { module: String, reason: String },
+    #[error("JNI ABI guest write 失败: {0}")]
+    JniAbiWrite(String),
 }
 
 /// 用于序列化到 `events.jsonl` 的一条事件记录。
@@ -99,12 +100,13 @@ pub struct GuestRuntime {
     pub jni_refs: RefTable,
     /// JNI 对象存储（共享所有权，供 hook 访问）。
     pub object_store: Arc<Mutex<ObjectStore>>,
-    /// JNI 函数表 guest 内存布局（装配时映射）。
-    pub jni_function_table: Option<JniFunctionTable>,
-    /// JNI trampoline hook（装配时安装到 engine）。
-    /// 用 Option 包装：需要在 engine 上注册 hook 但 engine 被 GuestRuntime 独占借用。
+    /// Guest 可见的 JNIEnv ABI 对象（函数表 + trampoline 布局，装配时映射）。
+    pub jni_env_abi: Option<JNIEnvABI>,
+    /// Guest 可见的 JavaVM ABI 对象（invoke table + trampoline 布局）。
+    pub java_vm_abi: Option<JavaVMABI>,
+    /// JNIEnv guest 指针（= `jni_env_abi` 的 env_ptr，便利字段）。
     pub jni_env_pointer: Option<u64>,
-    /// JavaVM guest 指针（JNI_OnLoad 参数）。
+    /// JavaVM guest 指针（= `java_vm_abi` 的 vm_ptr，JNI_OnLoad 参数）。
     pub java_vm_pointer: Option<u64>,
     /// JNI trampoline hook 的 telemetry sink（run 后取出事件）。
     pub jni_telemetry: Option<Arc<Mutex<Vec<(String, TelemetryEventKind)>>>>,
@@ -239,7 +241,8 @@ impl GuestRuntime {
             jni_registry: JniRegistry::new(),
             jni_refs: RefTable::new(),
             object_store: Arc::new(Mutex::new(ObjectStore::new())),
-            jni_function_table: None,
+            jni_env_abi: None,
+            java_vm_abi: None,
             jni_env_pointer: None,
             java_vm_pointer: None,
             jni_telemetry: None,
@@ -249,100 +252,74 @@ impl GuestRuntime {
         })
     }
 
-    /// 初始化 JNI 环境：映射函数表 + trampoline 到 guest 内存，安装 code hook。
+    /// 初始化 JNI 环境：映射 JNIEnv + JavaVM ABI 表到 guest 内存，安装 code hook。
     ///
-    /// 必须在 `assemble()` 之后、`emu_start()` 之前调用。
-    /// `vm` 是共享的 AndroidVM（registry + objects + refs + exceptions），
-    /// JNI trampoline hook 持有其引用。
+    /// 必须在 `assemble()` 之后、`emu_start()` 之前调用。`vm` 是共享的
+    /// `AndroidVM`（registry + objects + refs + exceptions），JNI trampoline hook
+    /// 持有其引用。
+    ///
+    /// 装配步骤：
+    /// 1. 按 [`JNIEnvABI`] + [`JavaVMABI`] 计算 guest 内存布局（JavaVM 紧跟 JNIEnv 之后）
+    /// 2. 一次性映射整块区域（env struct / 函数表 / jni trampoline +
+    ///    JavaVM struct / invoke table / javavm trampoline）
+    /// 3. 写入 env header + 函数指针表 + jni trampoline NOP +
+    ///    JavaVM header + invoke table + javavm trampoline NOP
+    /// 4. 安装 code hook 覆盖 [jni trampoline, javavm trampoline]，hook 内部按地址分流
     ///
     /// # JNI 地址布局
     ///
     /// 使用高端地址 0x7F_C000_0000（栈在 0x7F_E000_0000，sentinel 在 0x7F_FFFF_0000）。
+    /// JavaVM 区域紧跟 JNIEnv 区域之后。
     ///
     /// # NOTE: 硬编码地址是临时缓解措施
     ///
     /// 当前直接用 `engine.mem_map` 抢固定地址。后续应改为通过 guest 自身的
     /// mmap 或 allocator 分配，避免与 guest .so 装载地址冲突。
-    /// 参见 [`JniFunctionTable`] 的模块级文档。
     pub fn init_jni(&mut self, vm: Arc<Mutex<AndroidVM>>) -> Result<(), RuntimeAssemblyError> {
         const JNI_ENV_BASE: u64 = 0x7F_C000_0000;
-        let ft = JniFunctionTable::layout(JNI_ENV_BASE);
+        let env_abi = JNIEnvABI::new(JNI_ENV_BASE);
+        let vm_abi = JavaVMABI::new(env_abi.env_ptr() + env_abi.total_size() as u64);
 
-        // 1. 映射整块 JNI + JavaVM 区域到 guest 内存
-        //    JavaVM 放在 JNI 区域之后的一页（0x7F_C000_3000）
-        const JAVA_VM_PAGE: usize = 0x1000;
-        let java_vm_addr = ft.env_ptr + ft.total_size as u64;
-        let total_map = ft.total_size + JAVA_VM_PAGE;
-
+        // 1. 一次性映射整块 JNIEnv + JavaVM 区域到 guest 内存
+        let total_map = env_abi.total_size() + vm_abi.total_size();
         self.engine
-            .mem_map(ft.env_ptr, total_map, MemPerms::READ_EXEC)
+            .mem_map(env_abi.env_ptr(), total_map, MemPerms::READ_EXEC)
             .map_err(RuntimeAssemblyError::Backend)?;
 
-        // 2. 写入 JNIEnv header + 函数指针表 + trampoline NOP
-        self._write_jni_table(&ft)?;
+        // 2. 写入 JNIEnv 表 + JavaVM 表（含 invoke table + 各自 trampoline NOP）。
+        //    mem_write 闭包借 &mut engine，写完即释放，后续可继续用 self.engine。
+        {
+            let engine = &mut self.engine;
+            let mut mem_write = |addr: u64, bytes: &[u8]| engine.mem_write(addr, bytes).is_ok();
+            env_abi
+                .write_to_guest(&mut mem_write)
+                .map_err(RuntimeAssemblyError::JniAbiWrite)?;
+            vm_abi
+                .write_to_guest(&mut mem_write)
+                .map_err(RuntimeAssemblyError::JniAbiWrite)?;
+        }
 
-        // 3. 写入最小 JavaVM 结构
-        self._write_java_vm(java_vm_addr)?;
+        // 3. 创建 JniTrampolineHook（持有双 ABI + 线程状态），安装为 code hook。
+        //    范围覆盖 jni trampoline + javavm trampoline，hook 内部按地址分流 dispatch。
+        let hook = JniTrampolineHook::new(env_abi.clone(), vm_abi.clone(), vm);
+        let begin = env_abi.trampoline_begin();
+        let end = vm_abi.trampoline_end();
 
-        // 4. 创建 JniTrampolineHook 并安装为 code hook
-        let hook = JniTrampolineHook::new(ft.clone(), vm);
-        let begin = hook.trampoline_begin();
-        let end = hook.trampoline_end();
-
-        // 保存 telemetry sink 引用（在 engine run 之后读取事件）
+        // 保存 telemetry sink 引用（run 之后读取事件）
         self.jni_telemetry = Some(hook.telemetry_sink());
 
         self.engine
             .install_code_hook(begin, end, Box::new(hook))
             .map_err(RuntimeAssemblyError::Backend)?;
 
-        self.jni_function_table = Some(ft.clone());
-        self.jni_env_pointer = Some(ft.env_ptr);
-        self.java_vm_pointer = Some(java_vm_addr);
+        // 先取出 guest 指针，再 move ABI 对象到字段（避免 move 后借用）。
+        let env_ptr = env_abi.env_ptr();
+        let vm_ptr = vm_abi.vm_ptr();
 
-        Ok(())
-    }
-
-    /// 写入最小 JavaVM 结构到 guest 内存。
-    ///
-    /// JavaVM 结构仅包含一个指向 JNIInvokeInterface 函数表的指针。
-    /// 函数表各槽位填零（bootstrap 阶段不实现 JavaVM 函数），
-    /// JNI_OnLoad 如果尝试调用 JavaVM 函数会崩溃。
-    fn _write_java_vm(&mut self, java_vm_addr: u64) -> Result<(), RuntimeAssemblyError> {
-        // JavaVM 结构: 8 字节 = 指向 InvokeInterface 函数表的指针
-        // 函数表放在 JavaVM 之后的 64 字节处，8 个槽位 × 8 字节 = 64 字节
-        let interface_table_addr = java_vm_addr + 64;
-        let table_bytes = interface_table_addr.to_le_bytes();
-
-        // 写 JavaVM 结构：首 8 字节 → 函数表指针
-        self.engine.mem_write(java_vm_addr, &table_bytes)
-            .map_err(|e| RuntimeAssemblyError::Backend(e))?;
-
-        // 写函数表（全部填零，8 槽位 × 8 字节 = 64 字节）
-        let zeros = vec![0u8; 64];
-        self.engine.mem_write(interface_table_addr, &zeros).ok();
-
-        Ok(())
-    }
-
-    /// 写入 JNI 函数表到 guest 内存（通过 engine）。
-    fn _write_jni_table(&mut self, ft: &JniFunctionTable) -> Result<(), RuntimeAssemblyError> {
-        // JNIEnv header: 首 8 字节 = pointer to table_base
-        let env_header = ft.table_base.to_le_bytes();
-        self.engine.mem_write(ft.env_ptr, &env_header)
-            .map_err(|e| RuntimeAssemblyError::Backend(e))?;
-
-        // 函数指针表 + trampoline NOP
-        for i in 0..rundroid_jni::function_table::JNI_TABLE_SIZE {
-            let tramp_addr = ft.trampoline_base + (i as u64) * rundroid_jni::function_table::TRAMPOLINE_SLOT_SIZE;
-            let table_slot = ft.table_base + (i as u64) * 8;
-
-            // 写函数指针表条目
-            self.engine.mem_write(table_slot, &tramp_addr.to_le_bytes()).ok();
-
-            // 写 trampoline NOP
-            self.engine.mem_write(tramp_addr, &rundroid_jni::function_table::ARM64_NOP).ok();
-        }
+        self.jni_env_abi = Some(env_abi);
+        self.java_vm_abi = Some(vm_abi);
+        self.jni_env_pointer = Some(env_ptr);
+        self.java_vm_pointer = Some(vm_ptr);
 
         Ok(())
     }
