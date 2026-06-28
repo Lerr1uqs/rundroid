@@ -8,11 +8,13 @@
 
 - **新增 `kernel/` 目录**，按 OS 子系统域组织（方法按域分文件 `impl LinuxRuntime`）：
   - `kernel/mod.rs`：`LinuxRuntime` 聚合根（struct + 字段）+ 构造（new/with_telemetry/build）+ 设备注册 `register_builtins` + 配置 API `seed_rng`/`mount_file`/`mount_device` + `emit` + 路径解析 `open_path` + lifecycle（exit）
-  - `kernel/fd_io.rs`：fd IO 语义方法 `read`/`read_at`/`write`/`ioctl`/`fstat`/`dup`/`dup3`
+  - `kernel/fd_io.rs`：fd IO 语义方法 `read`/`read_at`/`write`/`ioctl`/`fstat`/`dup`/`dup3`，其中 `stdout/stderr` 写入收集属于 kernel `write` 语义的一部分
   - `kernel/mem.rs`：内存管理 `alloc_mmap_addr`/`brk`/`munmap`
   - `kernel/random.rs`：PRNG `getrandom_bytes`
-  - 所有 kernel 方法**只产出数据/纯状态，不接收 `write_guest`/`map_guest` 闭包**，不碰目标侧内存。
-- **瘦身 `syscall.rs`**：只做 ABI 边界——syscall 号常量 + errno + `SyscallResult` + `dispatch` + 各 `sys_*` handler。handler 职责限定为：解码 `x0..x5` → 调 `LinuxRuntime`(kernel) 的 OS 方法拿数据 → `write_guest`/`map_guest` 把结果落地到目标侧 → 编码 `SyscallResult`（回写失败即 EFAULT）。
+  - 所有 kernel 方法**只产出数据/推进 OS 状态，不接收 `MemoryBridge`**，不碰目标侧内存。`MemoryBridge` 是 syscall 边界注入的 guest 内存访问抽象，只提供读/写/映射三种能力，底层通常落到 `GuestCPU::mem_read` / `mem_write` / `mem_map`，而不是 Python 专属桥。
+- **新增 `errno.rs`**：集中定义 errno 常量与 kernel 错误到 syscall errno 的映射规则，避免 `syscall.rs` / `kernel/*` 分散硬编码。
+- **新增 `memory_bridge.rs`**：定义 `MemoryBridge` trait（`read` / `write` / `map`），取代 `dispatch(..., read_guest, write_guest, map_guest)` 的三闭包接口。
+- **瘦身 `syscall.rs`**：只做 ABI 边界——syscall 号常量 + `SyscallResult` + `dispatch` + 各 `sys_*` handler。handler 职责限定为：解码 `x0..x5` → 调 `LinuxRuntime`(kernel) 的 OS 方法拿数据 → 通过 `MemoryBridge` 把结果落地到目标侧 → 用 `errno.rs` 编码 `SyscallResult`（回写失败即 EFAULT）。
 - **`fd.rs` / `vfs.rs` 不变**。
 - **pure refactor**：所有现有 syscall 单测（含 pread64 四个）+ case（01/02/03/04）必须继续通过，不改变任何对外行为。`runtime-correctness-hardening` 已确立的 "source → 目标侧回写 → 返回值" 主线落到 syscall 这一层。
 
@@ -30,6 +32,9 @@
 
 - **`emulator/os/linux/src/syscall.rs`**：拆分，瘦身到 ABI 边界。
 - **`emulator/os/linux/src/kernel/`**：新增子模块目录（`mod.rs`/`fd_io.rs`/`mem.rs`/`random.rs`），承接 `LinuxRuntime` + OS 语义方法。
+- **`emulator/os/linux/src/errno.rs`**：新增 errno 常量与统一映射。
+- **`emulator/os/linux/src/memory_bridge.rs`**：新增 guest 内存读/写/映射的最小抽象 trait。
 - **`emulator/os/linux/src/lib.rs`**：模块声明 + re-export 调整。
 - **`emulator/case-runner/src/runtime.rs`**：`SyscallDispatcher` 调用 `dispatch` 的签名保持不变（行为不变）。
-- **测试**：OS 语义方法（`read_at` / `getrandom_bytes` / `alloc_mmap_addr`）可在 kernel 层独立单测（脱离 syscall 号/寄存器/mock 闭包）；现有 syscall 单测与 case 保持绿。
+- **`emulator/case-runner/src/runtime.rs` / `emulator/bindings/python/src/lib.rs`**：各自提供 `MemoryBridge` 适配，把 `GuestCPU` 能力收敛到统一三方法接口。
+- **测试**：OS 语义方法（`read_at` / `getrandom_bytes` / `alloc_mmap_addr` / `write(stdout/stderr)`）可在 kernel 层独立单测（脱离 syscall 号/寄存器/mock `MemoryBridge`）；现有 syscall 单测与 case 保持绿。
