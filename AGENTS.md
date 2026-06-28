@@ -29,7 +29,7 @@
   最核心、最庞大的是 第 4 层（DVM/JNI 模拟），其次是 第 2/3 层（syscall + 文件
   IO），其余都是支撑和扩展。如果你想深入某一块，告诉我即可。
 ```
-目前只做 arm + android版本 
+目前只做 arm64 + android版本 
 
 
 # 你的职责
@@ -43,6 +43,7 @@ unidbg resources里面有一些可以用于验证的prebuild库
 
 # 代码风格
 注意要有中文注释 函数注释+函数体内部复杂算法注释 如果遇到特殊case需要说明什么情况下有这个case 高内聚低耦合 面向对象编程
+> 比如为了os/kernel层和backend层解耦 这两者之间使用XXXBridge组件进行依赖传递 在ut中能单独构造
 
 不允许使用 get_xxx的方式 直接使用 xxx获取field即可 (除非是Java 签名专属要求 那没办法 此外尽量别用get_xxx)
 
@@ -134,3 +135,5 @@ sig = emulator.avm.new_object(jclass, bytes([0x11, 0x22, 0x33])) # call the cons
 
 project_design/ 项目设计目录 如果用户没有要求严禁更改 如果有事实性冲突 请及时提出
 lessons/ 犯错清单 历史上的错误 经验教训
+
+ROADMAP.md 你一开始需要阅读的文件 关于项目的心智模型 需要随着项目进展你可以同步更改 但是不要改AGENTS.md
