@@ -1,29 +1,36 @@
-//! JNI trampoline hook — 实现 `CodeHook`，在 trampoline 触发时分发 JNI 调用。
+//! `rundroid-jni-trampoline` —— 共享的 JNI trampoline hook + dispatch。
 //!
-//! Guest 调用 `(*env)->FindClass(env, name)` 时：
-//! 1. 加载 `env->functions` 获取函数指针表基址
-//! 2. 加载 `functions[6]` 获取 FindClass 的 trampoline 地址
-//! 3. 跳转到 trampoline 地址
-//! 4. CodeHook 在指令执行前触发 → 本模块分派
+//! 把"guest 经 JNIEnv/JavaVM 函数表回调 → host 分派 JNI 调用"这条链路收敛成单一
+//! crate，被 [`case-runner`](rundroid_case_runner) 和 Python 绑定层共同消费，
+//! 避免两边各自复制一份 dispatch。
 //!
 //! # 架构
 //!
-//! 本模块持有 `JniFunctionTable`（guest 内存布局）和
-//! `Arc<Mutex<AndroidVM>>`（共享 VM 状态）。
-//! 每次 trampoline 触发时短暂锁住 VM 来构造 `JniEnvSurface` 并执行 JNI 操作。
+//! [`JniTrampolineHook`] 实现 [`CodeHook`]，在 trampoline 触发时分派
+//! `(*env)->FindClass` / `Call*Method` 等到 [`JniEnvSurface`]；按 guest PC 落点分流：
+//! - 落在 JNIEnv trampoline 区 → [`JniTrampolineHook::dispatch_env`]（函数表入口）
+//! - 落在 JavaVM trampoline 区 → [`JniTrampolineHook::dispatch_invoke`]（invoke table 入口）
+//! - 其它（数据区误入）→ fail-fast
+//!
+//! # verbose trace
+//!
+//! 持有 `verbose: Arc<AtomicBool>` 共享开关。消费方可在 hook 安装后 toggle，
+//! 开启后每次 guest JNI 调用打印一行 unidbg 式 trace（slot 名 + 关键参数 + 返回值），
+//! 便于逆向调试与测试断言（pytest `capsys` 可捕获）。默认关闭。
 //!
 //! # NOTE: trampoline + CodeHook 是临时缓解措施
 //!
-//! 当前 trampoline 页填充 NOP，依赖 Unicorn 的 `add_code_hook` 在指令执行前拦截。
+//! 当前 trampoline 页填充 NOP，依赖 backend 的 code hook 在指令执行前拦截。
 //! 这意味着 trampoline 槽位本身不包含可执行代码——它们只作为"跳转目标"触发 hook。
 //! 后续应改为通过 guest 自身的 mmap/allocator 分配 trampoline 区域，
 //! 并在槽位中写入真正的跳板指令（如 `BRK` 或 `SVC`），减少对 Unicorn 专有 API 的依赖。
-//! 参见 `function_table.rs` 模块文档。
 
+#![forbid(unsafe_code)]
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rundroid_backend::{Arm64Reg, CodeHook, GuestCPU};
-use rundroid_telemetry::TelemetryEventKind;
 use rundroid_jni::{
     function_table::{
         JNI_ALLOC_OBJECT, JNI_CALL_BOOLEAN_METHOD, JNI_CALL_BYTE_METHOD,
@@ -48,11 +55,12 @@ use rundroid_jni::{
 };
 use rundroid_jni::error::JniError;
 use rundroid_jni::types::JValue;
+use rundroid_telemetry::TelemetryEventKind;
 
 /// JNI trampoline 的 CodeHook 实现。
 ///
 /// 持有 guest 可见的 JNIEnv / JavaVM ABI 布局（[`JNIEnvABI`] / [`JavaVMABI`]）、
-/// 共享 VM 状态、当前线程 attach 状态，以及 telemetry 收集器。
+/// 共享 VM 状态、当前线程 attach 状态、telemetry 收集器，以及 verbose 开关。
 ///
 /// [`CodeHook::on_code`] 按 guest PC 落点分流：
 /// - 落在 JNIEnv trampoline 区 → [`Self::dispatch_env`]（函数表入口）
@@ -69,13 +77,21 @@ pub struct JniTrampolineHook {
     thread_state: JavaVMThreadState,
     /// 共享 telemetry 事件收集器（hook 内写、runtime 读）。
     telemetry: Arc<Mutex<Vec<(String, TelemetryEventKind)>>>,
+    /// verbose trace 共享开关（消费方可在 hook 安装后 toggle）。
+    verbose: Arc<AtomicBool>,
 }
 
 impl JniTrampolineHook {
     /// 构造 trampoline hook。
     ///
     /// 主线程默认已 attach（runtime 在 `JNI_OnLoad` 前 attach 主线程）。
-    pub fn new(env_abi: JNIEnvABI, vm_abi: JavaVMABI, vm: Arc<Mutex<AndroidVM>>) -> Self {
+    /// `verbose` 是共享开关：开启后每次 guest JNI 调用打印一行 unidbg 式 trace。
+    pub fn new(
+        env_abi: JNIEnvABI,
+        vm_abi: JavaVMABI,
+        vm: Arc<Mutex<AndroidVM>>,
+        verbose: Arc<AtomicBool>,
+    ) -> Self {
         let thread_state = JavaVMThreadState::main_thread(env_abi.env_ptr());
         Self {
             env_abi,
@@ -83,6 +99,7 @@ impl JniTrampolineHook {
             vm,
             thread_state,
             telemetry: Arc::new(Mutex::new(Vec::new())),
+            verbose,
         }
     }
 
@@ -95,6 +112,30 @@ impl JniTrampolineHook {
     fn emit(&self, name: String, kind: TelemetryEventKind) {
         if let Ok(mut sink) = self.telemetry.lock() {
             sink.push((name, kind));
+        }
+    }
+
+    /// verbose 开时打印一行 JNIEnv 函数表调用 trace（unidbg 式）。
+    ///
+    /// 格式：`[I] JNIEnv->{slot}({detail}) => 0x{ret:X}` 或 `... => ERR({e})`。
+    fn verbose_env_line(&self, slot: &str, detail: &str, result: &Result<u64, JniError>) {
+        if !self.verbose.load(Ordering::Relaxed) {
+            return;
+        }
+        match result {
+            Ok(ret) => println!("[I] JNIEnv->{slot}({detail}) => 0x{ret:X}"),
+            Err(e) => println!("[I] JNIEnv->{slot}({detail}) => ERR({e})"),
+        }
+    }
+
+    /// verbose 开时打印一行 JavaVM invoke table 调用 trace。
+    fn verbose_vm_line(&self, slot: &str, detail: &str, result: &Result<u64, JniError>) {
+        if !self.verbose.load(Ordering::Relaxed) {
+            return;
+        }
+        match result {
+            Ok(ret) => println!("[I] JavaVM->{slot}({detail}) => 0x{ret:X}"),
+            Err(e) => println!("[I] JavaVM->{slot}({detail}) => ERR({e})"),
         }
     }
 }
@@ -132,10 +173,16 @@ impl JniTrampolineHook {
             None => ("unknown", false),
         };
         self.emit(format!("jni.abi_slot.{slot_name}"), TelemetryEventKind::Jni);
+
         if !is_bridge {
-            return Err(JniError::Internal(format!(
+            let err = JniError::Internal(format!(
                 "JNIEnv slot {slot_name} (#{index}) 尚未实现"
-            )));
+            ));
+            // 未实现 slot 也打一条 verbose trace（标注 unimplemented），便于定位。
+            if self.verbose.load(Ordering::Relaxed) {
+                println!("[I] JNIEnv->{slot_name}() => ERR({err})");
+            }
+            return Err(err);
         }
 
         // 读 JNI 调用参数（x0 = JNIEnv* 由我们管理，从 x1 起为实参）。
@@ -153,15 +200,20 @@ impl JniTrampolineHook {
             refs,
             exceptions,
             natives,
-            object_id_alloc: _,
+            object_id_alloc,
             apk: _,
         } = &mut *vm_guard;
 
-        let mut env = JniEnvSurface::new_with_objects(classes, objects, refs, exceptions, natives);
+        let mut env = JniEnvSurface::new_with_objects(
+            classes, objects, object_id_alloc, refs, exceptions, natives,
+        );
 
         let mut telemetry_events = Vec::new();
-        let result =
-            dispatch_jni_call(index, &mut env, cpu, x1, x2, x3, x4, x5, &mut telemetry_events);
+        let verbose = self.verbose.load(Ordering::Relaxed);
+        let mut trace = JniTrace::new(verbose);
+        let result = dispatch_jni_call(
+            index, &mut env, cpu, x1, x2, x3, x4, x5, &mut telemetry_events, &mut trace,
+        );
 
         // 合并 dispatch_jni_call 内部产生的事件（如 register_natives）。
         if !telemetry_events.is_empty() {
@@ -169,6 +221,8 @@ impl JniTrampolineHook {
                 sink.append(&mut telemetry_events);
             }
         }
+
+        self.verbose_env_line(slot_name, &trace.detail, &result);
         result
     }
 
@@ -192,17 +246,24 @@ impl JniTrampolineHook {
         let out_ptr = cpu.reg_read(Arm64Reg::X(1));
         let version = cpu.reg_read(Arm64Reg::X(2));
 
-        match index {
+        let verbose = self.verbose.load(Ordering::Relaxed);
+        let mut detail = String::new();
+        if verbose {
+            detail = format!("version=0x{version:08X}");
+        }
+
+        let result = match index {
             // GetEnv(JavaVM*, void** env, jint version) → JNI_OK + *env = env_ptr
             JNI_INVOKE_GET_ENV => match apply_get_env(&self.thread_state, version) {
                 Ok(env_ptr) => {
                     if !cpu.mem_write(out_ptr, &env_ptr.to_le_bytes()) {
-                        return Err(JniError::Internal(format!(
+                        Err(JniError::Internal(format!(
                             "GetEnv: 写 env 出参失败 @ 0x{:X}",
                             out_ptr
-                        )));
+                        )))
+                    } else {
+                        Ok(JNI_OK)
                     }
-                    Ok(JNI_OK)
                 }
                 Err(_) => {
                     // 区分版本非法 vs 未 attach，映射到对应 JNI 错误码（不静默吞错）。
@@ -218,13 +279,18 @@ impl JniTrampolineHook {
 
             // AttachCurrentThread(JavaVM*, JNIEnv** env, void*) → JNI_OK + *env = env_ptr
             JNI_INVOKE_ATTACH_CURRENT_THREAD => {
-                let env_ptr = apply_attach_current_thread(&mut self.thread_state)?;
-                if !cpu.mem_write(out_ptr, &env_ptr.to_le_bytes()) {
-                    return Err(JniError::Internal(
-                        "AttachCurrentThread: 写 env 出参失败".into(),
-                    ));
+                match apply_attach_current_thread(&mut self.thread_state) {
+                    Ok(env_ptr) => {
+                        if !cpu.mem_write(out_ptr, &env_ptr.to_le_bytes()) {
+                            Err(JniError::Internal(
+                                "AttachCurrentThread: 写 env 出参失败".into(),
+                            ))
+                        } else {
+                            Ok(JNI_OK)
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
-                Ok(JNI_OK)
             }
 
             // DetachCurrentThread(JavaVM*) → JNI_OK
@@ -236,7 +302,10 @@ impl JniTrampolineHook {
             _ => Err(JniError::Internal(format!(
                 "JavaVM invoke slot {slot_name} (#{index}) 尚未实现"
             ))),
-        }
+        };
+
+        self.verbose_vm_line(slot_name, &detail, &result);
+        result
     }
 
     /// 收尾：写返回值到 x0（错误时写 [`JNI_ERR`]），PC=LR 返回调用者。
@@ -256,6 +325,46 @@ impl JniTrampolineHook {
     }
 }
 
+// ============================================================================
+// JniTrace —— 单次 JNI 调用的 verbose trace 中间记录
+// ============================================================================
+
+/// 单次 JNI 调用的 verbose trace 中间记录。
+///
+/// [`dispatch_jni_call`] 各 arm 经 [`Self::set_with`] 填充 `detail`（已解码的关键参数，
+/// 如 `name="com/scene/Signer"`），[`JniTrampolineHook::dispatch_env`] 收尾拼装最终
+/// unidbg 式一行并（verbose 开时）打印。
+///
+/// `enabled` 为 false 时 [`Self::set_with`] 的闭包不会执行——verbose 关闭时零开销。
+#[derive(Default)]
+struct JniTrace {
+    /// 是否记录 detail（= verbose 开关快照）。
+    enabled: bool,
+    /// 关键参数的人类可读片段。
+    detail: String,
+}
+
+impl JniTrace {
+    /// 创建 trace 记录。`enabled` 决定是否实际填充 detail。
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            detail: String::new(),
+        }
+    }
+
+    /// 仅在 `enabled` 时调用 `f` 填充 detail（verbose 关闭时零开销）。
+    fn set_with(&mut self, f: impl FnOnce() -> String) {
+        if self.enabled {
+            self.detail = f();
+        }
+    }
+}
+
+// ============================================================================
+// dispatch_jni_call
+// ============================================================================
+
 /// 按 JNI 函数索引分派调用。
 fn dispatch_jni_call(
     index: usize,
@@ -267,16 +376,20 @@ fn dispatch_jni_call(
     x4: u64,
     x5: u64,
     telemetry: &mut Vec<(String, TelemetryEventKind)>,
+    trace: &mut JniTrace,
 ) -> Result<u64, JniError> {
     match index {
         0..=3 => Err(JniError::Internal("JNI reserved slot called".into())),
 
         JNI_GET_VERSION => {
+            // GetVersion 无参数；返回 JNI_VERSION_1_6。
+            trace.set_with(|| "JNI_VERSION_1_6".to_string());
             Ok(0x0001_0006) // JNI_VERSION_1_6
         }
 
         JNI_FIND_CLASS => {
             let name = read_cstr_from_guest(cpu, x1)?;
+            trace.set_with(|| format!(r#"name="{name}""#));
             let handle = env.find_class(&name)?;
             Ok(handle as u64)
         }
@@ -293,6 +406,7 @@ fn dispatch_jni_call(
 
         JNI_NEW_GLOBAL_REF => {
             let handle = x1 as u32;
+            trace.set_with(|| format!("ref=0x{handle:X}"));
             let new_handle = env.new_global_ref(handle)?;
             Ok(new_handle as u64)
         }
@@ -320,6 +434,9 @@ fn dispatch_jni_call(
         JNI_NEW_OBJECT => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| {
+                format!("class=0x{class_handle:X} ctor_mid=0x{method_id:X}")
+            });
             // x3..x5 = constructor args（最多 3 个）
             let args = read_varargs(x3, x4, x5);
             let handle = env.new_object(class_handle, method_id, &args)?;
@@ -335,6 +452,9 @@ fn dispatch_jni_call(
             let class_handle = x1 as u32;
             let method_name = read_cstr_from_guest(cpu, x2)?;
             let method_sig = read_cstr_from_guest(cpu, x3)?;
+            trace.set_with(|| {
+                format!(r#"name="{method_name}" sig="{method_sig}""#)
+            });
             let method_id = env.get_method_id(class_handle, &method_name, &method_sig)?;
             Ok(method_id.0)
         }
@@ -343,7 +463,11 @@ fn dispatch_jni_call(
             let class_handle = x1 as u32;
             let method_name = read_cstr_from_guest(cpu, x2)?;
             let method_sig = read_cstr_from_guest(cpu, x3)?;
-            let method_id = env.get_static_method_id(class_handle, &method_name, &method_sig)?;
+            trace.set_with(|| {
+                format!(r#"name="{method_name}" sig="{method_sig}""#)
+            });
+            let method_id =
+                env.get_static_method_id(class_handle, &method_name, &method_sig)?;
             Ok(method_id.0)
         }
 
@@ -351,6 +475,9 @@ fn dispatch_jni_call(
             let class_handle = x1 as u32;
             let field_name = read_cstr_from_guest(cpu, x2)?;
             let field_sig = read_cstr_from_guest(cpu, x3)?;
+            trace.set_with(|| {
+                format!(r#"name="{field_name}" sig="{field_sig}""#)
+            });
             let field_id = env.get_field_id(class_handle, &field_name, &field_sig)?;
             Ok(field_id.0)
         }
@@ -359,6 +486,9 @@ fn dispatch_jni_call(
             let class_handle = x1 as u32;
             let field_name = read_cstr_from_guest(cpu, x2)?;
             let field_sig = read_cstr_from_guest(cpu, x3)?;
+            trace.set_with(|| {
+                format!(r#"name="{field_name}" sig="{field_sig}""#)
+            });
             let field_id = env.get_static_field_id(class_handle, &field_name, &field_sig)?;
             Ok(field_id.0)
         }
@@ -367,6 +497,7 @@ fn dispatch_jni_call(
         JNI_CALL_VOID_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             env.call_void_method_by_id(obj_handle, method_id, &args)?;
             Ok(0)
@@ -374,6 +505,7 @@ fn dispatch_jni_call(
         JNI_CALL_BOOLEAN_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_boolean_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -381,6 +513,7 @@ fn dispatch_jni_call(
         JNI_CALL_BYTE_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_byte_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -388,6 +521,7 @@ fn dispatch_jni_call(
         JNI_CALL_CHAR_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_char_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -395,6 +529,7 @@ fn dispatch_jni_call(
         JNI_CALL_SHORT_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_short_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -402,6 +537,7 @@ fn dispatch_jni_call(
         JNI_CALL_INT_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_int_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -409,6 +545,7 @@ fn dispatch_jni_call(
         JNI_CALL_LONG_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_long_method_by_id(obj_handle, method_id, &args)?;
             Ok(v as u64)
@@ -416,6 +553,7 @@ fn dispatch_jni_call(
         JNI_CALL_FLOAT_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_float_method_by_id(obj_handle, method_id, &args)?;
             Ok(v.to_bits() as u64)
@@ -423,6 +561,7 @@ fn dispatch_jni_call(
         JNI_CALL_DOUBLE_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_double_method_by_id(obj_handle, method_id, &args)?;
             Ok(v.to_bits())
@@ -430,6 +569,7 @@ fn dispatch_jni_call(
         JNI_CALL_OBJECT_METHOD => {
             let obj_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_object_method(obj_handle, method_id, &args)?;
             Ok(v)
@@ -439,6 +579,7 @@ fn dispatch_jni_call(
         JNI_CALL_STATIC_VOID_METHOD => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("class=0x{class_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             env.call_static_void_method_by_id(class_handle, method_id, &args)?;
             Ok(0)
@@ -446,6 +587,7 @@ fn dispatch_jni_call(
         JNI_CALL_STATIC_INT_METHOD => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("class=0x{class_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_static_int_method_by_id(class_handle, method_id, &args)?;
             Ok(v as u64)
@@ -453,6 +595,7 @@ fn dispatch_jni_call(
         JNI_CALL_STATIC_OBJECT_METHOD => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("class=0x{class_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_static_object_method_by_id(class_handle, method_id, &args)?;
             Ok(v)
@@ -460,6 +603,7 @@ fn dispatch_jni_call(
         JNI_CALL_STATIC_BOOLEAN_METHOD => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("class=0x{class_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_static_boolean_method_by_id(class_handle, method_id, &args)?;
             Ok(v as u64)
@@ -467,6 +611,7 @@ fn dispatch_jni_call(
         JNI_CALL_STATIC_LONG_METHOD => {
             let class_handle = x1 as u32;
             let method_id = x2;
+            trace.set_with(|| format!("class=0x{class_handle:X} mid=0x{method_id:X}"));
             let args = read_varargs(x3, x4, x5);
             let v = env.call_static_long_method_by_id(class_handle, method_id, &args)?;
             Ok(v as u64)
@@ -476,12 +621,14 @@ fn dispatch_jni_call(
         JNI_GET_INT_FIELD => {
             let obj_handle = x1 as u32;
             let field_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} fid=0x{field_id:X}"));
             let v = env.get_int_field_by_id(obj_handle, field_id)?;
             Ok(v as u64)
         }
         JNI_GET_OBJECT_FIELD => {
             let obj_handle = x1 as u32;
             let field_id = x2;
+            trace.set_with(|| format!("obj=0x{obj_handle:X} fid=0x{field_id:X}"));
             let v = env.get_object_field_by_id(obj_handle, field_id)?;
             Ok(v)
         }
@@ -489,6 +636,9 @@ fn dispatch_jni_call(
             let obj_handle = x1 as u32;
             let field_id = x2;
             let val = x3 as i32;
+            trace.set_with(|| {
+                format!("obj=0x{obj_handle:X} fid=0x{field_id:X} val={val}")
+            });
             env.set_int_field_by_id(obj_handle, field_id, val)?;
             Ok(0)
         }
@@ -496,6 +646,9 @@ fn dispatch_jni_call(
             let obj_handle = x1 as u32;
             let field_id = x2;
             let val_handle = x3 as u32;
+            trace.set_with(|| {
+                format!("obj=0x{obj_handle:X} fid=0x{field_id:X} val=0x{val_handle:X}")
+            });
             env.set_object_field_by_id(obj_handle, field_id, val_handle)?;
             Ok(0)
         }
@@ -503,6 +656,7 @@ fn dispatch_jni_call(
         // —— String ——
         JNI_NEW_STRING_UTF => {
             let utf_str = read_cstr_from_guest(cpu, x1)?;
+            trace.set_with(|| format!(r#"utf="{utf_str}""#));
             let handle = env.new_string_utf(&utf_str)?;
             Ok(handle as u64)
         }
@@ -515,6 +669,9 @@ fn dispatch_jni_call(
             let class_handle = x1 as u32;
             let methods_ptr = x2;
             let n_methods = x3 as usize;
+            trace.set_with(|| {
+                format!("class=0x{class_handle:X} n_methods={n_methods}")
+            });
 
             if methods_ptr == 0 || n_methods == 0 {
                 return Ok(0);

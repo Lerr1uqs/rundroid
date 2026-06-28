@@ -19,14 +19,22 @@ _JT = TypeVar("_JT", bound=type[JavaClass])
 _F = TypeVar("_F", bound=Callable[..., object])
 
 
-def java_class(name: str) -> Callable[[_JT], _JT]:
+def java_class(
+    name: str, superclass: Union[str, None] = None
+) -> Callable[[_JT], _JT]:
     """声明一个 Python class 是 Java class 的 shim。
 
     参数：
         name: Java class 的 slash-separated 全限定名（如 ``"android/content/pm/Signature"``）。
+        superclass: 可选父类全限定名（如 ``"com/scene/Signer"``）。声明后 Rust 侧写入
+            ``JClassDef.superclass``，使 registry 的继承链解析（``GetMethodID`` /
+            ``Call*Method`` 沿父类回退）对 guest 可见——用于覆盖「子类继承父类方法」语义。
+            省略时该 class 无显式父类（沿用默认 ``java/lang/Object``）。
     """
     def decorator(cls: _JT) -> _JT:
         cls.__java_class_name__ = name  # type: ignore[attr-defined]
+        # 显式落 __java_superclass__（空串表无父类），供 Rust register_java_class 读取。
+        cls.__java_superclass__ = superclass or ""  # type: ignore[attr-defined]
         if not hasattr(cls, "__java_methods__"):
             cls.__java_methods__ = []  # type: ignore[attr-defined]
         if not hasattr(cls, "__java_static_fields__"):

@@ -1,0 +1,14 @@
+[package]
+name = "rundroid-jni-trampoline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "rundroid 共享 JNI trampoline hook + dispatch：case-runner 与 Python 绑定层共同消费"
+
+[dependencies]
+rundroid-backend.workspace = true
+rundroid-telemetry.workspace = true
+rundroid-jni.workspace = true

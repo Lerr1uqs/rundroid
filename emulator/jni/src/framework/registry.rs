@@ -8,7 +8,7 @@
 //! # 收敛主线（关键）
 //!
 //! `install()` 把每个 builtin spec 物化成 `JClassDef`，经 `register_or_merge_class`
-//! 写入 `AndroidRuntime` 持有的 `JniRegistry`——这是**唯一 runtime authority**。
+//! 写入 `AndroidVM` 持有的 `JniRegistry`——这是**唯一 runtime authority**。
 //! Python shim override 走同一条 `register_or_merge_class`，与 Rust builtin 共享
 //! 同一套 `JClassDef`/method/field 数据模型。`FrameworkRegistry.classes` 仅供
 //! catalog 自省/重装，**不**参与 dispatch。
@@ -18,7 +18,7 @@
 //! package/signature 相关 stub 优先读 `ApkContext`；APK 未提供时走 mock 数据路径
 //! （见 `catalog::MOCK_PACKAGE_NAME`），保证无 APK 也能运行。
 
-use crate::android_runtime::AndroidRuntime;
+use crate::android_vm::AndroidVM;
 use crate::apk_context::ApkContext;
 use crate::error::JniError;
 use crate::framework::catalog::{self, ApplicationInfoData};
@@ -105,29 +105,29 @@ impl FrameworkRegistry {
         &self.classes
     }
 
-    /// 装配全部 builtin framework class + service 到 `AndroidRuntime`。
+    /// 装配全部 builtin framework class + service 到 `AndroidVM`。
     ///
     /// # 步骤
     ///
-    /// 1. APK 同步：若本 registry 的 apk 句柄为空，从 `AndroidRuntime` 取一份。
-    /// 2. 构建 [`FrameworkCtx`]（共享 rt 的对象池 / id 分配器 + 自有 apk/service 句柄）。
+    /// 1. APK 同步：若本 registry 的 apk 句柄为空，从 `vm` 取一份。
+    /// 2. 构建 [`FrameworkCtx`]（共享 vm 的对象池 / id 分配器 + 自有 apk/service 句柄）。
     /// 3. 注册默认 service（phone/wifi/…），每个分配稳定 stub ObjectId。
     /// 4. 分配 framework 单例（PackageManager / ApplicationInfo / AssetManager）。
     /// 5. 构建 builtin class specs，物化后经 `register_or_merge_class` 写入 `JniRegistry`。
     ///
     /// 可重复调用：spec 物化走 merge 语义，不会因重复注册失败。
-    pub fn install(&mut self, rt: &mut AndroidRuntime) -> Result<(), JniError> {
+    pub fn install(&mut self, vm: &mut AndroidVM) -> Result<(), JniError> {
         // 1. APK 同步
         if self.apk.read().unwrap().is_none() {
-            if let Some(apk) = rt.apk() {
+            if let Some(apk) = vm.apk.as_ref() {
                 *self.apk.write().unwrap() = Some(apk.clone());
             }
         }
 
-        // 2. 构建 ctx（共享 rt 对象池 + 自有 apk/service）
+        // 2. 构建 ctx（共享 vm 对象池 + 自有 apk/service）
         let ctx = FrameworkCtx::new(
-            rt.objects(),
-            rt.object_id_allocator(),
+            Arc::clone(&vm.objects),
+            Arc::clone(&vm.object_id_alloc),
             Arc::clone(&self.apk),
             Arc::clone(&self.services),
         );
@@ -144,7 +144,7 @@ impl FrameworkRegistry {
         for spec in specs {
             let name = spec.class_name.clone();
             let class_def = spec.materialize()?;
-            rt.classes_mut().register_or_merge_class(class_def)?;
+            vm.classes.register_or_merge_class(class_def)?;
             self.classes.insert(name, spec);
         }
 
@@ -204,10 +204,10 @@ impl FrameworkRegistry {
     /// 构造一个空的 framework stub 实例（StubInstance{()}），返回其 ObjectId。
     ///
     /// 供 harness 创建 Context / PackageManager 等 instance，再经 `dispatch_call` 调用方法。
-    /// 对象池/id 分配器取自 `AndroidRuntime`，与 install 时同一空间。
-    pub fn new_stub_instance(&self, rt: &AndroidRuntime, class_name: &str) -> Result<ObjectId, JniError> {
-        let oid = rt.object_id_allocator().lock().unwrap().object();
-        rt.objects()
+    /// 对象池/id 分配器取自 `AndroidVM`，与 install 时同一空间。
+    pub fn new_stub_instance(&self, vm: &AndroidVM, class_name: &str) -> Result<ObjectId, JniError> {
+        let oid = vm.object_id_alloc.lock().unwrap().object();
+        vm.objects
             .lock()
             .unwrap()
             .insert(oid, class_name.to_string(), ObjectStorage::StubInstance { data: Box::new(()) })
@@ -220,9 +220,9 @@ impl FrameworkRegistry {
     /// 供 harness 直接创建 `Signature` 调 `hashCode()` / `toByteArray()` 等。
     /// 等价于 `new Signature(byte[])`，但跳过 `<init>` dispatch（构造语义见
     /// native-jni-lifecycle change）。
-    pub fn new_signature(&self, rt: &AndroidRuntime, bytes: Vec<u8>) -> Result<ObjectId, JniError> {
-        let oid = rt.object_id_allocator().lock().unwrap().object();
-        rt.objects()
+    pub fn new_signature(&self, vm: &AndroidVM, bytes: Vec<u8>) -> Result<ObjectId, JniError> {
+        let oid = vm.object_id_alloc.lock().unwrap().object();
+        vm.objects
             .lock()
             .unwrap()
             .insert(
@@ -265,9 +265,9 @@ mod tests {
 
     #[test]
     fn install_registers_all_builtins_and_services() {
-        let mut rt = AndroidRuntime::new();
+        let mut vm = AndroidVM::new();
         let mut reg = FrameworkRegistry::new();
-        reg.install(&mut rt).unwrap();
+        reg.install(&mut vm).unwrap();
 
         // builtin class 全部进了 JniRegistry（统一 authority）
         for required in [
@@ -276,7 +276,7 @@ mod tests {
             "android/content/pm/Signature",
             "java/util/ArrayList",
         ] {
-            assert!(rt.classes().find_class(required).is_some(), "install 后 {required} 应在 JniRegistry");
+            assert!(vm.classes.find_class(required).is_some(), "install 后 {required} 应在 JniRegistry");
         }
         // 默认 service 全部注册
         let services_handle = reg.services();
@@ -290,10 +290,10 @@ mod tests {
 
     #[test]
     fn install_syncs_apk_from_runtime() {
-        let mut rt = AndroidRuntime::new().with_apk(ApkContext::new("com.from.rt".into()));
+        let mut vm = AndroidVM::new().with_apk(ApkContext::new("com.from.rt".into()));
         let mut reg = FrameworkRegistry::new();
-        // 不在 reg 上设 apk，install 应从 rt 同步
-        reg.install(&mut rt).unwrap();
+        // 不在 reg 上设 apk，install 应从 vm 同步
+        reg.install(&mut vm).unwrap();
         assert_eq!(
             reg.apk_handle().read().unwrap().as_ref().unwrap().package_name,
             "com.from.rt"
@@ -302,22 +302,22 @@ mod tests {
 
     #[test]
     fn install_is_idempotent_via_merge() {
-        let mut rt = AndroidRuntime::new();
+        let mut vm = AndroidVM::new();
         let mut reg = FrameworkRegistry::new();
-        reg.install(&mut rt).unwrap();
+        reg.install(&mut vm).unwrap();
         // 二次 install 不应失败（merge 语义）
-        reg.install(&mut rt).unwrap();
-        assert!(rt.classes().find_class("android/content/Context").is_some());
+        reg.install(&mut vm).unwrap();
+        assert!(vm.classes.find_class("android/content/Context").is_some());
     }
 
     #[test]
     fn new_stub_instance_creates_object() {
-        let mut rt = AndroidRuntime::new();
+        let mut vm = AndroidVM::new();
         let mut reg = FrameworkRegistry::new();
-        reg.install(&mut rt).unwrap();
+        reg.install(&mut vm).unwrap();
 
-        let oid = reg.new_stub_instance(&rt, "android/content/Context").unwrap();
-        let objects = rt.objects();
+        let oid = reg.new_stub_instance(&vm, "android/content/Context").unwrap();
+        let objects = Arc::clone(&vm.objects);
         let store = objects.lock().unwrap();
         assert_eq!(store.class_name(oid), Some("android/content/Context"));
         assert!(matches!(store.storage(oid), Some(ObjectStorage::StubInstance { .. })));
@@ -325,12 +325,12 @@ mod tests {
 
     #[test]
     fn new_signature_stores_bytes() {
-        let mut rt = AndroidRuntime::new();
+        let mut vm = AndroidVM::new();
         let mut reg = FrameworkRegistry::new();
-        reg.install(&mut rt).unwrap();
+        reg.install(&mut vm).unwrap();
 
-        let oid = reg.new_signature(&rt, vec![0xCA, 0xFE]).unwrap();
-        let objects = rt.objects();
+        let oid = reg.new_signature(&vm, vec![0xCA, 0xFE]).unwrap();
+        let objects = Arc::clone(&vm.objects);
         let store = objects.lock().unwrap();
         match store.storage(oid) {
             Some(ObjectStorage::StubInstance { data }) => {
@@ -343,10 +343,10 @@ mod tests {
 
     #[test]
     fn interface_shells_registered_as_interface() {
-        let mut rt = AndroidRuntime::new();
+        let mut vm = AndroidVM::new();
         let mut reg = FrameworkRegistry::new();
-        reg.install(&mut rt).unwrap();
-        let cls = rt.classes().find_class("java/util/List").unwrap();
+        reg.install(&mut vm).unwrap();
+        let cls = vm.classes.find_class("java/util/List").unwrap();
         assert_eq!(cls.kind, ClassKind::Interface);
     }
 }

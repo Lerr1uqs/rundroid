@@ -111,6 +111,16 @@ impl IdAllocator {
         self.next += 1;
         id
     }
+
+    /// 分配一个全局唯一的 MethodId。
+    ///
+    /// 与 class/object 共用同一递增计数器——类型不同（MethodId/ObjectId/ClassId），
+    /// 跨类型永不比较，故数值可重叠；同类型内由单一计数器保证全局唯一。
+    pub fn method(&mut self) -> MethodId {
+        let id = MethodId(self.next);
+        self.next += 1;
+        id
+    }
 }
 
 // ============================================================================

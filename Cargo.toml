@@ -19,6 +19,7 @@ members = [
     "emulator/case-runner",
     "emulator/bindings/python",
     "emulator/jni",
+    "emulator/jni_trampoline",
 ]
 
 # 所有 crate 共享以下元信息与版本，避免在每个 package 中重复声明。
@@ -46,6 +47,7 @@ rundroid-driver = { path = "emulator/driver" }
 rundroid-case-runner = { path = "emulator/case-runner" }
 rundroid-bindings-python = { path = "emulator/bindings/python" }
 rundroid-jni = { path = "emulator/jni" }
+rundroid-jni-trampoline = { path = "emulator/jni_trampoline" }
 
 # 外部依赖（bootstrap 阶段实际用到时再开启，先占位以便后续 crate 复用版本号）。
 thiserror = "2"

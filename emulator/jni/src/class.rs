@@ -18,7 +18,7 @@ use crate::dispatch::MethodImpl;
 use crate::error::JniError;
 use crate::field::FieldAccess;
 use crate::registry::JniRegistry;
-use crate::types::{ClassId, FieldSig, MethodId, MethodSig};
+use crate::types::{ClassId, FieldSig, IdAllocator, MethodId, MethodSig};
 use std::collections::HashMap;
 
 /// Java class 的种类。
@@ -199,6 +199,31 @@ impl JClassDef {
         let def = JMethodDef { id: method_id, sig: sig.clone(), is_static, imp };
         target.insert(sig, def);
         Ok(())
+    }
+
+    /// 用全局分配器重排本 class 所有 method id（instance + static），保证跨 class 全局唯一。
+    ///
+    /// `add_method` / `override_method` 按 ``method_index.len()+1`` 分配——每 class 独立
+    /// 从 1 起，导致子类自有 method 的 id 与继承自父类的 method id 数值相撞（如多个 class
+    /// 的 ``<init>`` 都是 1，或子类第二个 method 与父类第二个 method 同为 2）。
+    /// `Call*Method` 沿子类继承链按**裸 id** 解析时会误命中子类自有方法（参见
+    /// `resolve_method_by_id`）。注册时统一改走全局计数器后，instance/static method id
+    /// 全 registry 唯一，继承解析不再有歧义。`method_index` 与 `JMethodDef.id` 同步更新。
+    pub fn reassign_method_ids(&mut self, alloc: &mut IdAllocator) {
+        // 取当前所有 sig 的快照（避免持有 method_index 借用同时改其值）。
+        let sigs: Vec<MethodSig> = self.method_index.keys().cloned().collect();
+        for sig in sigs {
+            let new_id = alloc.method();
+            self.method_index.insert(sig.clone(), new_id);
+            // 同一 sig 只可能存在于 instance 或 static 表之一（add_method 按 is_static 分流），
+            // 两处 get_mut 都试，命中者更新。
+            if let Some(def) = self.methods.get_mut(&sig) {
+                def.id = new_id;
+            }
+            if let Some(def) = self.static_methods.get_mut(&sig) {
+                def.id = new_id;
+            }
+        }
     }
 
     /// 插入或替换 field（override 语义）。

@@ -7,6 +7,8 @@ artifacts/
 # clone 后用 NDK 重编，编译命令见各 src/*.c 文件头注释
 resources/smoke/build/
 resources/jnitest/build/
+resources/jnimin/build/
+resources/scene/build/
 
 # 本地机器构建配置，不适用于其他环境
 .cargo/

@@ -391,6 +391,7 @@ dependencies = [
  "rundroid-elf-loader",
  "rundroid-elf-parser",
  "rundroid-jni",
+ "rundroid-jni-trampoline",
  "rundroid-linux",
  "rundroid-memory",
  "rundroid-telemetry",
@@ -407,6 +408,7 @@ dependencies = [
  "rundroid-elf-loader",
  "rundroid-elf-parser",
  "rundroid-jni",
+ "rundroid-jni-trampoline",
  "rundroid-linux",
  "rundroid-memory",
  "rundroid-telemetry",
@@ -479,6 +481,15 @@ dependencies = [
  "rundroid-telemetry",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "rundroid-jni-trampoline"
+version = "0.1.0"
+dependencies = [
+ "rundroid-backend",
+ "rundroid-jni",
+ "rundroid-telemetry",
 ]
 
 [[package]]

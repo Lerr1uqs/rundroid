@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple, PyType};
 use rundroid_backend::{Arm64Reg, Backend, Engine, MemPerms, GuestCPU, SyscallHook};
 use rundroid_backend_unicorn::UnicornBackend;
+use rundroid_core::IdAllocator as ModuleIdAllocator;
 use rundroid_driver::{
     VirtualDevice,
     context::{DeviceCloseContext, DeviceIoContext, DeviceOpenContext},
@@ -30,12 +31,14 @@ use rundroid_elf_linker::{
     DefaultLinker, LinkContext, ModuleGraph, RelocationPatch, ResolvedSymbol, SymbolQuery,
 };
 use rundroid_jni::{
-    AndroidRuntime,
+    AndroidVM,
     ClassId,
     FieldAccess,
     FieldSig,
     IdAllocator,
     JMethodDef,
+    JNIEnvABI,
+    JavaVMABI,
     JniArgs,
     JniError,
     JType,
@@ -47,12 +50,15 @@ use rundroid_jni::{
     ObjectStore,
     PythonCallableAnnotations,
     SharedField,
+    validate_jni_version,
 };
+use rundroid_jni_trampoline::JniTrampolineHook;
 use rundroid_linux::{LinuxRuntime, MemoryBridge, SyscallResult};
 use rundroid_memory::MemoryError;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // PyVirtFile
@@ -271,38 +277,68 @@ impl PythonShimAdapter {
 
 /// Emulator 是 rundroid 的 Python 侧主入口对象。
 ///
-/// 它装配 Unicorn 引擎、Linux syscall runtime、ELF 模块图和 Android runtime，
-/// 为 Python 脚本层提供完整的 Android Native 执行环境。
+/// 它装配 Unicorn 引擎、Linux syscall runtime、ELF 模块图和 Android VM，
+/// 为 Python 脚本层提供完整的 Android Native 执行环境（含 JNI guest 执行）。
 ///
 /// # JNI 权威归属
 ///
-/// class / method / field 的最终权威存储在 `runtime: AndroidRuntime` 中。
-/// Python `register()` 和 Rust builtin 都进入同一套 [`AndroidRuntime`]。
+/// class / method / field / object 的最终权威存储在 `vm: Arc<Mutex<AndroidVM>>` 中。
+/// Python `register()` 和 Rust builtin（framework stub）都进入同一套 [`AndroidVM`]。
+/// JNI trampoline hook 持有同一 VM 的 `Arc::clone`——绑定层与 hook 共享一个 VM。
 ///
 /// 以下字段仅为 **binding adapter cache**，不是 authority：
 /// - `shim.method_names` — 仅用于 Python override 优先分派路径（`call_java_method`）
+///
+/// # 重入约束（单线程仿真的内在限制）
+///
+/// guest JNI dispatch 在 `emu_start` 期间触发 trampoline hook，hook 持守 VM Mutex。
+/// 触发到 Python `@java_method` override 时，该 override **不得**再入 VM
+/// （`avm.new_object` / `emulator.call`）——否则与 hook 持守的 Mutex 自锁死锁。
+/// Python override 必须是纯计算（读字段、算返回值）。详见各 change 的 spec。
 #[pyclass(name = "Emulator")]
 struct PyEmulatorBridge {
     engine: EngineHolder,
     linux: Arc<Mutex<LinuxRuntime>>,
+    /// 共享模块 ID 分配器。
+    ///
+    /// 同一个 Python Emulator 允许连续 `load()` 多个不同模块，
+    /// 因此 ModuleId 必须来自同一个单调递增编号空间。
+    /// 若每次 `load()` 都新建分配器，会重复生成 `ModuleId(1)`，
+    /// 使 `ModuleGraph` 中后插入模块覆盖先前模块。
+    module_id_alloc: ModuleIdAllocator,
+    /// ELF 镜像保留区游标。
+    ///
+    /// Python 绑定层允许同一个 Emulator 连续 `load()` 多个 so，
+    /// 因此镜像基址必须来自同一条 bump 分配游标。
+    /// 若每次 `load()` 都从固定地址重新开始，第二个模块会与第一个模块重叠映射。
+    reserve_cursor: u64,
     graph: ModuleGraph,
     trampoline_mapped: bool,
-    /// Android Runtime — class / method / field / object 的 canonical authority。
+    /// Android VM — class / method / field / object 的 canonical authority。
     ///
-    /// 用 `RwLock` 包裹以支持**递归重入**：`call_java_method`（&self）调用 Python 方法，
-    /// 方法体内可能 `self._avm.new_object(...)` → `register_java_object`（&self）再次访问
-    /// runtime。两者都是 `&self`（pyo3 PyRef，可共存），内部经 read()/write() guard 访问；
-    /// 调用 Python 前必须释放 guard，否则 write 会与持守的 read 自锁。
-    runtime: RwLock<AndroidRuntime>,
-    /// 共享 ObjectId 分配器——与 `runtime` 内 `object_id_alloc` 同源。
+    /// `Arc<Mutex<AndroidVM>>`：JNI trampoline hook 钳死要 `Arc<Mutex<AndroidVM>>`
+    /// （hook 是 `Box<dyn CodeHook>` 存在 engine 里，在 `emu_start` 期间触发，
+    /// 必须捕获能跨任何 `&self` 借用存活的 VM 句柄）。绑定层与 hook 经 `Arc::clone`
+    /// 共享同一个 VM，注册的 class 对 guest JNI dispatch 可见（同一 registry）。
+    ///
+    /// host 侧方法（`call_java_method` 等）访问 VM 时**调用 Python 前必须释放 guard**，
+    /// 否则方法体内 `new_object` 重入会与持守的 Mutex 自锁（同 unidbg 单线程语义）。
+    vm: Arc<Mutex<AndroidVM>>,
+    /// 共享 ObjectId 分配器——与 `vm.object_id_alloc` 同源。
     ///
     /// marshalling 闭包（`wrap_python_method`）与 `register_java_builtin` /
     /// `call_java_method_typed` 等路径捕获此 Arc，为 `str`/`bytes` 自动 coercion
-    /// 及显式 wrapper 构造分配 `ObjectId`，确保与 runtime 分配的对象 ID 同空间。
+    /// 及显式 wrapper 构造分配 `ObjectId`，确保与 VM 分配的对象 ID 同空间。
     id_alloc: Arc<Mutex<IdAllocator>>,
     /// Python shim adapter — 持有 Python 侧实例化、分派所需的缓存映射，
     /// 但不是 class/method/object 的 authority。
     shim: PythonShimAdapter,
+    /// JNI verbose trace 共享开关——trampoline hook 安装后仍可经 `set_jni_verbose` toggle。
+    jni_verbose: Arc<AtomicBool>,
+    /// JNIEnv guest 指针缓存（`init_jni` 后填充；`jni_env_pointer` 返回此值）。
+    jni_env_ptr: Option<u64>,
+    /// JavaVM guest 指针缓存（`init_jni` 后填充；`jni_onload` / `java_vm_pointer` 用）。
+    jni_vm_ptr: Option<u64>,
 }
 
 fn backend_err(e: rundroid_backend::BackendError) -> PyErr {
@@ -342,17 +378,28 @@ impl PyEmulatorBridge {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
             })?;
 
-        let runtime = AndroidRuntime::new();
-        let objects = runtime.objects();
-        let id_alloc = runtime.object_id_allocator();
+        // VM 用 Arc<Mutex<AndroidVM>> 包裹：JNI trampoline hook 与绑定层共享同一 VM。
+        // 取出内部独立 Arc<Mutex>（objects / id_alloc）clone 给 shim / id_alloc 字段，
+        // 它们与 VM 内的字段同源（指向同一份 ObjectStore / IdAllocator），
+        // 供 marshalling 闭包捕获、不持 VM 锁即可分配 ObjectId。
+        let vm = Arc::new(Mutex::new(AndroidVM::new()));
+        let (objects, id_alloc) = {
+            let vm_guard = vm.lock().unwrap();
+            (Arc::clone(&vm_guard.objects), Arc::clone(&vm_guard.object_id_alloc))
+        };
         Ok(Self {
             engine: EngineHolder { engine: Some(engine) },
             linux,
+            module_id_alloc: ModuleIdAllocator::new(),
+            reserve_cursor: 0x4000_0000,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
-            runtime: RwLock::new(runtime),
+            vm,
             id_alloc,
             shim: PythonShimAdapter::new(objects),
+            jni_verbose: Arc::new(AtomicBool::new(false)),
+            jni_env_ptr: None,
+            jni_vm_ptr: None,
         })
     }
 
@@ -385,15 +432,14 @@ impl PyEmulatorBridge {
             }
         }
 
-        let module_id = rundroid_core::IdAllocator::new().module();
+        let module_id = self.module_id_alloc.module();
         let raw_id = module_id.raw();
 
-        let mut reserve_cursor: u64 = 0x4000_0000;
         let module = {
             let engine_ref: &mut dyn Engine = &mut *self.engine;
             let mut load_ctx = LoadCtxAdapterPy {
                 engine: engine_ref,
-                next_reserve: &mut reserve_cursor,
+                next_reserve: &mut self.reserve_cursor,
             };
             DefaultLoader::new()
                 .load(&mut load_ctx, &parsed, LoadRequest {
@@ -448,31 +494,7 @@ impl PyEmulatorBridge {
                 format!("symbol `{name}` not found"),
             ))?;
 
-        const SENTINEL_ADDR: u64 = 0x7F_FFFF_0000;
-        const STACK_BASE: u64   = 0x7F_E000_0000;
-        const STACK_TOP: u64    = STACK_BASE + 0x10_0000;
-
-        if !self.trampoline_mapped {
-            self.engine.mem_map(SENTINEL_ADDR, 0x1000, MemPerms::READ_EXEC)
-                .map_err(backend_err)?;
-            self.engine.mem_write(SENTINEL_ADDR, &[0xC0, 0x03, 0x5F, 0xD6])
-                .map_err(backend_err)?;
-            self.engine.mem_map(STACK_BASE, 0x10_0000, MemPerms::READ_WRITE)
-                .map_err(backend_err)?;
-            self.trampoline_mapped = true;
-        }
-
-        self.engine.reg_write(Arm64Reg::Sp, STACK_TOP).map_err(backend_err)?;
-        self.engine.reg_write(Arm64Reg::Lr, SENTINEL_ADDR).map_err(backend_err)?;
-        self.engine.reg_write(Arm64Reg::Pc, entry_addr).map_err(backend_err)?;
-        for (i, v) in regs.iter().enumerate() {
-            self.engine.reg_write(Arm64Reg::X(i as u8), *v).map_err(backend_err)?;
-        }
-
-        self.engine.emu_start(entry_addr, Some(SENTINEL_ADDR), None, None).map_err(backend_err)?;
-
-        self.engine.reg_read(Arm64Reg::X(0))
-            .map_err(|e| backend_err(e))
+        self.call_guest(entry_addr, &regs)
     }
 
     // ========================================================================
@@ -483,7 +505,7 @@ impl PyEmulatorBridge {
     ///
     /// 读取 class 上的 metadata 属性（`__java_class_name__`、`__java_methods__`、
     /// `__java_static_fields__`），解析 descriptor，提取 Python 类型注解，
-    /// 做 strict verify，然后将 method/field 注册到 AndroidRuntime。
+    /// 做 strict verify，然后将 method/field 注册到 AndroidVM。
     ///
     /// # 注册流程
     ///
@@ -495,7 +517,7 @@ impl PyEmulatorBridge {
     ///    d. 用 `javashim::wrap_python_method` 创建真实 handler
     ///    e. 注册到 class_def
     /// 3. 遍历 `__java_static_fields__`，解析并注册 field
-    /// 4. 通过 `register_or_merge_class` 注册到 AndroidRuntime
+    /// 4. 通过 `register_or_merge_class` 注册到 AndroidVM
     ///    （若 class 已存在则 merge：Python override 替换已有，未覆盖部分保留）
     fn register_java_class(&mut self, cls: &Bound<'_, PyType>) -> PyResult<()> {
         let class_name: String = cls.getattr("__java_class_name__")
@@ -508,6 +530,17 @@ impl PyEmulatorBridge {
             ))?;
 
         let mut class_def = rundroid_jni::JClassDef::new(ClassId(0), class_name.clone());
+
+        // —— 可选 superclass ——
+        // Python @java_class(name, superclass="...") 声明的继承关系落到 JClassDef.superclass，
+        // 使 registry 的继承链解析（class_chain / resolve_inherited_method /
+        // resolve_method_by_id）能沿父类回退——guest GetMethodID/Call*Method 据此解析
+        // 子类继承自父类的方法。无 __java_superclass__ 或空串 → 不设置（默认 java/lang/Object）。
+        let superclass: Option<String> = cls.getattr("__java_superclass__").ok()
+            .and_then(|v| v.extract().ok());
+        if let Some(sup) = superclass.filter(|s| !s.is_empty()) {
+            class_def.superclass = Some(sup);
+        }
 
         // —— 注册 methods ——
         let methods = cls.getattr("__java_methods__")
@@ -652,8 +685,9 @@ impl PyEmulatorBridge {
                 ))?;
         }
 
-        // 注册到 AndroidRuntime（若 class 已存在则 merge）
-        self.runtime.write().unwrap().classes_mut().register_or_merge_class(class_def)
+        // 注册到 AndroidVM（若 class 已存在则 merge）——与 framework stub、guest JNI
+        // dispatch 共用同一 registry（VM.classes），register 后即对 guest JNI 可见。
+        self.vm.lock().unwrap().classes.register_or_merge_class(class_def)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("class 注册失败: {e}")
             ))?;
@@ -667,8 +701,8 @@ impl PyEmulatorBridge {
     /// 不再由 binding 按 class_name 内部实例化）。
     ///
     /// 流程：
-    /// 1. ObjectId 由 AVM 层 `IdAllocator` 分配（`AndroidRuntime::allocate_object_id`），
-    ///    而非 binding 自有的计数器——ObjectId 归 AVM 层，与 class/field/method ID 统一空间。
+    /// 1. ObjectId 由共享 `IdAllocator` 分配（与 VM 内 `object_id_alloc` 同源），
+    ///    而非 binding 自有的计数器——ObjectId 归 AVM 层，与 marshalling 产物统一空间。
     /// 2. 存入 `ObjectStore`（`HostValue` 持有 Python 对象引用 `Py<PyAny>`）。
     /// 3. 经 `RefTable::new_global` 分配全局 handle（JNI `jobject` 等价物）。
     ///
@@ -680,20 +714,22 @@ impl PyEmulatorBridge {
     ///
     /// 取 `&self`（而非 `&mut self`）：本方法会被 Python 方法体经
     /// `self._avm.new_object(...)` 递归回调——此时外层 `call_java_method`（`&self`，
-    /// pyo3 `PyRef`）仍在栈上，若本方法也是 `&self` 则两个 `PyRef` 可共存；内部经
-    /// `RwLock` write guard 访问 runtime（本方法不调 Python，可持守 write guard）。
+    /// pyo3 `PyRef`）仍在栈上，若本方法也是 `&self` 则两个 `PyRef` 可共存。
+    ///
+    /// 三步分别持各自独立的锁（`id_alloc` / `shim.objects` 是内层 `Arc<Mutex>`，
+    /// 与 VM Mutex 无嵌套），VM Mutex 只在分配 global ref handle（`vm.refs`）时短暂
+    /// 持有；本方法不调 Python，故持锁安全。
     ///
     /// 返回 `(global_handle, object_id)`：handle 供 guest JNI 引用；
     /// object_id 回填到 JavaObject 的 `_rundroid_oid`，使 marshalling 能识别已注册对象
     /// （见 `javashim::py_to_jvalue` 的 `_rundroid_oid` 分支），从而让 JavaObject 可跨
     /// Python↔Rust 编组边界（作参数/返回值），与 `JavaString`/`JavaByteArray` 一致。
     fn register_java_object(&self, class_name: &str, py_obj: Py<PyAny>) -> PyResult<(u32, u64)> {
-        let mut rt = self.runtime.write().unwrap();
-        // 1. 由 AVM 层 IdAllocator 分配 ObjectId（与 class/field/method ID 统一空间）
-        let object_id = rt.allocate_object_id();
+        // 1. 由共享 IdAllocator 分配 ObjectId（独立 Arc<Mutex>，不持 VM 锁）
+        let object_id = self.id_alloc.lock().unwrap().object();
 
-        // 2. 存入 ObjectStore（HostValue 持有 Python 对象引用）
-        rt.vm.objects.lock().unwrap().insert(
+        // 2. 存入 ObjectStore（独立 Arc<Mutex>，不持 VM 锁）
+        self.shim.objects.lock().unwrap().insert(
             object_id,
             class_name.to_string(),
             ObjectStorage::HostValue { data: Box::new(py_obj) },
@@ -701,8 +737,8 @@ impl PyEmulatorBridge {
             format!("ObjectStore 插入失败: {e}")
         ))?;
 
-        // 3. 分配 global ref handle，连同 object_id 一起返回
-        let handle = rt.refs_mut().new_global(object_id);
+        // 3. 分配 global ref handle（refs 是 VM 直接字段，短暂持 VM 锁，不调 Python）
+        let handle = self.vm.lock().unwrap().refs.new_global(object_id);
 
         Ok((handle, object_id.0))
     }
@@ -736,13 +772,13 @@ impl PyEmulatorBridge {
     /// 通过 `RefTable::resolve` → `ObjectStore::storage` 查找，
     /// 从 `HostValue` 中取出 Python 对象引用。
     fn java_instance(&self, handle: u32) -> PyResult<PyObject> {
-        let rt = self.runtime.read().unwrap();
-        let object_id = rt.refs().resolve(handle)
+        let vm = self.vm.lock().unwrap();
+        let object_id = vm.refs.resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在")
             ))?;
 
-        match rt.vm.objects.lock().unwrap().storage(object_id) {
+        match vm.objects.lock().unwrap().storage(object_id) {
             Some(ObjectStorage::HostValue { data }) => {
                 let py_obj: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
                     .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -765,20 +801,20 @@ impl PyEmulatorBridge {
     ///
     /// 调用后 handle 失效，后续通过该 handle 的操作返回错误。
     fn release_java_instance(&mut self, handle: u32) -> PyResult<()> {
-        let mut rt = self.runtime.write().unwrap();
-        let object_id = rt.refs().resolve(handle)
+        let mut vm = self.vm.lock().unwrap();
+        let object_id = vm.refs.resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在于 RefTable")
             ))?;
 
         // 从 ObjectStore 移除（drop HostValue → Python 对象引用失效）
-        rt.vm.objects.lock().unwrap().remove(object_id)
+        vm.objects.lock().unwrap().remove(object_id)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("ObjectId {object_id} 不在 ObjectStore 中")
             ))?;
 
         // 从 RefTable 删除 global ref
-        rt.refs_mut().delete_global(handle)
+        vm.refs.delete_global(handle)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("删除 ref handle 失败: {e}")
             ))?;
@@ -816,8 +852,8 @@ impl PyEmulatorBridge {
         let java_name = sig.name.clone();
         let argc = sig.args.len();
 
-        // 1. 解析 handle → ObjectId（临时 read guard，调用后即释放）
-        let object_id = self.runtime.read().unwrap().refs().resolve(handle)
+        // 1. 解析 handle → ObjectId（短暂持 VM 锁，解析后即释放）
+        let object_id = self.vm.lock().unwrap().refs.resolve(handle)
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("实例 handle {handle} 不存在于 RefTable")
             ))?;
@@ -834,9 +870,8 @@ impl PyEmulatorBridge {
             StubInstance(String),
             Unsupported(&'static str),
         }
-        // 取出 objects 的 Arc（read guard 仅借用于 clone，语句结束即释放），
-        // 之后独立锁 objects，不持守 runtime read guard。
-        let objects = self.runtime.read().unwrap().objects();
+        // objects 是内层独立 Arc<Mutex>（与 VM 内字段同源），不持 VM 锁即可访问。
+        let objects = Arc::clone(&self.shim.objects);
         let target = {
             let store = objects.lock().unwrap();
             let storage = store.storage(object_id)
@@ -928,8 +963,8 @@ impl PyEmulatorBridge {
                     // 创建临时 RefTable（dispatch 不需要真实 ref 表，仅满足 API 签名）
                     let mut temp_refs = rundroid_jni::RefTable::new();
                     // dispatch_call 仅走 framework stub 的 RustNative handler（无 engine 回调），
-                    // 持守 read guard 安全；此分支为非 override 回落，不触发 Python 方法体重入。
-                    let result = self.runtime.read().unwrap().classes().dispatch_call(
+                    // 持守 VM Mutex 安全；此分支为非 override 回落，不触发 Python 方法体重入。
+                    let result = self.vm.lock().unwrap().classes.dispatch_call(
                         &dispatch_sig, &jni_args, &mut temp_refs,
                     ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         format!("method `{java_name}` 在 class `{}` 中分派失败: {e}", dispatch_sig.class)
@@ -991,19 +1026,19 @@ impl PyEmulatorBridge {
                 format!("method descriptor 解析失败: {e}")
             ))?;
 
-        // 1. 短暂 read guard：解析 handle → ObjectId + class_name，取出共享 objects/id_alloc。
+        // 1. 短暂持 VM 锁：解析 handle → ObjectId + class_name，取出共享 objects/id_alloc。
         let (object_id, class_name, objects, id_alloc) = {
-            let rt = self.runtime.read().unwrap();
-            let oid = rt.refs().resolve(handle)
+            let vm = self.vm.lock().unwrap();
+            let oid = vm.refs.resolve(handle)
                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("实例 handle {handle} 不存在于 RefTable")
                 ))?;
-            let class_name = rt.vm.objects.lock().unwrap().class_name(oid)
+            let class_name = vm.objects.lock().unwrap().class_name(oid)
                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("ObjectId {oid} 不在 ObjectStore 中")
                 ))?
                 .to_string();
-            (oid, class_name, rt.objects(), Arc::clone(&self.id_alloc))
+            (oid, class_name, Arc::clone(&self.shim.objects), Arc::clone(&self.id_alloc))
         };
 
         // 2. 解析 dispatch 用的 class（descriptor 带 class 用之，否则用对象 class_name）。
@@ -1013,10 +1048,10 @@ impl PyEmulatorBridge {
             dispatch_sig.class = resolved_class.clone();
         }
 
-        // 3. 短暂 read guard：clone 出 handler Arc，立即释放 guard（避免持守 guard 调 Python 自锁）。
+        // 3. 短暂持 VM 锁：clone 出 handler Arc，立即释放锁（避免持锁调 Python 自锁）。
         let handler = {
-            let rt = self.runtime.read().unwrap();
-            let cls = rt.classes().find_class(&resolved_class)
+            let vm = self.vm.lock().unwrap();
+            let cls = vm.classes.find_class(&resolved_class)
                 .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     format!("class `{resolved_class}` 未注册")
                 ))?;
@@ -1035,7 +1070,7 @@ impl PyEmulatorBridge {
                     "PythonShim 方法尚未接入"
                 )),
             }
-        }; // ← read guard 在此释放
+        }; // ← VM 锁在此释放
 
         // 4. 入参编组 + 标记 this（锁外，无 runtime guard）。
         let mut jni_args = javashim::pyargs_to_jniargs(py, args, &objects, &id_alloc)
@@ -1099,7 +1134,7 @@ impl PyEmulatorBridge {
 
         // 使用 register_or_merge_class：若 class 已存在则合并（保留已有 override），
         // 否则正常注册
-        self.runtime.write().unwrap().classes_mut().register_or_merge_class(class_def)
+        self.vm.lock().unwrap().classes.register_or_merge_class(class_def)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("framework stub class 注册失败: {e}")
             ))?;
@@ -1123,11 +1158,13 @@ impl PyEmulatorBridge {
             sig.class = class_name.to_string();
         }
 
-        let rt = self.runtime.read().unwrap();
-        let result = rt.classes().dispatch_static_field_get(&sig)
-            .or_else(|_| rt.classes().dispatch_field_get(&sig));
-        let objects = rt.objects();
-        drop(rt);
+        // 短暂持 VM 锁：registry 查询（field get 是纯 registry 读取，不调 Python）。
+        let result = {
+            let vm = self.vm.lock().unwrap();
+            vm.classes.dispatch_static_field_get(&sig)
+                .or_else(|_| vm.classes.dispatch_field_get(&sig))
+        };
+        let objects = Arc::clone(&self.shim.objects);
 
         Python::with_gil(|py| jvalue_result_to_py(py, result, &objects))
     }
@@ -1139,16 +1176,14 @@ impl PyEmulatorBridge {
     fn read_instance_field(&self, handle: u32, field_name: &str) -> PyResult<PyObject> {
         // 锁内取出实例 Py 引用（clone），立即释放锁——getattr 会触发 JavaObject.__getattr__
         // （Python 操作），必须在无锁状态下执行。
+        // 注意：refs 在 VM 上（需 VM 锁），objects 是独立 Arc<Mutex>（不需 VM 锁）。
+        // 先短暂持 VM 锁解析 handle → ObjectId（释放后再锁 objects，不嵌套 VM 锁）。
         let py_obj: Py<PyAny> = {
-            let objects = self.runtime.read().unwrap().objects();
-            let object_id = {
-                let rt = self.runtime.read().unwrap();
-                rt.refs().resolve(handle)
-                    .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("实例 handle {handle} 不存在于 RefTable")
-                    ))?
-            };
-            let store = objects.lock().unwrap();
+            let object_id = self.vm.lock().unwrap().refs.resolve(handle)
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("实例 handle {handle} 不存在于 RefTable")
+                ))?;
+            let store = self.shim.objects.lock().unwrap();
             match store.storage(object_id) {
                 Some(ObjectStorage::HostValue { data }) => {
                     let py_ref: &Py<PyAny> = data.downcast_ref::<Py<PyAny>>()
@@ -1182,6 +1217,138 @@ impl PyEmulatorBridge {
                 ))
         })
     }
+
+    // ========================================================================
+    // JNI guest 执行 — init_jni / jni_onload / 指针查询 / verbose / read_guest
+    // ========================================================================
+
+    /// 初始化 JNI guest 执行环境：映射 JNIEnv + JavaVM ABI 表到 guest 内存，
+    /// 安装 trampoline code hook。
+    ///
+    /// 必须在 `load` 之后、`call` / `jni_onload` 之前调用一次。装配后：
+    /// - guest 代码经 `(*env)->Fn` 回调会落入 trampoline，触发 hook 分派到 VM。
+    /// - 返回的 `jni_env_pointer` / `java_vm_pointer` 可写入 guest 或传给 native。
+    ///
+    /// trampoline hook 持有 `Arc::clone(&self.vm)`——绑定层与 hook 共享同一 VM，
+    /// 注册的 class 对 guest JNI dispatch 可见。verbose 开关也以 Arc 共享，
+    /// 安装后仍可经 `set_jni_verbose` toggle。
+    fn init_jni(&mut self) -> PyResult<()> {
+        // 地址布局与 case-runner init_jni 一致：JNIEnv @ 0x7F_C000_0000，
+        // JavaVM 紧跟其后；栈在 0x7F_E000_0000，sentinel 在 0x7F_FFFF_0000。
+        const JNI_ENV_BASE: u64 = 0x7F_C000_0000;
+        let env_abi = JNIEnvABI::new(JNI_ENV_BASE);
+        let vm_abi = JavaVMABI::new(env_abi.env_ptr() + env_abi.total_size() as u64);
+
+        // 1. 一次性映射整块 JNIEnv + JavaVM 区域（env struct / 函数表 / trampoline +
+        //    JavaVM struct / invoke table / javavm trampoline）。
+        let total_map = env_abi.total_size() + vm_abi.total_size();
+        self.engine
+            .mem_map(env_abi.env_ptr(), total_map, MemPerms::READ_EXEC)
+            .map_err(backend_err)?;
+
+        // 2. 写入 env header + 函数指针表 + trampoline NOP + JavaVM header + invoke table + trampoline NOP。
+        {
+            let engine: &mut EngineHolder = &mut self.engine;
+            let mut mem_write = |addr: u64, bytes: &[u8]| {
+                engine.mem_write(addr, bytes).is_ok()
+            };
+            env_abi.write_to_guest(&mut mem_write)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("JNIEnv ABI 写入 guest 失败: {e}")
+                ))?;
+            vm_abi.write_to_guest(&mut mem_write)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("JavaVM ABI 写入 guest 失败: {e}")
+                ))?;
+        }
+
+        // 3. 安装 code hook 覆盖 [jni trampoline, javavm trampoline]，
+        //    hook 内部按地址分流 dispatch（JNIEnv vs JavaVM）。
+        let hook = JniTrampolineHook::new(
+            env_abi.clone(),
+            vm_abi.clone(),
+            Arc::clone(&self.vm),
+            Arc::clone(&self.jni_verbose),
+        );
+        let begin = env_abi.trampoline_begin();
+        let end = vm_abi.trampoline_end();
+        self.engine
+            .install_code_hook(begin, end, Box::new(hook))
+            .map_err(backend_err)?;
+
+        // 4. 缓存 guest 指针（move ABI 前）。
+        self.jni_env_ptr = Some(env_abi.env_ptr());
+        self.jni_vm_ptr = Some(vm_abi.vm_ptr());
+
+        Ok(())
+    }
+
+    /// 返回 JNIEnv guest 指针（`init_jni` 后有效；未初始化返回 None）。
+    #[getter]
+    fn jni_env_pointer(&self) -> Option<u64> {
+        self.jni_env_ptr
+    }
+
+    /// 返回 JavaVM guest 指针（`jni_onload` 第一参数；未初始化返回 None）。
+    #[getter]
+    fn java_vm_pointer(&self) -> Option<u64> {
+        self.jni_vm_ptr
+    }
+
+    /// 读取 guest 内存（host 视角），返回 bytes。供测试断言 guest 写出的数据。
+    fn read_guest(&self, addr: u64, len: usize) -> PyResult<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        self.engine.mem_read(addr, &mut buf).map_err(backend_err)?;
+        Ok(buf)
+    }
+
+    /// 遍历所有已加载模块，调用每个导出的 `JNI_OnLoad(JavaVM*, void*)`。
+    ///
+    /// 必须在 `init_jni` 之后调用（需要 JavaVM 指针）。每个模块：
+    /// 1. 以 `java_vm_pointer` 作 x0、0 作 x1 调用 `JNI_OnLoad`
+    /// 2. 校验返回值是合法 JNI version（`validate_jni_version`），非法则 fail-fast
+    ///
+    /// 返回各模块的 `(模块名, jni_version)` 列表。
+    ///
+    /// # 重入约束
+    ///
+    /// `JNI_OnLoad` 内部可能经 `(*vm)->GetEnv` → trampoline hook 分派到 VM。
+    /// hook 持守 VM Mutex 期间不会回调 Python（dispatch 走 RustNative handler），
+    /// 故 `call_guest`（emu_start）期间持锁安全。但若 JNI_OnLoad 注册的 native
+    /// 方法后续触发 Python override，该 override 不得再入 VM（单线程仿真限制）。
+    fn jni_onload(&mut self) -> PyResult<Vec<(String, u64)>> {
+        let java_vm = self.jni_vm_ptr.ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "JavaVM 指针未初始化（init_jni 未调用？）"
+        ))?;
+
+        // 先收集所有 JNI_OnLoad 地址（避免借 self.graph 又 mut self.call_guest 冲突）。
+        let onloads: Vec<(String, u64)> = self.graph.modules.values()
+            .filter_map(|m| {
+                m.exports.find("JNI_OnLoad").map(|e| (m.name.clone(), e.guest_addr))
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for (name, addr) in onloads {
+            let version = self.call_guest(addr, &[java_vm, 0])?;
+            if !validate_jni_version(version) {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("模块 `{name}` 的 JNI_OnLoad 返回非法 JNI version: {version:#010x}")
+                ));
+            }
+            results.push((name, version));
+        }
+        Ok(results)
+    }
+
+    /// 开启/关闭 JNI verbose trace（unidbg 式 `[I] JNIEnv->{slot}(...) => 0x...`）。
+    ///
+    /// 开启后每次 guest JNI 调用向 host stdout 打一行 trace，便于调试与测试断言
+    /// （pytest `capsys` 可捕获）。trampoline hook 持有同一 `Arc<AtomicBool>`，
+    /// 安装后 toggle 立即生效。
+    fn set_jni_verbose(&self, on: bool) {
+        self.jni_verbose.store(on, Ordering::Relaxed);
+    }
 }
 
 // ============================================================================
@@ -1192,23 +1359,60 @@ impl PyEmulatorBridge {
     /// 通用内置对象注册（Python 侧不直接调用，由 string/bytes 专方法复用）。
     ///
     /// 分配 ObjectId → 写入 ObjectStore → 分配 global ref handle。
-    /// 持守 write guard（本方法不回调 Python，可安全持守）。
+    /// 三步分别持各自独立锁（id_alloc / objects 是内层 Arc<Mutex>），VM 锁只在
+    /// 分配 global ref handle（vm.refs）时短暂持有；本方法不回调 Python，可安全持锁。
     fn register_builtin(
         &self,
         class_name: &str,
         storage: ObjectStorage,
     ) -> PyResult<(u32, ObjectId)> {
-        let mut rt = self.runtime.write().unwrap();
-        let object_id = rt.allocate_object_id();
-        rt.vm.objects.lock().unwrap().insert(
+        // 1. ObjectId 由共享 IdAllocator 分配（独立 Arc<Mutex>，不持 VM 锁）
+        let object_id = self.id_alloc.lock().unwrap().object();
+        // 2. 写入 ObjectStore（独立 Arc<Mutex>，不持 VM 锁）
+        self.shim.objects.lock().unwrap().insert(
             object_id,
             class_name.to_string(),
             storage,
         ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
             format!("ObjectStore 插入内置对象失败: {e}")
         ))?;
-        let handle = rt.refs_mut().new_global(object_id);
+        // 3. 分配 global ref handle（refs 是 VM 直接字段，短暂持 VM 锁，不调 Python）
+        let handle = self.vm.lock().unwrap().refs.new_global(object_id);
         Ok((handle, object_id))
+    }
+
+    /// 调用 guest 中地址 `entry_addr` 的函数（AArch64 ABI），返回 x0。
+    ///
+    /// 实现：sentinel 页放一条 `ret`，LR=sentinel，PC=entry，参数按 x0..x7 放置，
+    /// `emu_start` 跑到 sentinel 自然停止，读 x0。
+    ///
+    /// sentinel + stack 仅首次映射（`trampoline_mapped` 复用），多次调用共享。
+    /// `call`（按符号名调用）与 `jni_onload`（按 JNI_OnLoad 导出地址调用）共用此入口。
+    fn call_guest(&mut self, entry_addr: u64, args: &[u64]) -> PyResult<u64> {
+        const SENTINEL_ADDR: u64 = 0x7F_FFFF_0000;
+        const STACK_BASE: u64   = 0x7F_E000_0000;
+        const STACK_TOP: u64    = STACK_BASE + 0x10_0000;
+
+        if !self.trampoline_mapped {
+            self.engine.mem_map(SENTINEL_ADDR, 0x1000, MemPerms::READ_EXEC)
+                .map_err(backend_err)?;
+            self.engine.mem_write(SENTINEL_ADDR, &[0xC0, 0x03, 0x5F, 0xD6])
+                .map_err(backend_err)?;
+            self.engine.mem_map(STACK_BASE, 0x10_0000, MemPerms::READ_WRITE)
+                .map_err(backend_err)?;
+            self.trampoline_mapped = true;
+        }
+
+        self.engine.reg_write(Arm64Reg::Sp, STACK_TOP).map_err(backend_err)?;
+        self.engine.reg_write(Arm64Reg::Lr, SENTINEL_ADDR).map_err(backend_err)?;
+        self.engine.reg_write(Arm64Reg::Pc, entry_addr).map_err(backend_err)?;
+        for (i, v) in args.iter().take(8).enumerate() {
+            self.engine.reg_write(Arm64Reg::X(i as u8), *v).map_err(backend_err)?;
+        }
+
+        self.engine.emu_start(entry_addr, Some(SENTINEL_ADDR), None, None).map_err(backend_err)?;
+
+        self.engine.reg_read(Arm64Reg::X(0)).map_err(backend_err)
     }
 }
 

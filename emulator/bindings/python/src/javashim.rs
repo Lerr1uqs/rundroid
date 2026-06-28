@@ -113,8 +113,20 @@ pub fn wrap_python_method(
                         // 经 __getattr__(java_name) → __java_dispatch__，py_args 元组展开为位置参数
                         instance.bind(py).call_method1(&java_name, &py_args)
                     }
-                    // 实例不在 ObjectStore / 非 HostValue：直接调用未绑定函数
-                    None => fn_ref.call(&py_args, None),
+                    // 实例不在 ObjectStore / 非 HostValue：guest 经 NewObject 创建的对象在
+                    // Rust 侧是 StubInstance（单线程仿真下无 Python JavaObject backing）。
+                    // 蓝图函数签名含 self，直接 call(py_args) 会因缺 self 而 TypeError——
+                    // 故注入 self=None：(None, *py_args)。纯计算 override（不依赖 self）即可
+                    // 正常调用；若 override 访问 self 属性，None 上 AttributeError fail-fast
+                    //（正确语义：guest 对象无 Python 实例状态可读）。
+                    None => {
+                        let mut full: Vec<PyObject> = Vec::with_capacity(py_args.len() + 1);
+                        full.push(py.None());
+                        full.extend(py_args.iter().map(|item| item.unbind()));
+                        let full_tuple = PyTuple::new(py, full)
+                            .map_err(|e| JniError::Internal(format!("PyTuple 构造失败: {e}")))?;
+                        fn_ref.call(&full_tuple, None)
+                    }
                 }
             } else {
                 // static method：直接调用，py_args 元组展开为位置参数

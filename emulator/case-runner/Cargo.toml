@@ -19,6 +19,7 @@ rundroid-elf-linker.workspace = true
 rundroid-linux.workspace = true
 rundroid-telemetry.workspace = true
 rundroid-jni.workspace = true
+rundroid-jni-trampoline.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

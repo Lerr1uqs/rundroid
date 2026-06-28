@@ -13,7 +13,7 @@
 //! - `getSystemService()` —— service registry 路径
 
 use rundroid_jni::{
-    AndroidRuntime, ApkContext, FrameworkRegistry, JniArgs, JType, JValue, MethodSig,
+    AndroidVM, ApkContext, FrameworkRegistry, JniArgs, JType, JValue, MethodSig,
     ObjectStorage, ObjectId, RefTable,
 };
 
@@ -21,18 +21,18 @@ use rundroid_jni::{
 // harness helpers
 // ============================================================================
 
-/// 构造一个装好 framework stub 的 AndroidRuntime（带给定 APK）。
-fn runtime_with_apk(apk: ApkContext) -> (AndroidRuntime, FrameworkRegistry) {
-    let mut rt = AndroidRuntime::new().with_apk(apk);
+/// 构造一个装好 framework stub 的 AndroidVM（带给定 APK）。
+fn runtime_with_apk(apk: ApkContext) -> (AndroidVM, FrameworkRegistry) {
+    let mut vm = AndroidVM::new().with_apk(apk);
     let mut reg = FrameworkRegistry::new();
-    reg.install(&mut rt).expect("framework install 失败");
-    (rt, reg)
+    reg.install(&mut vm).expect("framework install 失败");
+    (vm, reg)
 }
 
-/// 把 Rust 字符串落成 Java String 对象（经 runtime 的对象池 + id 分配器）。
-fn intern_string(rt: &mut AndroidRuntime, s: &str) -> ObjectId {
-    let oid = rt.allocate_object_id();
-    rt.objects()
+/// 把 Rust 字符串落成 Java String 对象（经 vm 的对象池 + id 分配器）。
+fn intern_string(vm: &mut AndroidVM, s: &str) -> ObjectId {
+    let oid = vm.object_id_alloc.lock().unwrap().object();
+    vm.objects
         .lock()
         .unwrap()
         .insert(oid, "java/lang/String".into(), ObjectStorage::String(s.into()))
@@ -41,9 +41,8 @@ fn intern_string(rt: &mut AndroidRuntime, s: &str) -> ObjectId {
 }
 
 /// 读取一个 String 对象的内容。
-fn read_string(rt: &AndroidRuntime, oid: ObjectId) -> String {
-    let objects = rt.objects();
-    let store = objects.lock().unwrap();
+fn read_string(vm: &AndroidVM, oid: ObjectId) -> String {
+    let store = vm.objects.lock().unwrap();
     match store.storage(oid) {
         Some(ObjectStorage::String(s)) => s.clone(),
         other => panic!("期望 String storage，实际 {other:?}"),
@@ -51,11 +50,11 @@ fn read_string(rt: &AndroidRuntime, oid: ObjectId) -> String {
 }
 
 /// 调用 instance method（自动构造临时 RefTable）。
-fn call(rt: &AndroidRuntime, sig: &MethodSig, this: ObjectId, args: Vec<JValue>) -> JValue {
+fn call(vm: &AndroidVM, sig: &MethodSig, this: ObjectId, args: Vec<JValue>) -> JValue {
     let mut jni_args = JniArgs::from_vec(args);
     jni_args.set_this(this);
     let mut refs = RefTable::new();
-    rt.classes().dispatch_call(sig, &jni_args, &mut refs).expect(&format!("dispatch {sig} 失败"))
+    vm.classes.dispatch_call(sig, &jni_args, &mut refs).expect(&format!("dispatch {sig} 失败"))
 }
 
 /// 独立实现 Java `Arrays.hashCode(byte[])`，用于校验 Signature.hashCode 用的是规范公式。
@@ -74,37 +73,37 @@ fn java_arrays_hash(bytes: &[u8]) -> i32 {
 #[test]
 fn harness_get_package_name_reads_apk() {
     let apk = ApkContext::new("com.example.app".into());
-    let (rt, reg) = runtime_with_apk(apk);
+    let (vm, reg) = runtime_with_apk(apk);
 
-    let ctx_oid = reg.new_stub_instance(&rt, "android/content/Context").unwrap();
+    let ctx_oid = reg.new_stub_instance(&vm, "android/content/Context").unwrap();
     let sig = MethodSig {
         class: "android/content/Context".into(),
         name: "getPackageName".into(),
         args: vec![],
         ret: JType::Object("java/lang/String".into()),
     };
-    let result = call(&rt, &sig, ctx_oid, vec![]);
+    let result = call(&vm, &sig, ctx_oid, vec![]);
     let oid = result.as_object().expect("getPackageName 应返回 String 对象");
-    assert_eq!(read_string(&rt, oid), "com.example.app");
+    assert_eq!(read_string(&vm, oid), "com.example.app");
 }
 
 #[test]
 fn harness_get_package_name_without_apk_returns_mock() {
     // 无 APK 运行（mock 数据路径）—— design.md 要求
-    let mut rt = AndroidRuntime::new();
+    let mut vm = AndroidVM::new();
     let mut reg = FrameworkRegistry::new();
-    reg.install(&mut rt).unwrap();
+    reg.install(&mut vm).unwrap();
 
-    let ctx_oid = reg.new_stub_instance(&rt, "android/content/Context").unwrap();
+    let ctx_oid = reg.new_stub_instance(&vm, "android/content/Context").unwrap();
     let sig = MethodSig {
         class: "android/content/Context".into(),
         name: "getPackageName".into(),
         args: vec![],
         ret: JType::Object("java/lang/String".into()),
     };
-    let result = call(&rt, &sig, ctx_oid, vec![]);
+    let result = call(&vm, &sig, ctx_oid, vec![]);
     let oid = result.as_object().expect("无 APK 也应返回 mock String");
-    assert_eq!(read_string(&rt, oid), "com.rundroid.unknown");
+    assert_eq!(read_string(&vm, oid), "com.rundroid.unknown");
 }
 
 // ============================================================================
@@ -116,34 +115,34 @@ fn harness_get_package_info_returns_packageinfo_with_metadata() {
     let apk = ApkContext::new("com.example.app".into())
         .with_version(Some("1.2.3".into()), Some(42))
         .with_signature(vec![0xCA, 0xFE]);
-    let (mut rt, reg) = runtime_with_apk(apk);
+    let (mut vm, reg) = runtime_with_apk(apk);
 
     // 1. 取 PackageManager（经 Context.getPackageManager，验证单例链路）
-    let ctx_oid = reg.new_stub_instance(&rt, "android/content/Context").unwrap();
+    let ctx_oid = reg.new_stub_instance(&vm, "android/content/Context").unwrap();
     let get_pm = MethodSig {
         class: "android/content/Context".into(),
         name: "getPackageManager".into(),
         args: vec![],
         ret: JType::Object("android/content/pm/PackageManager".into()),
     };
-    let pm_oid = call(&rt, &get_pm, ctx_oid, vec![]).as_object().expect("getPackageManager 应返回对象");
+    let pm_oid = call(&vm, &get_pm, ctx_oid, vec![]).as_object().expect("getPackageManager 应返回对象");
 
     // 2. getPackageInfo(name, flags)
-    let name_oid = intern_string(&mut rt, "com.example.app");
+    let name_oid = intern_string(&mut vm, "com.example.app");
     let get_info = MethodSig {
         class: "android/content/pm/PackageManager".into(),
         name: "getPackageInfo".into(),
         args: vec![JType::Object("java/lang/String".into()), JType::Int],
         ret: JType::Object("android/content/pm/PackageInfo".into()),
     };
-    let info_result = call(&rt, &get_info, pm_oid, vec![JValue::Object(name_oid), JValue::Int(0)]);
+    let info_result = call(&vm, &get_info, pm_oid, vec![JValue::Object(name_oid), JValue::Int(0)]);
     let info_oid = info_result.as_object().expect("getPackageInfo 应返回 PackageInfo");
 
     // 类型正确
     {
-        let objects = rt.objects();
+        let objects = vm.objects.lock().unwrap();
         assert_eq!(
-            objects.lock().unwrap().class_name(info_oid),
+            objects.class_name(info_oid),
             Some("android/content/pm/PackageInfo")
         );
     }
@@ -155,8 +154,8 @@ fn harness_get_package_info_returns_packageinfo_with_metadata() {
         args: vec![],
         ret: JType::Object("java/lang/String".into()),
     };
-    let vn_oid = call(&rt, &get_vn, info_oid, vec![]).as_object().expect("versionName 应非空");
-    assert_eq!(read_string(&rt, vn_oid), "1.2.3");
+    let vn_oid = call(&vm, &get_vn, info_oid, vec![]).as_object().expect("versionName 应非空");
+    assert_eq!(read_string(&vm, vn_oid), "1.2.3");
 
     // 4. PackageInfo.getVersionCode() → 42
     let get_vc = MethodSig {
@@ -165,7 +164,7 @@ fn harness_get_package_info_returns_packageinfo_with_metadata() {
         args: vec![],
         ret: JType::Int,
     };
-    assert_eq!(call(&rt, &get_vc, info_oid, vec![]), JValue::Int(42));
+    assert_eq!(call(&vm, &get_vc, info_oid, vec![]), JValue::Int(42));
 }
 
 // ============================================================================
@@ -175,10 +174,10 @@ fn harness_get_package_info_returns_packageinfo_with_metadata() {
 #[test]
 fn harness_signature_hash_code_matches_canonical_formula() {
     let apk = ApkContext::new("com.example.app".into());
-    let (rt, reg) = runtime_with_apk(apk);
+    let (vm, reg) = runtime_with_apk(apk);
 
     let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
-    let sig_oid = reg.new_signature(&rt, bytes.clone()).unwrap();
+    let sig_oid = reg.new_signature(&vm, bytes.clone()).unwrap();
 
     let hash_sig = MethodSig {
         class: "android/content/pm/Signature".into(),
@@ -186,17 +185,17 @@ fn harness_signature_hash_code_matches_canonical_formula() {
         args: vec![],
         ret: JType::Int,
     };
-    let result = call(&rt, &hash_sig, sig_oid, vec![]);
+    let result = call(&vm, &hash_sig, sig_oid, vec![]);
     assert_eq!(result, JValue::Int(java_arrays_hash(&bytes)));
 }
 
 #[test]
 fn harness_signature_to_byte_array_roundtrip() {
     let apk = ApkContext::new("com.example.app".into());
-    let (rt, reg) = runtime_with_apk(apk);
+    let (vm, reg) = runtime_with_apk(apk);
 
     let bytes = vec![0x11, 0x22, 0x33];
-    let sig_oid = reg.new_signature(&rt, bytes).unwrap();
+    let sig_oid = reg.new_signature(&vm, bytes).unwrap();
 
     let to_ba = MethodSig {
         class: "android/content/pm/Signature".into(),
@@ -204,10 +203,9 @@ fn harness_signature_to_byte_array_roundtrip() {
         args: vec![],
         ret: JType::Array(Box::new(JType::Byte)),
     };
-    let arr_oid = call(&rt, &to_ba, sig_oid, vec![]).as_object().expect("toByteArray 应返回 byte[]");
+    let arr_oid = call(&vm, &to_ba, sig_oid, vec![]).as_object().expect("toByteArray 应返回 byte[]");
 
-    let objects = rt.objects();
-    let store = objects.lock().unwrap();
+    let store = vm.objects.lock().unwrap();
     match store.storage(arr_oid) {
         Some(ObjectStorage::PrimitiveArray { jtype, elements }) => {
             assert_eq!(*jtype, JType::Byte);
@@ -224,11 +222,11 @@ fn harness_signature_to_byte_array_roundtrip() {
 #[test]
 fn harness_signature_equals_by_bytes() {
     let apk = ApkContext::new("com.example.app".into());
-    let (rt, reg) = runtime_with_apk(apk);
+    let (vm, reg) = runtime_with_apk(apk);
 
-    let a = reg.new_signature(&rt, vec![1, 2, 3]).unwrap();
-    let b = reg.new_signature(&rt, vec![1, 2, 3]).unwrap();
-    let c = reg.new_signature(&rt, vec![9, 9]).unwrap();
+    let a = reg.new_signature(&vm, vec![1, 2, 3]).unwrap();
+    let b = reg.new_signature(&vm, vec![1, 2, 3]).unwrap();
+    let c = reg.new_signature(&vm, vec![9, 9]).unwrap();
 
     let eq = MethodSig {
         class: "android/content/pm/Signature".into(),
@@ -236,9 +234,9 @@ fn harness_signature_equals_by_bytes() {
         args: vec![JType::Object("java/lang/Object".into())],
         ret: JType::Boolean,
     };
-    assert_eq!(call(&rt, &eq, a, vec![JValue::Object(b)]), JValue::Boolean(true));
-    assert_eq!(call(&rt, &eq, a, vec![JValue::Object(c)]), JValue::Boolean(false));
-    assert_eq!(call(&rt, &eq, a, vec![JValue::Null]), JValue::Boolean(false));
+    assert_eq!(call(&vm, &eq, a, vec![JValue::Object(b)]), JValue::Boolean(true));
+    assert_eq!(call(&vm, &eq, a, vec![JValue::Object(c)]), JValue::Boolean(false));
+    assert_eq!(call(&vm, &eq, a, vec![JValue::Null]), JValue::Boolean(false));
 }
 
 // ============================================================================
@@ -248,12 +246,12 @@ fn harness_signature_equals_by_bytes() {
 #[test]
 fn harness_get_system_service_returns_registered_stub() {
     let apk = ApkContext::new("com.example.app".into());
-    let (mut rt, reg) = runtime_with_apk(apk);
+    let (mut vm, reg) = runtime_with_apk(apk);
 
-    let ctx_oid = reg.new_stub_instance(&rt, "android/content/Context").unwrap();
+    let ctx_oid = reg.new_stub_instance(&vm, "android/content/Context").unwrap();
     // getSystemService 的入参 String 须经对象池；handler 内经 read_string_arg 读取 name。
-    let phone_oid = intern_string(&mut rt, "phone");
-    let nope_oid = intern_string(&mut rt, "definitely-not-a-service");
+    let phone_oid = intern_string(&mut vm, "phone");
+    let nope_oid = intern_string(&mut vm, "definitely-not-a-service");
 
     let gss = MethodSig {
         class: "android/content/Context".into(),
@@ -263,15 +261,15 @@ fn harness_get_system_service_returns_registered_stub() {
     };
 
     // 已注册的 service（"phone"）→ 返回稳定 stub
-    let first = call(&rt, &gss, ctx_oid, vec![JValue::Object(phone_oid)]);
+    let first = call(&vm, &gss, ctx_oid, vec![JValue::Object(phone_oid)]);
     let first_oid = first.as_object().expect("已注册 service 应返回 stub 对象");
 
     // 再查一次 → 同一 oid（稳定 stub）
-    let second = call(&rt, &gss, ctx_oid, vec![JValue::Object(phone_oid)]);
+    let second = call(&vm, &gss, ctx_oid, vec![JValue::Object(phone_oid)]);
     assert_eq!(second.as_object(), Some(first_oid), "service stub 必须稳定");
 
     // 未知 service → null（与真实 Android 一致）
-    let unknown = call(&rt, &gss, ctx_oid, vec![JValue::Object(nope_oid)]);
+    let unknown = call(&vm, &gss, ctx_oid, vec![JValue::Object(nope_oid)]);
     assert!(unknown.is_null(), "未知 service 应返回 null");
 }
 
@@ -282,11 +280,11 @@ fn harness_get_system_service_returns_registered_stub() {
 #[test]
 fn harness_integer_int_value_reads_wrapper() {
     let apk = ApkContext::new("com.example.app".into());
-    let (mut rt, _reg) = runtime_with_apk(apk);
+    let (mut vm, _reg) = runtime_with_apk(apk);
 
     // 构造一个 Integer wrapper 对象
-    let oid = rt.allocate_object_id();
-    rt.objects().lock().unwrap().insert(
+    let oid = vm.object_id_alloc.lock().unwrap().object();
+    vm.objects.lock().unwrap().insert(
         oid,
         "java/lang/Integer".into(),
         ObjectStorage::Wrapper { jtype: JType::Int, value: JValue::Int(2024) },
@@ -298,15 +296,15 @@ fn harness_integer_int_value_reads_wrapper() {
         args: vec![],
         ret: JType::Int,
     };
-    assert_eq!(call(&rt, &sig, oid, vec![]), JValue::Int(2024));
+    assert_eq!(call(&vm, &sig, oid, vec![]), JValue::Int(2024));
 }
 
 #[test]
 fn harness_string_length_and_hashcode() {
     let apk = ApkContext::new("com.example.app".into());
-    let (mut rt, _reg) = runtime_with_apk(apk);
+    let (mut vm, _reg) = runtime_with_apk(apk);
 
-    let oid = intern_string(&mut rt, "hello");
+    let oid = intern_string(&mut vm, "hello");
 
     let len_sig = MethodSig {
         class: "java/lang/String".into(),
@@ -314,7 +312,7 @@ fn harness_string_length_and_hashcode() {
         args: vec![],
         ret: JType::Int,
     };
-    assert_eq!(call(&rt, &len_sig, oid, vec![]), JValue::Int(5));
+    assert_eq!(call(&vm, &len_sig, oid, vec![]), JValue::Int(5));
 
     // Java "hello".hashCode() == 99162322
     let hc_sig = MethodSig {
@@ -323,7 +321,7 @@ fn harness_string_length_and_hashcode() {
         args: vec![],
         ret: JType::Int,
     };
-    assert_eq!(call(&rt, &hc_sig, oid, vec![]), JValue::Int(99162322));
+    assert_eq!(call(&vm, &hc_sig, oid, vec![]), JValue::Int(99162322));
 }
 
 // ============================================================================
@@ -338,7 +336,7 @@ fn harness_builtin_and_override_share_authority() {
     use std::sync::Arc;
 
     let apk = ApkContext::new("com.example.app".into());
-    let (mut rt, _reg) = runtime_with_apk(apk);
+    let (mut vm, _reg) = runtime_with_apk(apk);
 
     // 用一个 override class def 合并覆盖 Context.getPackageName
     let mut override_def = rundroid_jni::JClassDef::new(
@@ -354,13 +352,13 @@ fn harness_builtin_and_override_share_authority() {
     override_def
         .override_method(sig.clone(), false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(-1)))))
         .unwrap();
-    rt.classes_mut().register_or_merge_class(override_def).unwrap();
+    vm.classes.register_or_merge_class(override_def).unwrap();
 
     // 现在调用 getPackageName 应命中 override（返回 Int(-1) 而非原 builtin 的 String）
-    let ctx_oid = _reg.new_stub_instance(&rt, "android/content/Context").unwrap();
+    let ctx_oid = _reg.new_stub_instance(&vm, "android/content/Context").unwrap();
     let mut refs = RefTable::new();
     let mut args = JniArgs::new();
     args.set_this(ctx_oid);
-    let result = rt.classes().dispatch_call(&sig, &args, &mut refs).unwrap();
+    let result = vm.classes.dispatch_call(&sig, &args, &mut refs).unwrap();
     assert_eq!(result, JValue::Int(-1), "Python-shim 风格 override 应覆盖 builtin");
 }

@@ -16,10 +16,15 @@
 
 pub mod artifacts;
 pub mod case;
-pub mod jni_hook;
 pub mod manifest;
 pub mod resource;
 pub mod runtime;
+
+// JNI trampoline hook + dispatch 是跨装配层共享的原语
+// （case-runner 与 Python 绑定层共同消费），位于独立的
+// `rundroid-jni-trampoline` crate。这里以 `jni_hook` 命名 re-export，
+// 保持 case-runner 内部既有引用路径（`crate::jni_hook::JniTrampolineHook`）不变。
+pub use rundroid_jni_trampoline as jni_hook;
 
 pub use artifacts::{backend_info_from, Artifacts, BackendInfo, CallOutcome, CaseResult, Outcome, RegionEntry};
 pub use case::{run_case, CaseRunError};

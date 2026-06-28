@@ -124,6 +124,66 @@ impl JniRegistry {
         cls.method_id(sig)
     }
 
+    /// 沿 superclass 链向上收集 class（含起始 class，子→父有序）。
+    ///
+    /// 真实 JNI 的 `GetMethodID` / `Call*Method` 沿继承链查找 instance method——
+    /// 子类未定义时回退到 superclass。本方法返回有序 class 引用（子在前），
+    /// 带环保护（superclass 自引用或链成环时安全终止），供继承方法解析使用。
+    pub fn class_chain(&self, class_name: &str) -> Vec<&JClassDef> {
+        let mut chain: Vec<&JClassDef> = Vec::new();
+        let mut current = class_name.to_string();
+        loop {
+            // 环保护：当前 class 已在链中则终止（避免 superclass 成环导致死循环）
+            if chain.iter().any(|c| c.name == current) {
+                break;
+            }
+            let cls = match self.classes.get(&current) {
+                Some(c) => c,
+                None => break,
+            };
+            chain.push(cls);
+            match &cls.superclass {
+                Some(s) if !s.is_empty() => current = s.clone(),
+                _ => break,
+            }
+        }
+        chain
+    }
+
+    /// 沿继承链解析 instance method（真实 JNI 语义：子类未定义时回退 superclass）。
+    ///
+    /// 从 `class_name` 起向上查 superclass，返回第一个匹配 `name`+`sig_str` 的方法的
+    /// owner class name 与 `MethodSig`。返回的 `sig.class` 已指向 owner，调用方用 owner
+    /// class 取 `MethodId`，`dispatch_call` 据此定位 handler。
+    pub fn resolve_inherited_method(
+        &self,
+        class_name: &str,
+        name: &str,
+        sig_str: &str,
+    ) -> Option<(String, MethodSig)> {
+        for cls in self.class_chain(class_name) {
+            for sig in cls.find_methods_by_name(name) {
+                if sig.descriptor() == sig_str {
+                    return Some((cls.name.clone(), sig.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// 沿继承链按 `MethodId` 查找 instance method signature。
+    ///
+    /// `Call*Method` 持有的是 `MethodId`（可能继承自 superclass）；沿继承链查找拥有该 id
+    /// 的 class，返回其 `MethodSig`（`sig.class` 指向 owner，`dispatch_call` 据此定位 handler）。
+    pub fn resolve_method_by_id(&self, class_name: &str, method_id: u64) -> Option<MethodSig> {
+        for cls in self.class_chain(class_name) {
+            if let Some((sig, _)) = cls.methods.iter().find(|(_, def)| def.id.0 == method_id) {
+                return Some(sig.clone());
+            }
+        }
+        None
+    }
+
     /// 分配一个新的 ObjectId。
     ///
     /// 使用内部 `IdAllocator` 统一分配，确保与 class/method/field ID 不冲突。
@@ -228,6 +288,9 @@ impl JniRegistry {
             if def.id == ClassId(0) {
                 def.id = self.id_alloc.class();
             }
+            // 重排 method id 为全局唯一——避免子类自有 method id 与继承自父类的 id 数值相撞，
+            // 导致 Call*Method 沿子类链按裸 id 解析时误命中子类自有方法（继承场景的核心 bug）。
+            def.reassign_method_ids(&mut self.id_alloc);
             self.classes.insert(name, def);
             Ok(())
         }
@@ -337,5 +400,96 @@ mod tests {
         let after_merge_id = registry.find_class("test/IdPreserve").unwrap().id;
 
         assert_eq!(original_id, after_merge_id, "merge 不应改变已有 ClassId");
+    }
+
+    // —— 继承链解析（superclass method resolution）—— //
+
+    /// 构造一个两层的继承结构：Parent 定义 `ping()I`，Child extends Parent 不重定义。
+    fn inheritance_registry() -> JniRegistry {
+        let mut registry = JniRegistry::new();
+
+        let mut parent = JClassDef::new(ClassId(0), "test/Parent".into());
+        let ping = MethodSig {
+            class: "test/Parent".into(),
+            name: "ping".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        parent
+            .add_method(ping, false, MethodImpl::RustNative(Arc::new(|_| Ok(JValue::Int(7)))))
+            .unwrap();
+        registry.register_class(parent).unwrap();
+
+        // Child 的 superclass 指向 Parent（JClassDef::new 默认 superclass = java/lang/Object，
+        // 这里显式覆盖）。
+        let mut child = JClassDef::new(ClassId(0), "test/Child".into());
+        child.superclass = Some("test/Parent".into());
+        registry.register_class(child).unwrap();
+
+        registry
+    }
+
+    #[test]
+    fn class_chain_walks_superclass_in_order() {
+        let registry = inheritance_registry();
+        let chain: Vec<String> = registry.class_chain("test/Child")
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(chain, vec!["test/Child", "test/Parent"], "链应子→父有序");
+    }
+
+    #[test]
+    fn class_chain_cycle_safe() {
+        let mut registry = JniRegistry::new();
+        // 构造一个自引用环（A.superclass = A）验证不死循环
+        let mut a = JClassDef::new(ClassId(0), "test/A".into());
+        a.superclass = Some("test/A".into());
+        registry.register_class(a).unwrap();
+        let chain = registry.class_chain("test/A");
+        assert_eq!(chain.len(), 1, "自引用环应被环保护终止");
+    }
+
+    #[test]
+    fn resolve_inherited_method_finds_superclass_definition() {
+        let registry = inheritance_registry();
+        // Child 未定义 ping，应沿链回退到 Parent。
+        let (owner, sig) = registry
+            .resolve_inherited_method("test/Child", "ping", "()I")
+            .expect("继承方法应解析到 Parent");
+        assert_eq!(owner, "test/Parent");
+        assert_eq!(sig.class, "test/Parent");
+    }
+
+    #[test]
+    fn resolve_inherited_method_misses_unknown() {
+        let registry = inheritance_registry();
+        assert!(registry.resolve_inherited_method("test/Child", "nope", "()I").is_none());
+    }
+
+    #[test]
+    fn resolve_method_by_id_walks_chain() {
+        let registry = inheritance_registry();
+        // 取 Parent.ping 的 MethodId
+        let parent = registry.find_class("test/Parent").unwrap();
+        let ping_sig = MethodSig {
+            class: "test/Parent".into(),
+            name: "ping".into(),
+            args: vec![],
+            ret: JType::Int,
+        };
+        let ping_id = parent.method_id(&ping_sig).unwrap().0;
+
+        // 从 Child 解析该 MethodId → 应沿链找到 Parent 的 sig
+        let resolved = registry
+            .resolve_method_by_id("test/Child", ping_id)
+            .expect("MethodId 应沿继承链解析");
+        assert_eq!(resolved.class, "test/Parent", "sig.class 指向 owner");
+
+        // dispatch_call 用解析出的 sig（class=Parent）应能定位 handler 并执行
+        let mut refs = RefTable::new();
+        let args = crate::args::JniArgs::new();
+        let result = registry.dispatch_call(&resolved, &args, &mut refs).unwrap();
+        assert_eq!(result, JValue::Int(7), "继承方法 dispatch 应命中 Parent handler");
     }
 }

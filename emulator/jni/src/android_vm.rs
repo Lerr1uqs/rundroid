@@ -180,4 +180,52 @@ mod tests {
         vm.exceptions.clear();
         assert!(!vm.exceptions.occurred());
     }
+
+    /// 完整 class lifecycle：superclass / interfaces 元数据在注册后正确保留。
+    ///
+    /// （从已删除的 `android_runtime.rs` 迁移——验证 class hierarchy 语义，
+    /// 此前 android_vm 测试未覆盖。）
+    #[test]
+    fn vm_full_class_lifecycle() {
+        let mut vm = AndroidVM::new();
+
+        // 注册 class，带 superclass + interfaces
+        let mut class_def = JClassDef::new(ClassId(0), "java/util/HashMap".into());
+        class_def.kind = ClassKind::Class;
+        class_def.superclass = Some("java/util/AbstractMap".into());
+        class_def.interfaces = vec!["java/util/Map".into(), "java/lang/Cloneable".into()];
+        vm.classes.register_class(class_def).unwrap();
+
+        // 验证 class hierarchy
+        let cls = vm.classes.find_class("java/util/HashMap").unwrap();
+        assert_eq!(cls.name, "java/util/HashMap");
+        assert_eq!(cls.superclass, Some("java/util/AbstractMap".into()));
+        assert_eq!(cls.interfaces.len(), 2);
+        assert!(cls.interfaces.contains(&"java/util/Map".to_string()));
+    }
+
+    /// global ref 在 frame cleanup 后仍存活（survive），local ref 消失。
+    ///
+    /// （从已删除的 `android_runtime.rs` 迁移——验证 global ref 生命周期，
+    /// `vm_object_lifecycle` 只覆盖了 local ref。）
+    #[test]
+    fn vm_global_ref_survives_frame_clear() {
+        let mut vm = AndroidVM::new();
+
+        // 创建对象
+        let obj_id = ObjectId(1);
+        vm.objects.lock().unwrap().insert(
+            obj_id,
+            "java/lang/Integer".into(),
+            ObjectStorage::Wrapper {
+                jtype: crate::types::JType::Int,
+                value: crate::types::JValue::Int(42),
+            },
+        ).unwrap();
+
+        // global ref 应 survive frame cleanup
+        let handle = vm.refs.new_global(obj_id);
+        vm.refs.clear_frame();
+        assert_eq!(vm.refs.resolve(handle), Some(obj_id));
+    }
 }

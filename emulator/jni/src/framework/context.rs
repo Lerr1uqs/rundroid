@@ -5,7 +5,7 @@
 //! stub 能读 String/byte[] 入参、返回 Java 对象、查 package/signature/service 数据，
 //! handler 闭包捕获一份 [`FrameworkCtx`]——里面是各 VM 状态的 `Arc<Mutex/RwLock>` 句柄。
 //!
-//! 这与 Python marshalling 路径（`AndroidRuntime::objects()` / `object_id_allocator()`）
+//! 这与 Python marshalling 路径（`AndroidVM::objects` / `AndroidVM::object_id_alloc`）
 //! 用的是同一模式：handler 经共享句柄访问对象池，不另起一套对象存储。
 
 use crate::apk_context::ApkContext;
@@ -67,7 +67,7 @@ impl std::fmt::Debug for FrameworkCtx {
 }
 
 impl FrameworkCtx {
-    /// 从 AndroidRuntime 的共享句柄 + framework 自有的 apk/service 句柄组装 ctx。
+    /// 从 AndroidVM 的共享句柄 + framework 自有的 apk/service 句柄组装 ctx。
     pub(crate) fn new(
         objects: Arc<Mutex<ObjectStore>>,
         id_alloc: Arc<Mutex<IdAllocator>>,

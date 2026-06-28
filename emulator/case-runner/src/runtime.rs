@@ -306,9 +306,16 @@ impl GuestRuntime {
                 .map_err(RuntimeAssemblyError::JniAbiWrite)?;
         }
 
-        // 3. 创建 JniTrampolineHook（持有双 ABI + 线程状态），安装为 code hook。
+        // 3. 创建 JniTrampolineHook（持有双 ABI + 线程状态 + verbose 开关），安装为 code hook。
         //    范围覆盖 jni trampoline + javavm trampoline，hook 内部按地址分流 dispatch。
-        let hook = JniTrampolineHook::new(env_abi.clone(), vm_abi.clone(), vm);
+        //    verbose 默认关闭（case-runner 不打 JNI trace）；Python 绑定层安装时
+        //    传入可被 toggle 的 Arc<AtomicBool>。
+        let hook = JniTrampolineHook::new(
+            env_abi.clone(),
+            vm_abi.clone(),
+            vm,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let begin = env_abi.trampoline_begin();
         let end = vm_abi.trampoline_end();
 

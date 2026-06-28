@@ -16,8 +16,8 @@
 //! - [`jnienv`] / [`javavm`]：最小 `JNIEnv` / `JavaVM` surface
 //! - [`exception`]：异常状态（pending throwable）
 //! - [`apk_context`]：APK context（package / version / manifest / signatures / assets）
-//! - [`android_vm`]：`AndroidVM` — class / object / ref / exception / apk 聚合根
-//! - [`android_runtime`]：`AndroidRuntime` — Emulator 持有的高级整合点
+//! - [`android_vm`]：`AndroidVM` — class / object / ref / exception / apk 聚合根，
+//!   Emulator / 绑定层 / framework / trampoline hook 共持的**唯一** VM authority
 //! - [`framework`]：Android framework stubs — class-spec 驱动的 framework registry，
 //!   builtin class 经 `install()` 收敛进 `JniRegistry` 统一 authority
 //!
@@ -32,7 +32,6 @@
 #![forbid(unsafe_code)]
 
 pub mod abi;
-pub mod android_runtime;
 pub mod android_vm;
 pub mod apk_context;
 pub mod args;
@@ -54,7 +53,6 @@ pub mod registry;
 pub mod types;
 pub mod verify;
 
-pub use android_runtime::AndroidRuntime;
 pub use android_vm::AndroidVM;
 pub use apk_context::{ApkContext, SignatureData};
 pub use args::JniArgs;

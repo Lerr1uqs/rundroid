@@ -19,7 +19,7 @@ use crate::object_store::{ObjectStorage, ObjectStore};
 use crate::refs::RefTable;
 use crate::registry::JniRegistry;
 use crate::types::{
-    FieldId, FieldSig, JType, JValue, MethodId, MethodSig, ObjectId,
+    FieldId, FieldSig, IdAllocator, JType, JValue, MethodId, MethodSig, ObjectId,
 };
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +36,9 @@ pub struct JniEnvSurface<'r> {
     registry: &'r JniRegistry,
     /// 对象池共享引用（lock 时获取内部可变访问）。
     objects: &'r Arc<Mutex<ObjectStore>>,
+    /// 对象 ID 分配器共享引用——与 framework / Python 路径共用同一计数器，
+    /// 保证 guest 经 NewObject 创建的实例 oid 全局唯一（见 new_object）。
+    id_alloc: &'r Arc<Mutex<IdAllocator>>,
     refs: &'r mut RefTable,
     exceptions: &'r mut ExceptionState,
     /// Native 方法注册表 — RegisterNatives 写入此表。
@@ -53,6 +56,7 @@ impl<'r> JniEnvSurface<'r> {
     pub fn new_with_objects(
         registry: &'r JniRegistry,
         objects: &'r Arc<Mutex<ObjectStore>>,
+        id_alloc: &'r Arc<Mutex<IdAllocator>>,
         refs: &'r mut RefTable,
         exceptions: &'r mut ExceptionState,
         natives: &'r mut NativeRegistry,
@@ -60,6 +64,7 @@ impl<'r> JniEnvSurface<'r> {
         Self {
             registry,
             objects,
+            id_alloc,
             refs,
             exceptions,
             natives,
@@ -121,7 +126,10 @@ impl<'r> JniEnvSurface<'r> {
     // Method ID 操作
     // ========================================================================
 
-    /// GetMethodID: 从已注册 class 中查找 instance method。
+    /// GetMethodID: 从已注册 class（含继承链）中查找 instance method。
+    ///
+    /// 真实 JNI 语义：子类未定义时沿 superclass 链回退。`resolve_inherited_method`
+    /// 返回 owner class（方法实际定义所在的 class），据此取 `MethodId`。
     ///
     /// `sig_str` 是 JNI descriptor 格式，如 `"()I"`、`"(ILjava/lang/String;)V"`。
     pub fn get_method_id(
@@ -131,18 +139,13 @@ impl<'r> JniEnvSurface<'r> {
         sig_str: &str,
     ) -> Result<MethodId, JniError> {
         let class_name = self.resolve_class_name(class_handle)?;
-        let methods = self.registry.methods_by_name(&class_name, name);
-
-        // 遍历同名方法，按 JNI descriptor 匹配
-        for method_sig in methods {
-            if method_sig.descriptor() == sig_str {
-                return self.registry.method_id(&class_name, method_sig)
-                    .ok_or_else(|| JniError::MethodNotFound(method_sig.clone()));
-            }
+        match self.registry.resolve_inherited_method(&class_name, name, sig_str) {
+            Some((owner, sig)) => self.registry.method_id(&owner, &sig)
+                .ok_or_else(|| JniError::MethodNotFound(sig.clone())),
+            None => Err(JniError::Internal(format!(
+                "GetMethodID: class={class_name}, name={name}, sig={sig_str} 未找到"
+            ))),
         }
-        Err(JniError::Internal(format!(
-            "GetMethodID: class={class_name}, name={name}, sig={sig_str} 未找到"
-        )))
     }
 
     /// GetStaticMethodID: 从已注册 class 中查找 static method。
@@ -237,14 +240,16 @@ impl<'r> JniEnvSurface<'r> {
     pub fn new_object(
         &mut self,
         class_handle: u32,
-        method_id: u64,
+        _method_id: u64,
         _args: &[JValue],
     ) -> Result<u32, JniError> {
         let class_name = self.resolve_class_name(class_handle)?;
 
-        // 分配 ObjectId（bootstrap: 简单使用 method_id 的低 32 位作为对象 ID）
-        // TODO: 使用 IdAllocator 统一分配
-        let obj_id = ObjectId(method_id.wrapping_add(1));
+        // 经共享 IdAllocator 分配全局唯一 ObjectId。
+        // 旧实现用 method_id+1 推导——但不同 class 的同名构造器（如多个 <init>()V）
+        // 解析到相同 MethodId，第二次 NewObject 必然撞 id。改走 VM 共享分配器后，
+        // guest 实例 / framework stub / Python 对象共用同一递增序列，绝不冲突。
+        let obj_id = self.id_alloc.lock().unwrap().object();
 
         // 存入 ObjectStore 作为 StubInstance
         {
@@ -361,15 +366,11 @@ impl<'r> JniEnvSurface<'r> {
             .to_string();
         drop(store);
 
-        let cls = self.registry.find_class(&class_name)
-            .ok_or_else(|| JniError::ClassNotFound(class_name.clone()))?;
-
-        // 在 instance methods 中按 MethodId 查找
-        let method_sig = cls.methods.iter()
-            .find(|(_, def)| def.id.0 == method_id)
-            .map(|(sig, _)| sig.clone())
+        // 沿继承链按 MethodId 查找（继承方法：子类未定义时解析到 superclass）。
+        // resolve_method_by_id 返回的 sig.class 指向 owner，dispatch_call 据此定位 handler。
+        let method_sig = self.registry.resolve_method_by_id(&class_name, method_id)
             .ok_or_else(|| JniError::Internal(format!(
-                "MethodId {method_id} 在 class {class_name} 中未找到"
+                "MethodId {method_id} 在 class {class_name}（含继承链）中未找到"
             )))?;
 
         // 检查 native binding：如果此 method 通过 RegisterNatives 绑定了 guest 函数指针，
@@ -383,8 +384,14 @@ impl<'r> JniEnvSurface<'r> {
             )));
         }
 
-        // 构造 JniArgs（将 raw JValue 参数包装）
-        let mut jni_args = JniArgs::from_vec(raw_args.to_vec());
+        // 构造 JniArgs：varargs 按 method 声明参数个数截断。
+        // trampoline 的 read_varargs 固定读 3 个寄存器（x3..x5），超出方法 arity 的部分
+        // 是 padding 噪声；RustNative handler 通常忽略多余参数，但 Python override 严格
+        // 按签名接收参数，不截断会因多出的参数 TypeError（guest→Python 回调不可用）。
+        // 截断到 method_sig.args.len() 是严格更正确的行为：移除 padding、保留真实 varargs。
+        let n = method_sig.args.len();
+        let trimmed: Vec<JValue> = raw_args.iter().take(n).cloned().collect();
+        let mut jni_args = JniArgs::from_vec(trimmed);
         jni_args.set_this(obj_id);
 
         self.registry.dispatch_call(&method_sig, &jni_args, self.refs)
@@ -518,7 +525,10 @@ impl<'r> JniEnvSurface<'r> {
             )));
         }
 
-        let jni_args = JniArgs::from_vec(raw_args.to_vec());
+        // varargs 按 method 声明参数个数截断（同 instance dispatch，见上注释）。
+        let n = method_sig.args.len();
+        let trimmed: Vec<JValue> = raw_args.iter().take(n).cloned().collect();
+        let jni_args = JniArgs::from_vec(trimmed);
         self.registry.dispatch_static(&method_sig, &jni_args, self.refs)
     }
 
@@ -816,9 +826,12 @@ mod tests {
         let mut exceptions = ExceptionState::new();
         let mut natives = NativeRegistry::new();
 
+        let id_alloc = Arc::new(Mutex::new(IdAllocator::new()));
+
         let mut env = JniEnvSurface::new_with_objects(
             &registry,
             &objects,
+            &id_alloc,
             &mut refs,
             &mut exceptions,
             &mut natives,
@@ -874,8 +887,9 @@ mod tests {
         ).unwrap();
         let class_handle = refs.new_local(class_obj_id);
 
+        let id_alloc = Arc::new(Mutex::new(IdAllocator::new()));
         let mut env = JniEnvSurface::new_with_objects(
-            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+            &registry, &objects, &id_alloc, &mut refs, &mut exceptions, &mut natives,
         );
 
         // 3. 调用 register_natives — 模拟 guest 通过 JNI 注册
@@ -913,8 +927,9 @@ mod tests {
         ).unwrap();
         let class_handle = refs.new_local(class_obj_id);
 
+        let id_alloc = Arc::new(Mutex::new(IdAllocator::new()));
         let mut env = JniEnvSurface::new_with_objects(
-            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+            &registry, &objects, &id_alloc, &mut refs, &mut exceptions, &mut natives,
         );
 
         // 尝试注册不存在的 method
@@ -965,8 +980,9 @@ mod tests {
         let mut exceptions = ExceptionState::new();
         let mut natives = NativeRegistry::new();
 
+        let id_alloc = Arc::new(Mutex::new(IdAllocator::new()));
         let mut env = JniEnvSurface::new_with_objects(
-            &registry, &objects, &mut refs, &mut exceptions, &mut natives,
+            &registry, &objects, &id_alloc, &mut refs, &mut exceptions, &mut natives,
         );
 
         // 3. 绑定前：正常 dispatch 应返回 42（Rust handler）
