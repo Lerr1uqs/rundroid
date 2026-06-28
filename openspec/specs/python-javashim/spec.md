@@ -34,13 +34,13 @@ Python shim SHALL 通过显式注册进入 runtime。
 - **WHEN** Python shim 完成注册
 - **THEN** Rust VM SHALL 成为最终同步点与最终 authority
 - **AND** Python 不 SHALL 持有独立于 Rust VM 的最终 class/member 状态
-- **AND** 该注册结果 SHALL 进入 `Emulator` 持有的 `AndroidRuntime`
+- **AND** 该注册结果 SHALL 进入 `Emulator` 直接持有的 `AndroidVM`
 
 #### Scenario: Python binding adapter state is non-authoritative
 
 - **WHEN** Python binding 为调用/实例化维护内部缓存或 backing object 映射
 - **THEN** 这些状态 SHALL NOT 被视为最终 class/member/object authority
-- **AND** 运行时语义 SHALL 以 `AndroidRuntime` / `AndroidVM` 中的 canonical state 为准
+- **AND** 运行时语义 SHALL 以 `AndroidVM` 中的 canonical state 为准
 - **AND** 若保留 `class_types`、`method_names`、`java_instances` 一类结构，SHALL 仅作为 adapter-private implementation detail
 
 ### Requirement: Python override priority is stable
@@ -215,6 +215,5 @@ Android VM / JNI 操作 SHALL 收拢到 `emu.avm` 门面下；机器层操作 SH
 #### Scenario: ObjectId is allocated by the AVM layer
 
 - **WHEN** `register_java_object` 注册对象
-- **THEN** `ObjectId` SHALL 来自 `AndroidRuntime::allocate_object_id`（AVM 的 `IdAllocator`）
+- **THEN** `ObjectId` SHALL 来自 `AndroidVM` 的 `object_id_alloc`（AVM 的 `IdAllocator`）
 - **AND** SHALL NOT 使用 binding 层自有计数器（如 `next_object_id`）
-

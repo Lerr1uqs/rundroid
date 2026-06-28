@@ -41,19 +41,37 @@ Android VM SHALL 以 Rust 侧 VM / registry 作为最终同步点。
 - **AND** 它们 SHALL 共享相同的 class/member 数据结构
 - **AND** 不 SHALL 分别维护两套彼此独立的 method/field authority
 
-#### Scenario: Multiple registration surfaces converge through AndroidRuntime
+#### Scenario: Multiple registration surfaces converge through AndroidVM
 
 - **WHEN** Python registration surface 或 Rust builtin registration surface 注册 Java class/member
 - **THEN** 它们 SHALL 先被规整到统一 class definition 模型
-- **AND** 再注册到 `Emulator` 持有的 `AndroidRuntime`
-- **AND** `AndroidRuntime` 内部的 `AndroidVM` / `JniRegistry` SHALL 持有最终 authority
+- **AND** 再注册到 `Emulator` 直接持有的 `AndroidVM`
+- **AND** `AndroidVM` / `JniRegistry` SHALL 持有最终 authority
+
+#### Scenario: Binding and JNI trampoline hook share one AndroidVM
+
+- **WHEN** Python 绑定层初始化 JNI 执行（`init_jni`）
+- **THEN** 绑定层 SHALL 以 `Arc<Mutex<AndroidVM>>` 持有 VM
+- **AND** JNI trampoline hook SHALL 拿到同一 VM 的 `Arc::clone`
+- **AND** 经绑定层注册的 class SHALL 对 guest JNI dispatch 可见（同一 registry）
 
 #### Scenario: Python binding caches are never the final VM state
 
 - **WHEN** Python binding 为适配 shim 调用而维护 class/object/member 相关缓存
 - **THEN** 这些缓存 SHALL NOT 成为最终 VM authority
-- **AND** class/member/object identity SHALL 以 `AndroidRuntime` / `AndroidVM` 状态为准
+- **AND** class/member/object identity SHALL 以 `AndroidVM` 状态为准
 - **AND** 类似 `class_types`、`method_names`、`java_instances` 的结构若仍存在，SHALL 仅作为 binding-layer adapter cache
+
+### Requirement: No VM re-entry during guest JNI dispatch
+
+guest JNI dispatch（在 `emu_start` 期间）触发 Python override 时，该 override SHALL NOT 再次获取 VM 锁。这是单线程仿真的内在约束。
+
+#### Scenario: Python JNI override does not re-enter the VM
+
+- **WHEN** guest JNI dispatch 调到一个 Python `@java_method` override
+- **THEN** 该 override SHALL NOT 调 `avm.new_object` / `emulator.call` 等再次入 VM / engine 的路径
+- **AND** 绑定层文档 SHALL 明确标注该限制
+- **AND** 测试 fixture SHALL 仅使用纯计算型 override（读字段、算返回值），不得依赖 guest dispatch 期间的 VM re-entry
 
 ### Requirement: Reference semantics are explicit
 
@@ -90,4 +108,3 @@ Android VM SHALL 为 primitive arrays、object arrays 和常见 primitive wrappe
 - **WHEN** runtime 创建 `byte[]`、`int[]`、`Object[]` 或等价数组对象
 - **THEN** 它 SHALL 以显式 array kind 存储
 - **AND** 后续 region read/write 与 element access SHALL 复用该一等模型
-

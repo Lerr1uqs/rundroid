@@ -30,7 +30,7 @@
 - **WHEN** Python binding 维护 class/member/object 相关辅助状态
 - **THEN** `PyEmulator` 或等价 binding object SHALL NOT 成为最终 Java world state container
 - **AND** 这类状态 SHALL 仅作为 binding adapter cache
-- **AND** 最终 authority SHALL 仍位于 `AndroidRuntime` / `AndroidVM` / JNI runtime state
+- **AND** 最终 authority SHALL 仍位于 `AndroidVM` / JNI runtime state
 
 ### Requirement: Emulator owns JNI integration
 
@@ -81,7 +81,7 @@ runtime SHALL 通过显式 registry 管理 JNI class / method / field 定义。
 
 - **WHEN** 实现方通过 Rust builtin 或 Python bridge 注册 class/member
 - **THEN** 两者 SHALL 进入同一套 Rust registry authority
-- **AND** 两者 SHALL 先通过 `Emulator` 持有的 `AndroidRuntime` 完成统一注册
+- **AND** 两者 SHALL 先通过 `Emulator` 直接持有的 `AndroidVM` 完成统一注册
 - **AND** 不 SHALL 演化为 builtin 一套、Python 一套的平行状态系统
 
 #### Scenario: Registration collisions fail fast
@@ -154,4 +154,3 @@ runtime SHALL 为 JNI foundation 输出结构化 telemetry。
 - **WHEN** runtime 处理 class / method / field 注册、JNI 调用、reference 生命周期或错误
 - **THEN** 它 SHALL 输出结构化 JNI telemetry 事件
 - **AND** 错误事件 SHALL 至少包含 class、member、descriptor 与类型上下文
-

@@ -17,7 +17,7 @@ runtime SHALL 通过 class-oriented spec registry 实现 Android framework stubs
 
 - **WHEN** runtime 注册 Rust builtin framework class
 - **THEN** 它 SHALL 进入 Rust VM 持有的统一 class/member registry
-- **AND** 它 SHALL 通过 `Emulator` 持有的 `AndroidRuntime` 完成注册
+- **AND** 它 SHALL 通过 `Emulator` 直接持有的 `AndroidVM` 完成注册
 - **AND** 后续 Python shim override 或补环境 SHALL 复用同一套底层数据结构
 
 ### Requirement: APK-backed package and signature stubs
@@ -46,4 +46,3 @@ runtime SHALL 为常见 Java utility classes 提供最小但正式的 stub。
 
 - **WHEN** guest 通过 JNI 调用 `String`、`Class`、primitive wrapper 或常见 collection 类
 - **THEN** runtime SHALL 通过正式 stub handler 提供最小行为
-
