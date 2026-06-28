@@ -19,7 +19,7 @@ use rundroid_elf_loader::{
 };
 use rundroid_elf_parser::{ElfCrateParser, ElfParser, ParseInput, ParsedElf};
 use rundroid_jni::{AndroidVM, JavaVMABI, JNIEnvABI, JniRegistry, ObjectStore, RefTable};
-use rundroid_linux::{LinuxRuntime, SyscallResult};
+use rundroid_linux::{LinuxRuntime, MemoryBridge, SyscallResult};
 use rundroid_memory::{MemoryError, RegionTracker};
 use rundroid_telemetry::{EventSink, TelemetryEvent, TelemetryEventKind, TelemetryMode, TelemetryRouter};
 use std::sync::{Arc, Mutex};
@@ -138,6 +138,40 @@ struct SyscallDispatcher {
     linux: Arc<Mutex<LinuxRuntime>>,
 }
 
+/// 把 [`GuestCPU`] 适配成 syscall 层的 [`MemoryBridge`]。
+///
+/// 收敛 `mem_read` / `mem_write` / `mem_map` 到 `read` / `write` / `map` 三方法，
+/// 取代原来并排维护的三个 `read_guest` / `write_guest` / `map_guest` 闭包。
+/// 用 `&mut *cpu` 重借用：bridge 持有期间独占 cpu，块结束时释放，
+/// 之后 `reg_write` / `stop` 仍可用 cpu（不再需要裸指针 unsafe）。
+struct CpuMemoryBridge<'a> {
+    cpu: &'a mut dyn GuestCPU,
+}
+
+impl<'a> MemoryBridge for CpuMemoryBridge<'a> {
+    fn read(&mut self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        if self.cpu.mem_read(addr, &mut buf) {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    fn write(&mut self, addr: u64, data: &[u8]) -> bool {
+        self.cpu.mem_write(addr, data)
+    }
+
+    fn map(&mut self, addr: u64, len: usize, prot: i32) -> bool {
+        // prot (POSIX PROT_* 位掩码) → MemPerms。
+        let read = (prot & 1) != 0;
+        let write = (prot & 2) != 0;
+        let exec = (prot & 4) != 0;
+        let perms = MemPerms::from_flags(read, write, exec);
+        self.cpu.mem_map(addr, len, perms).is_ok()
+    }
+}
+
 impl SyscallHook for SyscallDispatcher {
     fn on_svc(&mut self, cpu: &mut dyn GuestCPU) {
         let nr = cpu.reg_read(Arm64Reg::X(8));
@@ -148,40 +182,13 @@ impl SyscallHook for SyscallDispatcher {
         let x4 = cpu.reg_read(Arm64Reg::X(4));
         let x5 = cpu.reg_read(Arm64Reg::X(5));
 
-        // read_guest / write_guest 闭包：通过 GuestCPU 访问 guest 内存。
-        // 不能直接借用 cpu（已经被 dispatch 借了），所以用裸指针 + 局部 unsafe。
-        // SAFETY: cpu 在整个 on_svc 调用期间是稳定的，闭包仅在 dispatch 内同步使用。
-        // 闭包返回 bool/Option 让 LinuxRuntime 能把"未映射缓冲"上报成 EFAULT，
+        // bridge 重借用 cpu；块结束时释放，之后 reg_write/stop 可继续用 cpu。
+        // 失败的 read/write/map 让 LinuxRuntime 把"未映射缓冲"上报成 EFAULT，
         // 避免出现"写没写成功都返回 N"的假阳性。
-        let cpu_ptr: *mut dyn GuestCPU = cpu as *mut dyn GuestCPU;
-        let mut read_guest = |addr: u64, len: usize| -> Option<Vec<u8>> {
-            let mut buf = vec![0u8; len];
-            // SAFETY: 见上方 cpu_ptr 论证。
-            if unsafe { (*cpu_ptr).mem_read(addr, &mut buf) } {
-                Some(buf)
-            } else {
-                None
-            }
-        };
-        let mut write_guest = |addr: u64, bytes: &[u8]| -> bool {
-            // SAFETY: 同上。
-            unsafe { (*cpu_ptr).mem_write(addr, bytes) }
-        };
-        let mut map_guest = |addr: u64, len: usize, prot: i32| -> bool {
-            // 把 prot (POSIX PROT_* 位掩码) 转换为 MemPerms 并映射。
-            let read = (prot & 1) != 0;
-            let write = (prot & 2) != 0;
-            let exec = (prot & 4) != 0;
-            let perms = rundroid_backend::MemPerms::from_flags(read, write, exec);
-            // SAFETY: 同上 cpu_ptr 论证。mem_map 可能因地址已占用而失败。
-            unsafe { (*cpu_ptr).mem_map(addr, len, perms).is_ok() }
-        };
-
         let result = {
+            let mut bridge = CpuMemoryBridge { cpu: &mut *cpu };
             let mut linux = self.linux.lock().unwrap();
-            linux.dispatch(
-                nr, x0, x1, x2, x3, x4, x5, &mut read_guest, &mut write_guest, &mut map_guest,
-            )
+            linux.dispatch(nr, x0, x1, x2, x3, x4, x5, &mut bridge)
         };
 
         match result {
