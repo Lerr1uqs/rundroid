@@ -1,18 +1,18 @@
-- [ ] 为 `runtime/backends/api` 增加 `mem_protect`，并把底层统一执行接口命名收敛为 `Backend`
-- [ ] 为 `Backend` 增加 `pc_read` / `pc_write`，统一寄存器、内存、PC 和 stop 控制语义
-- [ ] 为 `runtime/backends/unicorn` 实现 `mem_protect`，移除 syscall 目标内存写入失败的静默吞错语义
-- [ ] 升级 `runtime/elf/parser` 的 `DynamicInfo`，输出真实 `soname` 和 `needed` 字符串
-- [ ] 修正 parser 错误分类，至少区分 `BadMagic`、`Truncated`、`MalformedDynamic`
-- [ ] 为 `runtime/elf/loader` 输出 RELRO 模板或等价的页权限收紧输入
-- [ ] 改造 `runtime/case-runner`，建立 root module + `DT_NEEDED` 的最小装载队列，并填充 `ModuleGraph.deps`
-- [ ] 改造 `runtime/elf/linker` 的 `resolve` 逻辑，使其按 self → direct deps → dependency closure 的稳定顺序解析
-- [ ] 为 `runtime/os/linux` 与 `runtime/case-runner` 增加 scratch memory / 目标缓冲区管理，并明确该 API 仅供 harness/stub/debug 使用
-- [ ] 确保 scratch memory 不被实现为正式目标堆、`malloc` 或通用 userspace allocator 的替代路径
-- [ ] 打通 `read` / `pread64` / `getrandom` 的 source -> 目标侧回写 -> 返回值 主线，确保回写失败时直接报错
-- [ ] 让 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和 builtin `/dev/urandom` 共享同一目标侧回写正确性路径
-- [ ] 让 `SYS_MMAP` 的成功路径必须完成 backend 映射与必要的初始字节落地，不允许只返回地址
-- [ ] 让 case manifest 的 `arch` / `backend` / `seed` / `telemetry` 参数真正生效或明确报错
-- [ ] 重写或新增 smoke case，至少覆盖 `/dev/urandom`、`VirtFile.bytes(...)`、`VirtFile.host(...)` 的目标缓冲区回读断言
-- [ ] 增加 `mmap` 回归 case，验证返回地址真实可读/可写，而不是仅检查 syscall 返回值
-- [ ] 用 `cargo test` 和 `cargo run -p rundroid-cli -- case ...` 验证新旧 case
-- [ ] 使用 `openspec validate --type change runtime-correctness-hardening --strict` 验证 change
+- [x] 为 `runtime/backends/api` 增加 `mem_protect`，并把底层统一执行接口命名收敛为 `Backend`（mem_protect✅ 已有 engine.rs:69；命名收敛建议过时不适用——Backend 现为工厂 trait，Engine 为会话 trait，改名将破坏后续 change，spec 无此 SHALL，跳过）
+- [x] 为 `Backend` 增加 `pc_read` / `pc_write`，统一寄存器、内存、PC 和 stop 控制语义（功能已由 reg_read/reg_write(Arm64Reg::Pc) 等价满足 reg.rs:17；独立方法名非 spec 要求，跳过）
+- [x] 为 `runtime/backends/unicorn` 实现 `mem_protect`，移除 syscall 目标内存写入失败的静默吞错语义（unicorn mem_protect 已实现 engine.rs:174；syscall 回写失败即 EFAULT syscall.rs:397/650）
+- [x] 升级 `runtime/elf/parser` 的 `DynamicInfo`，输出真实 `soname` 和 `needed` 字符串（parser_elf.rs:51-67，soname:Option<String> + needed:Vec<String>）
+- [x] 修正 parser 错误分类，至少区分 `BadMagic`、`Truncated`、`MalformedDynamic`（error.rs:10-31，5 variant）
+- [x] 为 `runtime/elf/loader` 输出 RELRO 模板或等价的页权限收紧输入（LoadedModule.relro:Option<RelroRange> + linker 真调 mem_protect runtime.rs:711-731；精度 gap：parser 仅 bool 导致 loader 用近似 RW 段范围，非精确 PT_GNU_RELRO，可选增强）
+- [x] 改造 `runtime/case-runner`，建立 root module + `DT_NEEDED` 的最小装载队列，并填充 `ModuleGraph.deps`（load_and_link 递归装载 + add_dep runtime.rs:332-391）
+- [x] 改造 `runtime/elf/linker` 的 `resolve` 逻辑，使其按 self → direct deps → dependency closure 的稳定顺序解析（resolver.rs:37-80，BFS 依赖闭包，SymbolQuery.requester 限定，非全表扫描）
+- [x] 为 `runtime/os/linux` 与 `runtime/case-runner` 增加 scratch memory / 目标缓冲区管理，并明确该 API 仅供 harness/stub/debug 使用（固定 1MiB @ 0x800_000 runtime.rs:216-229，RegionTracker 标 RuntimeScratch，注释明确契约；alloc_scratch 动态 API 非 spec 要求，跳过）
+- [x] 确保 scratch memory 不被实现为正式目标堆、`malloc` 或通用 userspace allocator 的替代路径（已满足，无 malloc 语义）
+- [x] 打通 `read` / `pread64` / `getrandom` 的 source -> 目标侧回写 -> 返回值 主线，确保回写失败时直接报错（read/getrandom✅ syscall.rs:397/650；pread64 已实现 syscall.rs sys_pread64 + fd.rs file_pread/pread_from_fd（不移动游标），4 单测覆盖：reads_at_offset / does_not_move_cursor / returns_efault_on_write_failure / bad_fd_returns_ebadf）
+- [x] 让 `VirtFile.host(...)`、`VirtFile.bytes(...)` 和 builtin `/dev/urandom` 共享同一目标侧回写正确性路径（统一 read_from_fd→write_guest driver/fd.rs；regression suite 覆盖）
+- [x] 让 `SYS_MMAP` 的成功路径必须完成 backend 映射与必要的初始字节落地，不允许只返回地址（syscall.rs:578-609，map_guest 失败即 EFAULT）
+- [x] 让 case manifest 的 `arch` / `backend` / `seed` / `telemetry` 参数真正生效或明确报错（case.rs:42-68 + manifest_validation 测试）
+- [x] 重写或新增 smoke case，至少覆盖 `/dev/urandom`、`VirtFile.bytes(...)`、`VirtFile.host(...)` 的目标缓冲区回读断言（03-dev-urandom XOR 校验和 + syscall.rs regression suite）
+- [x] 增加 `mmap` 回归 case，验证返回地址真实可读/可写，而不是仅检查 syscall 返回值（新增 tests/cases/04-mmap-rw：smoke.c rd_mmap_rw 经真实 backend mmap→写 magic→读回 XOR 校验和=64，cli outcome=Pass；假映射会触发未映射异常使 emu_start 失败）
+- [x] 用 `cargo test` 和 `cargo run -p rundroid-cli -- case ...` 验证新旧 case（cargo test --workspace 全绿含 pread64 4 测试；cli 4 case 01/02/03/04 全 Pass）
+- [x] 使用 `openspec validate --type change runtime-correctness-hardening --strict` 验证 change（通过）

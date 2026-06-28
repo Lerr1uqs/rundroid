@@ -176,6 +176,45 @@ pub fn file_read(handle: &mut FileHandle, len: usize) -> Result<Vec<u8>, FileRea
     Ok(result)
 }
 
+/// FileHandle 上的 pread：从指定 `offset` 读取 `len` 字节，**不移动游标**。
+///
+/// 对应 `pread64` 语义：随机访问读取，不影响后续 `read`/`write` 的游标位置。
+/// 与 [`file_read`] 共用同一套源字节获取逻辑（Bytes/HostPath/Dynamic），
+/// 差别仅在于用传入的 `offset` 替代 `handle.cursor` 且不写回游标。
+pub fn file_pread(handle: &FileHandle, offset: u64, len: usize) -> Result<Vec<u8>, FileReadError> {
+    let result = match &handle.source {
+        VirtFileSource::Bytes(bytes) => {
+            let start = offset as usize;
+            if start >= bytes.len() {
+                Vec::new() // EOF
+            } else {
+                let end = (start + len).min(bytes.len());
+                bytes[start..end].to_vec()
+            }
+        }
+        VirtFileSource::HostPath(path) => {
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| FileReadError::HostIo(e.to_string()))?;
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| FileReadError::HostIo(e.to_string()))?;
+            let mut buf = vec![0u8; len];
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| FileReadError::HostIo(e.to_string()))?;
+            buf.truncate(n);
+            buf
+        }
+        VirtFileSource::Dynamic(provider) => {
+            provider
+                .read_at(offset, len)
+                .map_err(|e| FileReadError::ProviderError(e.message))?
+        }
+    };
+    // 注意：pread 不修改 handle.cursor（与 read 的关键区别）
+    Ok(result)
+}
+
 /// FileHandle 上的写操作。
 ///
 /// 按 VirtFileSource 变体统一分派，返回实际写入字节数。
@@ -429,6 +468,42 @@ pub fn read_from_fd(
             }
         }
         FdHandle::Device(dev) => {
+            let mut ctx = DeviceIoContext { fd: entry.fd };
+            dev.lock().unwrap().read(&mut ctx, len).map_err(|e| match e {
+                DeviceError::NotSupported => FdReadWriteError::NotSupported,
+                _ => FdReadWriteError::Internal(e.to_string()),
+            })
+        }
+    }
+}
+
+/// 对 fd 执行 pread（从 `offset` 读，不移动游标）。
+///
+/// - File handle：调用 [`file_pread`]，不影响 cursor（`pread64` 随机访问语义）
+/// - Device handle：设备 pread 退化为 [`VirtualDevice::read`]——
+///   流式设备（如 `/dev/urandom`）每次产生新字节，`offset` 无意义，
+///   保持与 read 相同的回写主线
+/// - 标准流返回空（EOF）
+///
+/// 返回字节由调用方回写到目标侧，与 [`read_from_fd`] 共用同一条目标侧回写路径。
+pub fn pread_from_fd(
+    entry: &mut FileDescriptorEntry,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, FdReadWriteError> {
+    match &mut entry.handle {
+        FdHandle::File(fh) => {
+            if matches!(entry.kind, FdKind::Stdin | FdKind::Stdout | FdKind::Stderr) {
+                Ok(Vec::new())
+            } else {
+                file_pread(fh, offset, len).map_err(|e| match e {
+                    FileReadError::HostIo(msg) => FdReadWriteError::Internal(msg),
+                    FileReadError::ProviderError(msg) => FdReadWriteError::Internal(msg),
+                })
+            }
+        }
+        FdHandle::Device(dev) => {
+            // 流式设备 pread 退化为 read：复用回写主线，offset 忽略。
             let mut ctx = DeviceIoContext { fd: entry.fd };
             dev.lock().unwrap().read(&mut ctx, len).map_err(|e| match e {
                 DeviceError::NotSupported => FdReadWriteError::NotSupported,

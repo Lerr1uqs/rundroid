@@ -16,8 +16,8 @@
 //! 不再按路径硬编码分派——所有分派统一经过 [`FileDescriptorTable`]。
 
 use crate::fd::{
-    FileDescriptorEntry, fstat_from_fd, ioctl_on_fd, mmap_from_fd, read_from_fd, write_to_fd,
-    Fd, FdReadWriteError, FileDescriptorTable,
+    FileDescriptorEntry, fstat_from_fd, ioctl_on_fd, mmap_from_fd, pread_from_fd, read_from_fd,
+    write_to_fd, Fd, FdReadWriteError, FileDescriptorTable,
 };
 use crate::vfs::{VfsError, VfsMountTable, VfsNode};
 use rundroid_driver::builtin::{null_factory, zero_factory};
@@ -36,6 +36,7 @@ const SYS_IOCTL: u64 = 29;
 const SYS_OPENAT: u64 = 56;
 const SYS_CLOSE: u64 = 57;
 const SYS_READ: u64 = 63;
+const SYS_PREAD64: u64 = 67;
 const SYS_WRITE: u64 = 64;
 const SYS_DUP: u64 = 23;
 const SYS_DUP3: u64 = 24;
@@ -254,6 +255,7 @@ impl LinuxRuntime {
             SYS_OPENAT => self.sys_openat(x1, x2, read_guest),
             SYS_CLOSE => self.sys_close(x0),
             SYS_READ => self.sys_read(x0, x1, x2, write_guest),
+            SYS_PREAD64 => self.sys_pread64(x0, x1, x2, x3, write_guest),
             SYS_WRITE => self.sys_write(x0, x1, x2, read_guest),
             SYS_IOCTL => self.sys_ioctl(x0, x1, x2),
             SYS_FSTAT => self.sys_fstat(x0, x1, write_guest),
@@ -403,6 +405,68 @@ impl LinuxRuntime {
                 }
                 self.emit(&TelemetryEvent::new(
                     "fd.read",
+                    TelemetryEventKind::FileSystem,
+                ));
+                SyscallResult::Done(bytes.len() as u64)
+            }
+            Err(FdReadWriteError::NotSupported) => {
+                self.emit(&TelemetryEvent::new(
+                    "device.error",
+                    TelemetryEventKind::FileSystem,
+                ));
+                SyscallResult::Done(ENOTTY as u64)
+            }
+            Err(FdReadWriteError::Internal(_)) => {
+                self.emit(&TelemetryEvent::new(
+                    "device.error",
+                    TelemetryEventKind::FileSystem,
+                ));
+                SyscallResult::Done(EFAULT as u64)
+            }
+        }
+    }
+
+    /// sys_pread64：从 fd 的指定 offset 读取到 guest 内存，不移动文件游标。
+    ///
+    /// 与 [`sys_read`](Self::sys_read) 的区别：从 `offset` 读、不影响后续
+    /// `read`/`write` 的游标位置（`pread64` 随机访问语义）。回写主线与 read 一致：
+    /// 源字节准备好后必须成功写回目标缓冲，否则返回 `EFAULT`——不允许"返回长度
+    /// 但目标缓冲没变"的假成功。
+    fn sys_pread64(
+        &mut self,
+        fd: u64,
+        buf_addr: u64,
+        count: u64,
+        offset: u64,
+        write_guest: &mut dyn FnMut(u64, &[u8]) -> bool,
+    ) -> SyscallResult {
+        let fd = fd as Fd;
+        let count = count as usize;
+
+        let entry = match self.fds.lookup_mut(fd) {
+            Some(e) => e,
+            None => return SyscallResult::Done(EBADF as u64),
+        };
+        let result = pread_from_fd(entry, offset, count);
+
+        match result {
+            Ok(bytes) => {
+                if bytes.is_empty() {
+                    self.emit(&TelemetryEvent::new(
+                        "fd.pread",
+                        TelemetryEventKind::FileSystem,
+                    ));
+                    return SyscallResult::Done(0);
+                }
+                if !write_guest(buf_addr, &bytes) {
+                    self.emit(&TelemetryEvent::new(
+                        "fd.pread_fault",
+                        TelemetryEventKind::FileSystem,
+                    ));
+                    return SyscallResult::Done(EFAULT as u64);
+                }
+                self.emit(&TelemetryEvent::new(
+                    "fd.pread",
                     TelemetryEventKind::FileSystem,
                 ));
                 SyscallResult::Done(bytes.len() as u64)
@@ -896,6 +960,123 @@ mod tests {
             SyscallResult::Done(addr) => assert!(addr >= 0x7F_0000_0000),
             other => panic!("expected address, got {other:?}"),
         }
+    }
+
+    /// pread64 从指定 offset 读取，回写目标缓冲后返回长度。
+    #[test]
+    fn pread64_reads_at_offset() {
+        let mut rt = LinuxRuntime::new();
+        let data = b"hello world from pread".to_vec();
+        rt.mount_file("/data/pread.txt", VirtFileSource::Bytes(data))
+            .unwrap();
+        let path = b"/data/pread.txt\0".to_vec();
+        let fd = match rt.dispatch(
+            SYS_OPENAT, 0, path.as_ptr() as u64, 0, 0, 0, 0,
+            &mut move |_, _| Some(path.clone()),
+            &mut |_, _| true,
+            &mut map_ok(),
+        ) {
+            SyscallResult::Done(v) => v as i32,
+            other => panic!("expected fd, got {other:?}"),
+        };
+
+        // pread64(fd, buf, count=5, offset=6) → "world"
+        let captured = std::cell::RefCell::new(Vec::new());
+        let r = rt.dispatch(
+            SYS_PREAD64, fd as u64, 0x2000, 5, 6, 0, 0,
+            &mut |_, _| None,
+            &mut |_a, bytes| {
+                captured.borrow_mut().extend_from_slice(bytes);
+                true
+            },
+            &mut map_ok(),
+        );
+        assert!(matches!(r, SyscallResult::Done(5)));
+        assert_eq!(&captured.into_inner(), b"world");
+    }
+
+    /// pread64 不移动文件游标：pread 后再 read 仍从 cursor=0 开始。
+    #[test]
+    fn pread64_does_not_move_cursor() {
+        let mut rt = LinuxRuntime::new();
+        let data = b"hello world".to_vec();
+        rt.mount_file("/data/cursor.txt", VirtFileSource::Bytes(data))
+            .unwrap();
+        let path = b"/data/cursor.txt\0".to_vec();
+        let fd = match rt.dispatch(
+            SYS_OPENAT, 0, path.as_ptr() as u64, 0, 0, 0, 0,
+            &mut move |_, _| Some(path.clone()),
+            &mut |_, _| true,
+            &mut map_ok(),
+        ) {
+            SyscallResult::Done(v) => v as i32,
+            other => panic!("expected fd, got {other:?}"),
+        };
+
+        // pread64(offset=6, 5) → "world"，不应移动 cursor。
+        let captured_pread = std::cell::RefCell::new(Vec::new());
+        rt.dispatch(
+            SYS_PREAD64, fd as u64, 0x2000, 5, 6, 0, 0,
+            &mut |_, _| None,
+            &mut |_a, b| {
+                captured_pread.borrow_mut().extend_from_slice(b);
+                true
+            },
+            &mut map_ok(),
+        );
+        assert_eq!(&captured_pread.into_inner(), b"world");
+
+        // 随后 read(5) 应从 cursor=0 读 → "hello"（证明 pread 没动 cursor）。
+        let captured_read = std::cell::RefCell::new(Vec::new());
+        rt.dispatch(
+            SYS_READ, fd as u64, 0x2000, 5, 0, 0, 0,
+            &mut |_, _| None,
+            &mut |_a, b| {
+                captured_read.borrow_mut().extend_from_slice(b);
+                true
+            },
+            &mut map_ok(),
+        );
+        assert_eq!(&captured_read.into_inner(), b"hello");
+    }
+
+    /// pread64 回写目标缓冲失败时返回 EFAULT（不允许假成功）。
+    #[test]
+    fn pread64_returns_efault_on_write_failure() {
+        let mut rt = LinuxRuntime::new();
+        let data = b"hello world".to_vec();
+        rt.mount_file("/data/pread_fault.txt", VirtFileSource::Bytes(data))
+            .unwrap();
+        let path = b"/data/pread_fault.txt\0".to_vec();
+        let fd = match rt.dispatch(
+            SYS_OPENAT, 0, path.as_ptr() as u64, 0, 0, 0, 0,
+            &mut move |_, _| Some(path.clone()),
+            &mut |_, _| true,
+            &mut map_ok(),
+        ) {
+            SyscallResult::Done(v) => v as i32,
+            other => panic!("expected fd, got {other:?}"),
+        };
+        let r = rt.dispatch(
+            SYS_PREAD64, fd as u64, 0x2000, 5, 0, 0, 0,
+            &mut |_, _| None,
+            &mut |_, _| false, // 回写失败
+            &mut map_ok(),
+        );
+        assert!(matches!(r, SyscallResult::Done(v) if v as i64 == EFAULT));
+    }
+
+    /// pread64 对无效 fd 返回 EBADF。
+    #[test]
+    fn pread64_bad_fd_returns_ebadf() {
+        let mut rt = LinuxRuntime::new();
+        let r = rt.dispatch(
+            SYS_PREAD64, 999, 0x2000, 5, 0, 0, 0,
+            &mut |_, _| None,
+            &mut |_, _| true,
+            &mut map_ok(),
+        );
+        assert!(matches!(r, SyscallResult::Done(v) if v as i64 == EBADF));
     }
 
     /// 测试 dup3 复制到指定 fd。

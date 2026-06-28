@@ -21,6 +21,19 @@ static long sys3(long nr, long a0, long a1, long a2) {
     return x0;
 }
 
+/* 6 参数 syscall（mmap 等）。 */
+static long sys6(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = a3;
+    register long x4 __asm__("x4") = a4;
+    register long x5 __asm__("x5") = a5;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8) : "memory");
+    return x0;
+}
+
 int rd_add(int a, int b) {
     return a + b;
 }
@@ -75,4 +88,24 @@ int rd_open_read(const char *path, void *buf, int n) {
     int r = rd_read(fd, buf, n);
     sys3(57 /* close */, fd, 0, 0);
     return r;
+}
+
+/* case 7：mmap 匿名页 → 写 magic → 读回校验和。
+ * 通过真实 backend 证明 mmap 返回的地址真实可读可写，而非只返回占位地址
+ * （spec: Bootstrap mmap must create target-visible mappings）。
+ *
+ * 自验证：若 mmap 未真实建立目标侧映射（map_guest 假成功），guest 写该地址
+ * 会触发未映射异常，call_export 的 emu_start 失败 → case 报错（而非假 pass）。
+ * 成功时返回 0xAB^0xCD^0x12^0x34 = 0x40 = 64。 */
+int rd_mmap_rw(void) {
+    long addr = sys6(222 /* mmap */, 0, 4096,
+                     3 /* PROT_READ|PROT_WRITE */,
+                     0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */,
+                     -1, 0);
+    if (addr < 0) return (int)addr;  /* errno */
+    unsigned char *p = (unsigned char *)addr;
+    p[0] = 0xAB; p[1] = 0xCD; p[2] = 0x12; p[3] = 0x34;
+    int cs = 0;
+    for (int i = 0; i < 4; i++) cs ^= p[i];
+    return cs;
 }

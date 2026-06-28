@@ -30,12 +30,6 @@
 9. 构建 `init` / `init_array`
 10. 最终把模块放入全局模块表
 
-对应参考位置：
-
-- [AndroidElfLoader.java](</F:/reverse-workspace/unidbg/unidbg-android/src/main/java/com/github/unidbg/linux/AndroidElfLoader.java:317>)
-- [LinuxModule.java](</F:/reverse-workspace/unidbg/unidbg-android/src/main/java/com/github/unidbg/linux/LinuxModule.java:87>)
-- [ModuleSymbol.java](</F:/reverse-workspace/unidbg/unidbg-android/src/main/java/com/github/unidbg/linux/ModuleSymbol.java:15>)
-
 结论：
 
 - `unidbg` 不是“把所有模块扫一遍看看谁有符号”，而是先建立依赖上下文，再做符号解析。
@@ -43,330 +37,113 @@
 
 ### 2. 段映射与页权限
 
-`unidbg` 并不是简单粗暴把整块镜像永久映射成 RWX。
+`unidbg` 并不是简单粗暴把整块镜像永久映射成 RWX。它会按段计算页对齐区间、对共享页做权限合并或 `mem_protect`、写入真实段数据、维护 `MemRegion`。
 
-它会：
-
-- 按段计算页对齐后的区间
-- 对共享页做权限合并或 `mem_protect`
-- 把真实段数据写入目标内存
-- 维护 `MemRegion`
-
-这说明：
-
-- “先整块 reserve，再按段收紧权限”是合理路线
-- “整块 RWX 然后不再收紧”只是临时跑通手段，不能作为长期语义
+结论：“先整块 reserve，再按段收紧权限”是合理路线。
 
 ### 3. 文件 IO / `mmap` / `/dev/urandom`
 
-`unidbg` 的文件 IO 路径最终会把读出的字节写入目标缓冲区，例如：
+`unidbg` 的文件 IO 路径最终会把读出的字节写入目标缓冲区（`RandomFileIO.read` / `ByteArrayFileIO.read` / `AbstractFileIO.mmap2`）。共同点：**目标侧可观察状态是真实结果的一部分；返回值正确但目标缓冲区没变，不算成功**。
 
-- `RandomFileIO.read(...)`
-- `ByteArrayFileIO.read(...)`
-- `AbstractFileIO.mmap2(...)`
+实现主线必须固定成：source 产出字节 → runtime 把结果写回目标缓冲区或建立目标侧映射 → 只有步骤 2 成功 syscall 才返回成功。
 
-这些路径的共同点是：
+## 现状对齐（2026-06-28 评估）
 
-- 目标侧可观察状态是真实结果的一部分
-- 返回值正确但目标缓冲区没变，不算成功
+> 本 change 创建于 `bootstrap-runtime` 完成时。后续 8 个 change（android-vm-state-model、jni-shim-foundation、native-jni-lifecycle、python-*、android-framework-stubs、jni-abi-surfaces 等）已把下列建议的绝大部分落地。本节逐条对齐当前代码形态，标注剩余真实 gap。证据为 `file:line`。
 
-这也是 `rundroid` 当前最需要修正的点之一。
+### 1. 目标侧状态访问 fail-fast ✅
 
-在 `rundroid` 里，这一段不能只停留在“数据源能返回 bytes”。
+- `Engine` trait（会话句柄）的 `mem_read`/`mem_write`/`reg_read`/`reg_write`/`mem_protect` 已全部返回 `Result<(), BackendError>`（`emulator/backends/api/src/engine.rs:33-69`）。
+- `GuestCPU` trait（hook 内受限视图）的 `mem_read`/`mem_write` **故意**返回 `bool`，用于把"未映射缓冲"上报成 EFAULT（`engine.rs:140-158`）。
+- syscall 路径已 fail-fast：`write_guest`/`map_guest` 返回 false 即返回 EFAULT（`emulator/os/linux/src/syscall.rs:397-402, 578-609, 650-652`）。
+- **原"统一收敛为 `Backend` 命名"的建议不适用**：`Backend` 现已是工厂 trait（`Backend::open -> Box<dyn Engine>`，`engine.rs:16-22`），`Engine` 是会话 trait。改名将破坏 8 个 change 的代码并与现有 `Backend` 冲突。spec 亦无此命名 SHALL。**跳过。**
 
-实现上必须固定成下面这条主线：
+### 2. pc_read / pc_write ✅（功能等价）
 
-1. file/device source 先产出源字节或映射描述
-2. runtime 尝试把结果写回目标缓冲区，或建立目标侧映射
-3. 只有步骤 2 成功，syscall 才能返回成功
+- PC 读写通过 `reg_read(Arm64Reg::Pc)` / `reg_write(Arm64Reg::Pc, ..)` 实现（`backends/api/src/reg.rs:17`，用法见 `case-runner/src/runtime.rs:519`）。
+- 独立方法名非 spec 要求。**跳过。**
 
-具体约束：
+### 3. mem_protect + 页权限收紧 ✅
 
-- `VirtFile.host(...)`、`VirtFile.bytes(...)`、builtin `/dev/urandom`、custom device 的 `read/pread64` 都必须走同一条目标侧回写主线
-- 回写失败时，不允许保留“返回长度但目标缓冲区没变化”的假成功
-- `mmap` 不允许只分配一个 host side 句柄或只计算返回地址，必须让 backend 中的目标页真实可访问
-- file-backed / device-backed `mmap` 若需要初始内容，必须在返回前完成初始字节落地或显式失败
+- `Engine::mem_protect` 已存在（`engine.rs:69`）；unicorn 已实现，调 `uc.mem_protect` + page 对齐（`backends/unicorn/src/engine.rs:174-192`）。
+- loader 装载后按 PT_LOAD p_flags 收紧段权限（`case-runner/src/runtime.rs:439-450`）。
+- linker RELRO 收紧**真调** `engine.mem_protect`（`runtime.rs:711-731`），不是只 emit event。
+- **精度 gap（可选，非 spec 强制）**：parser `DynamicInfo.relro` 仅 `bool`（`elf/parser/src/model.rs:83`），loader 用"第一个 RW PT_LOAD 段"近似 RELRO 范围（`elf/loader/src/loader.rs:96-111`）而非精确 PT_GNU_RELRO vaddr/memsz。spec 验收只要求"应用 RELRO 收紧"，已满足。
 
-验收上也必须对应加强：
+### 4. parser soname/needed 字符串化 ✅
 
-- `/dev/urandom` case 不只检查返回值，还要回读目标缓冲区，确认字节真实可见
-- `VirtFile.bytes(...)` / `VirtFile.host(...)` case 必须回读目标缓冲区，断言长度和内容
-- `mmap` case 必须证明返回地址可读或可写，而不是只证明 syscall 没报错
+- `DynamicInfo.soname: Option<String>` + `needed: Vec<String>` 已有，从 DT_SONAME/DT_NEEDED + strtab 解析（`elf/parser/src/parser_elf.rs:51-67`）。init/fini/init_array/fini_array 全有。
 
-## 最佳实现建议
+### 5. parser 错误分类 ✅
 
-### 1. 执行环境的目标侧状态访问必须 fail-fast
+- `ElfParseError` 有 `BadMagic`/`Truncated`/`MalformedDynamic`/`Unsupported`/`Policy`（`elf/parser/src/error.rs:10-31`）。三层错误（parser/loader/linker）严格分离。
 
-当前把这层接口命名成 `SyscallCpu` 语义不对：
+### 6. DT_NEEDED 装载队列 + 依赖图 resolve ✅
 
-- 它不是“只给 syscall 用”的接口
-- 它也不只是 CPU，而是同时覆盖 register、memory 和 stop control
+- `load_and_link` 递归装载 DT_NEEDED + `ModuleGraph.add_dep` + soname 去重（`case-runner/src/runtime.rs:332-391`）。
+- linker `resolve` 按 self → direct deps → 依赖闭包 BFS，`SymbolQuery.requester` 限定范围，**非全表扫描**（`elf/linker/src/resolver.rs:37-80`）。
+- init_order 用 Kahn 拓扑排序 + 稳定输出 + 环检测（`elf/linker/src/init.rs`）。
 
-更合理的收敛方式是：
+### 7. scratch memory ✅
 
-- 直接使用 `Backend` 作为统一执行环境接口命名
-- 它同时封装 backend/unicorn 侧执行能力与 OS/syscall 侧所需的寄存器、内存、PC、stop 控制能力
-- syscall handler 直接依赖 `&mut dyn Backend`，不再额外引入误导性的 `SyscallCpu` 命名
+- assemble 时固定映射 1 MiB @ `0x800_000` 为 RW scratch（`runtime.rs:216-229`），`RegionTracker` 标 `RuntimeScratch`，注释明确"仅 case manifest 公开契约，非 malloc/heap"。
+- spec "Bootstrap scratch memory stays test-scoped" 已满足。原 `alloc_scratch` 动态 API 建议非 spec 要求。**跳过。**
 
-当前这类 `mem_read()` / `mem_write()` 的 best-effort 语义不适合 correctness 阶段。
+### 8. file/device/mmap 目标侧回写 ✅（pread64 未实现）
 
-建议改成：
+- getrandom/read 写目标失败即 EFAULT（`syscall.rs:397-402, 650-652`）。
+- `VirtFile.host`/`VirtFile.bytes` + builtin `/dev/urandom` 统一经 `read_from_fd` → `write_guest`（`emulator/driver/src/fd.rs`，`emulator/driver/src/mapper.rs`，`emulator/driver/src/builtin/urandom.rs`）。
+- SYS_MMAP 必须调 `map_guest` 成功才返回地址（`syscall.rs:578-609`）。
+- **pread64 未实现**（task 11 字面提及）。spec scenario 用"read **或** pread64"的"或"，read 已覆盖，pread64 非强制。
 
-```rust
-pub trait Backend {
-    fn reg_read(&self, reg: Arm64Reg) -> Result<u64, BackendError>;
-    fn reg_write(&mut self, reg: Arm64Reg, value: u64) -> Result<(), BackendError>;
-    fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError>;
-    fn mem_write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), BackendError>;
-    fn pc_read(&self) -> Result<u64, BackendError>;
-    fn pc_write(&mut self, value: u64) -> Result<(), BackendError>;
-    fn stop(&mut self) -> Result<(), BackendError>;
-}
-```
+### 9. case manifest 参数生效 ✅
 
-然后：
+- arch/backend 不支持即 fail-fast，seed 应用到 LinuxRuntime，telemetry 切换 mode（`case-runner/src/case.rs:42-68`）。`manifest_validation.rs` 有专项测试。
 
-- Linux runtime 的 `dispatch()` 返回 `Result<SyscallResult, SyscallError>`
-- `Backend` 统一承载 register / memory / pc / execution control，以及 syscall 所需的访问主线
-- 任何目标缓冲区读写失败都直接进入失败路径
-- case runner 不能把“返回值正确但目标内存没写进去”判成 pass
+### 10. smoke/regression case ✅（mmap case 缺）
 
-### 2. 增加 scratch memory / call buffer 管理
+- `03-dev-urandom` 用 XOR 校验和间接断言目标缓冲区非零；`syscall.rs` 有完整 regression suite（`regression_urandom_buffer_visible` / `regression_virtfile_bytes_read_back` / `regression_virtfile_host_read_back` / `regression_dynamic_provider_writeback_failure` 等）。
+- **mmap 缺真实回归 case**（见剩余 gap）。
 
-当前 case 直接传 `0x800000` 这种裸地址，不够可靠。
+## 剩余真实 gap
 
-建议在 `OS` 增加一个最小 scratch allocator：
+经现状对齐，spec 验收角度仅剩 1 个硬缺口：
 
-- `alloc_scratch(size, perms) -> target_addr`
-- `write_scratch(addr, bytes)`
-- `read_scratch(addr, len)`
+- **task 16：mmap 真实可读写回归 case**。spec "Bootstrap mmap must create target-visible mappings" 要求 case 证明返回地址真实可读/可写。现状 mmap unit test 用 mock `map_guest`（恒 true，`syscall.rs:886-899, 1206-1286`），未通过真实 backend 验证地址可读写。需要新增 `case.toml` + guest fixture：guest 调 `mmap` → 写该地址 → 读回断言。
 
-这样 case runner 可以：
+可选增强（design 建议、spec 非强制，按需取舍）：
 
-- 先申请目标缓冲区
-- 把指针传进导出函数
-- 调用结束后回读目标内容并断言
+- pread64 实现（task 11 字面）
+- RELRO 精确 PT_GNU_RELRO vaddr/memsz（task 6 精度）
+- `alloc_scratch` 动态 API（task 9）
+- `pc_read`/`pc_write` 独立方法名（task 2）
 
-这比让 case 手工写裸地址稳定得多。
+## Architecture Changes（对齐现状命名）
 
-这里必须明确它的边界：
-
-- scratch allocator 是 testing-harness / case runner / Python stub 的辅助能力
-- 它不是目标程序正式堆的一部分
-- 它也不是 `malloc` / `free` / `mmap` / `brk` 的替代实现
-
-也就是说：
-
-- 正常目标程序的动态内存语义，仍应走目标程序自己的分配路径
-- scratch 只解决“测试脚本要给 native 调用准备一块可控目标缓冲区”这个问题
-
-推荐命名上也体现这一点，例如：
-
-- `os.testing.alloc_scratch(...)`
-- `os.harness.alloc_scratch(...)`
-
-而不是让它看起来像正式 userspace allocator。
-
-### 3. 建立真实的 `DT_NEEDED` 装载队列
-
-建议把当前的 `load_and_link(module_name, bytes)` 演进为：
-
-```rust
-pub fn load_root_module(&mut self, module_uri: &str) -> Result<ModuleId, RuntimeAssemblyError>;
-```
-
-这里的 `module_uri` 不是“某个神秘的新协议”，它只是一个比裸文件名更稳定的资源定位符。
-
-它的作用是：
-
-- 告诉 loader “根模块从哪里来”
-- 让 case/harness/resource resolver 能用统一入口加载模块
-- 避免把 loader API 绑死在“只能传本地路径”或“只能直接给 bytes”上
-
-例如都可以接受：
-
-- `resource:cases/so/libfoo.so`
-- `file:F:/samples/libfoo.so`
-- `apk:/lib/arm64-v8a/libfoo.so`
-
-bootstrap 阶段并不要求一次支持所有 scheme，但接口层最好先按 URI/resolver 模型设计。
-
-它背后的含义其实很简单：
-
-- `module_name` 更像显示名或调用方随便起的名字
-- `module_uri` 才是“这个模块实际从哪里解析和读取”
-
-之所以要这样改，是因为真实 `DT_NEEDED` 装载不是“当前模块自己跑一遍 link 就完了”，而是：
-
-- 先明确 root module 的来源
-- 再根据它的 `DT_NEEDED` 继续查 resolver
-- 逐步把依赖图装完整
-- 最后在一个稳定依赖上下文里做 link
-
-如果还停留在 `load_and_link(module_name, bytes)` 这种接口，很容易让实现方偷懒成：
-
-- 只 link 当前给进来的一个模块
-- 依赖模块靠“之后谁先 load 到内存里”碰运气
-- `resolve()` 直接扫全局模块表
-
-这就是我们想避免的错误语义。
-
-推荐流程：
-
-1. 解析 root module
-2. 取出 `DT_SONAME`
-3. 取出 `DT_NEEDED`
-4. 用 `resource:` / resolver 找到依赖模块
-5. 对未装载依赖递归执行 parser + loader
-6. 建立 `ModuleGraph.deps`
-7. 等图完整后再统一调用 linker
-
-关键约束：
-
-- 不允许靠“扫描所有已装载模块”替代依赖图
-- `resolve()` 必须先 self，再 direct deps，再按依赖闭包的稳定顺序继续
-- 不允许用 `HashMap` 的偶然遍历顺序决定结果
-
-### 4. parser 必须给出字符串化的 soname / needed
-
-当前只保留 strtab offset 不够。
-
-建议 parser 的 `DynamicInfo` 至少演进为：
-
-```rust
-pub struct DynamicInfo {
-    pub soname: Option<String>,
-    pub needed: Vec<String>,
-    pub init: Option<u64>,
-    pub fini: Option<u64>,
-    pub init_array: Option<u64>,
-    pub init_array_size: u64,
-    pub fini_array: Option<u64>,
-    pub fini_array_size: u64,
-    pub relro: Option<RelroTemplate>,
-}
-```
-
-这一步不是“功能扩张”，而是让 loader/linker 拿到足够正确的输入。
-
-### 5. 页权限与 RELRO 的正确落地方式
-
-推荐采用两阶段模型：
-
-1. `reserve_image_space()` 把 footprint 整块映射成临时可写
-2. loader 写完段内容、linker 写完 relocation 后：
-   - 依据段权限做 `mem_protect`
-   - 对 RELRO 区域做最终只读收紧
-
-建议新增 backend trait：
-
-```rust
-fn mem_protect(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError>;
-```
-
-然后：
-
-- `LoadContext` 只负责初始映射和写入
-- `LinkContext::protect_relro()` 必须真正调用 backend
-- 失败时必须返回 error，不能只记一条 event
-
-### 6. case manifest 必须变成“强生效输入”
-
-`arch` / `backend` / `seed` / `telemetry` 都必须真正作用于 OS。
-
-建议：
-
-- 不支持的 `arch` / `backend` 直接在 manifest 校验阶段报错
-- `seed` 必须在 OS 装配后立刻应用到 Linux OS
-- `telemetry = full` 如果当前未实现完整能力，也应保持结构一致并至少输出更多字段，而不是仅与 `events_only` 等价
-
-### 7. smoke case 需要从“只看返回值”升级为“检查目标侧状态”
-
-建议把现有 case 升级为：
-
-- `01-pure-export-call`
-  - 保持现状，验证导出调用和 ABI
-- `02-open-and-read-urandom`
-  - open `/dev/urandom`
-  - read 到目标缓冲区
-  - 回读目标缓冲区，断言数据非零且长度正确
-- `03-mmap-write-read`
-  - 目标代码调用 `mmap`
-  - runtime 确保该地址真的可写
-  - 函数返回后从目标侧回读，断言页已可见
-
-## Architecture Changes
-
-本次 change 建议新增或修改的 crate 内职责如下。
-
-### `runtime/backends/api`
-
-- 新增 `mem_protect`
-- `Backend` 的 register / memory / pc 访问接口改为 `Result`
-
-### `runtime/backends/unicorn`
-
-- 实现 `mem_protect`
-- syscall hook 里不再吞目标侧读写失败
-
-### `runtime/elf/parser`
-
-- `DynamicInfo` 输出 `soname: Option<String>` 与 `needed: Vec<String>`
-- bad magic / truncated / malformed dynamic 区分更准确
-
-### `runtime/elf/loader`
-
-- 输出真实的 RELRO 模板信息
-- 不再把 `module_name` 当成 soname 替代品
-
-### `runtime/elf/linker`
-
-- `resolve()` 必须基于依赖图顺序
-- `init_order` 继续保持稳定拓扑序
-
-### `runtime/os/linux`
-
-- `mmap` 不能只返回地址，至少要能与 backend 映射协同
-- `/dev/urandom` / `getrandom` 写目标缓冲区失败要上抛
-
-### `runtime/case-runner`
-
-- 管理 scratch memory
-- 应用 `seed`
-- manifest 参数校验
-- 增加目标缓冲区回读断言能力
+- `runtime/backends/api`：`Backend`=工厂（`open`），`Engine`=会话句柄（mem_map/mem_protect/mem_read/mem_write/reg_*/emu_*/install_*_hook），`GuestCPU`=hook 内受限视图（bool 语义用于 EFAULT 上报），`SyscallHook`/`CodeHook`=回调 trait。mem_read/mem_write/reg_* 在 `Engine` 上返回 `Result`。
+- `runtime/backends/unicorn`：`mem_protect` 已实现，syscall hook 不吞目标侧读写失败。
+- `runtime/elf/parser`：`DynamicInfo` 已输出 `soname: Option<String>` 与 `needed: Vec<String>`；错误分 BadMagic/Truncated/MalformedDynamic。
+- `runtime/elf/loader`：输出 `LoadedModule.relro: Option<RelroRange>`（当前为近似范围）。
+- `runtime/elf/linker`：`resolve()` 基于 requester 依赖图顺序；`init_order` 拓扑稳定。
+- `runtime/os/linux`：`mmap`/`read`/`getrandom` 已建立目标侧映射/回写；回写失败上抛 EFAULT。
+- `runtime/case-runner`：固定 scratch buffer；应用 seed；manifest 参数校验。
 
 ## Risks
 
 ### 1. 过早把 correctness change 扩成完整 syscall/VFS 重写
 
-这不是本次 change 的目标。
+不是本次目标。本次只补 task 16（mmap 真实回归 case），可选增强按需。
 
-本次只要求：
+### 2. design 过时导致破坏性改动
 
-- 目标内存可见性正确
-- `DT_NEEDED` 最小依赖图正确
-- 页权限最小正确
+本 change 原design 的若干"命名收敛"建议（Engine→Backend、SyscallCpu 批评等）描述的是 7 天前的代码形态，与现状冲突。已在本 design 中改为"现状对齐"。**禁止**按过时建议做破坏性改名。
 
-### 2. 引入过多 unsafe
+### 3. 引入过多 unsafe
 
-当前 `LinkCtxAdapter` 里已经有裸指针绕借用检查的做法。
-
-本次 change 应尽量减少 unsafe 边界，而不是继续扩大。
-
-优先策略：
-
-- 重排 API 所有权
-- 抽出 snapshot 数据
-- 最后才考虑增加新的裸指针桥接
+`LinkCtxAdapter` 已有裸指针绕借用。本次补 case 不应扩大 unsafe 边界。
 
 ## Acceptance Direction
 
-这个 change 完成时，至少应满足：
-
-- `getrandom` / `read` 类路径在目标缓冲区未成功写入时不会返回 pass
-- `DT_NEEDED` 的 direct dependency 能被装载并参与符号解析
-- `resolve()` 不再扫描所有模块决定结果
-- `mem_protect` 与 RELRO 至少在 Unicorn backend 生效
-- case manifest 的 `seed` / `arch` / `backend` 参数真实生效
-- 新的 smoke case 会断言目标侧内存状态
+- task 16：新增 mmap 回归 case，通过真实 backend 证明返回地址可读/可写（而非 mock map_guest）。
+- 其余 spec Requirement 已由后续 change 满足，对应 task 在 tasks.md 标注并勾选。
+- 可选增强（pread64 / RELRO 精度 / alloc_scratch / pc_read）按需决定，不阻塞本 change 收尾。

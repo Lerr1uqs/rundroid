@@ -1,0 +1,21 @@
+# case 4: mmap 真实可读写回归
+# 目的：通过真实 backend 证明 mmap 返回的地址真实可读可写，
+# 而不是只检查 syscall 返回值
+# （spec: Bootstrap mmap must create target-visible mappings）。
+#
+# 自验证设计：
+# - rd_mmap_rw 调 mmap 匿名页 → 写 magic 字节 → 读回算 XOR 校验和
+# - 若 mmap 未真实建立目标侧映射（map_guest 假成功），guest 写该地址会触发
+#   未映射异常，call_export 的 emu_start 会失败 → case 报错（而非假 pass）
+# - expect_return = 0xAB^0xCD^0x12^0x34 = 0x40 = 64
+
+name = "04-mmap-rw"
+arch = "arm64"
+backend = "unicorn"
+module = "resource:smoke/build/libsmoke.so"
+telemetry = "events_only"
+
+[[call]]
+symbol = "rd_mmap_rw"
+args = []
+expect_return = 64
