@@ -1,9 +1,7 @@
 ## Purpose
 
 定义 `rundroid` 基于 case 的测试系统和 differential execution 的稳定要求，保证 case 格式、资源解析方式、以及可选 oracle 的工作模式长期一致。
-
 ## Requirements
-
 ### Requirement: Declarative runtime cases
 
 项目 SHALL 以声明式方式定义 runtime case。
@@ -46,3 +44,18 @@ scratch memory SHALL 仅作为 testing-harness / stub / 调试辅助能力存在
 - **WHEN** 目标程序的正常执行路径需要动态内存
 - **THEN** runtime SHALL 继续依赖目标程序自身的 `malloc`、`mmap`、`brk` 或等价机制
 - **AND** scratch API 不 SHALL 被实现为正式 heap allocator 的替代品
+
+### Requirement: JNI ABI is observable through harness
+
+testing harness SHALL 能验证 guest 通过真实 JNI ABI table 调用 runtime。
+
+#### Scenario: Guest invokes JNI call through JNIEnv table
+
+- **WHEN** harness 运行一个最小 JNI case
+- **THEN** case SHALL 能通过 `_JNIEnv` function table 调用至少一个 class lookup 和一个 method call
+
+#### Scenario: Thread attach path is covered
+
+- **WHEN** harness 运行一个依赖 `GetEnv` 或 `AttachCurrentThread` 的 case
+- **THEN** case SHALL 能断言返回的 env 对当前 VM 有效
+
