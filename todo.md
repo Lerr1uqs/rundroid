@@ -30,3 +30,11 @@
 - java primitive type到py type的转换？
 
 - JavaClass 是否要添加一个release函数 手动释放
+
+- java class 构造函数的问题
+
+- @java_class("name") 仅接受一个 name，不接受 superclass。
+
+- static/<init>/superclass/多继承 
+
+- emu.jni_env_pointer 这个是不是多余的 应该是内部字段比较好？
