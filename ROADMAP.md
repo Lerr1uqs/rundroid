@@ -18,13 +18,13 @@ rundroid/
 ├── emulator/                 # 所有 Rust crate
 │   ├── core/                 # 基础：RuntimeConfig / Arch / BackendKind / IdAllocator / ModuleId
 │   ├── telemetry/            # 事件（TelemetryRouter / EventSink / TelemetryEventKind）
-│   ├── memory/               # RegionTracker（guest 内存区账本）
+│   ├── memory/               # MemoryAddressSpace（guest VMA 第一权威）+ RegionTracker 兼容层
 │   ├── backends/
 │   │   ├── api/              # trait: Backend(工厂)/Engine(会话)/GuestCPU(hook内视图)/SyscallHook/CodeHook + MemPerms + Arm64Reg
-│   │   └── unicorn/          # UnicornBackend 实现（svc=intr hook, code hook, mem_protect）
+│   │   └── unicorn/          # UnicornBackend 实现（svc=intr hook, code hook, mem_protect/mem_unmap）
 │   ├── elf/
 │   │   ├── parser/           # ParsedElf / DynamicInfo(soname/needed/relro) / ElfParseError(BadMagic/Truncated/...)
-│   │   ├── loader/           # ElfLoader/LoadContext/LoadedModule(relro) — reserve footprint RWX → 写段 → 收紧权限
+│   │   ├── loader/           # ElfLoader/LoadContext/LoadedModule(relro) — 共享 authority 预留 footprint → 写完全部段 → 统一收紧权限
 │   │   └── linker/           # ElfLinker/LinkContext/ModuleGraph/resolve(BFS依赖闭包)/init(Kahn拓扑)
 │   ├── driver/               # VirtualDevice trait / VirtFile(Host/Bytes/Dynamic) / builtin(urandom/random/null/zero)
 │   ├── os/linux/             # LinuxRuntime / kernel/* / memory_bridge.rs / fd.rs / vfs.rs
@@ -52,7 +52,7 @@ elf-parser ◄── elf-loader ◄── elf-linker# ELF 三层，严格分层
   │
 driver                                   # 设备/VirtFile 抽象
   │
-os/linux ◄───────────────────────────── # LinuxRuntime(syscall/fd/vfs)
+os/linux ◄───────────────────────────── # LinuxRuntime(syscall/fd/vfs) + 共享 guest 地址空间接线
   │
 jni ◄─────────────────────────────────── # AndroidVM/registry/JNIEnvABI
   │
@@ -69,9 +69,10 @@ bindings/python (pyo3) → python/         # ffi + stub
 
 | 概念 | 位置 | 一句话职责 |
 |---|---|---|
-| `GuestRuntime` | case-runner/runtime.rs | 装配总览：持 engine + linux + elf graph + jni 表 + regions，实现 LoadContext/LinkContext |
+| `GuestRuntime` | case-runner/runtime.rs | 装配总览：持 engine + 共享 `MemoryAddressSpace` + linux + elf graph + jni 表，实现 LoadContext/LinkContext |
+| `MemoryAddressSpace` | memory/address_space.rs | guest VMA 第一权威：`Reserved`/`Dynamic` 分配、overlap 预检查、protect/unmap 回写、usage 元数据 |
 | `Backend`/`Engine`/`GuestCPU` | backends/api | 工厂/会话句柄/hook 内受限视图（GuestCPU 的 mem_* 返回 bool 用于 EFAULT 上报） |
-| `LinuxRuntime` | os/linux | OS 状态(vfs/fds/mmap区/brk/rng) + syscall dispatch（**linux-syscall-layering 将拆 kernel/+syscall**） |
+| `LinuxRuntime` | os/linux | OS 状态(vfs/fds/brk/rng) + syscall dispatch；`mmap/munmap/mprotect` 通过共享 `MemoryAddressSpace` 落地 |
 | `AndroidVM` | jni/android_vm.rs | JNI 聚合根（registry/objects/refs/exceptions/natives/apk）的最终 authority |
 | `JniRegistry` | jni/registry.rs | class/method/field 权威 + dispatch 主线（Rust handler / Python shim / framework stub 统一入口） |
 | `JniEnvSurface` | jni/jnienv.rs | host 侧 Rust 分派层（find_class/call_int_method_by_id/...） |
@@ -84,7 +85,7 @@ bindings/python (pyo3) → python/         # ffi + stub
 
 1. **JNI trampoline + code hook 拦截**：guest `(*env)->Fn(env,...)` → 函数表每格指向 trampoline NOP → backend code hook 在 NOP 执行前回调 → `function_index(addr)=(addr-trampoline_base)/4` 反算 slot → 查 catalog 分流 → dispatch。Rust handler 在 host 跑，**不进 guest**（类比 svc 拦截）。
 2. **syscall svc hook + 目标侧回写**：guest `svc #0` → SyscallHook → `LinuxRuntime::dispatch(nr,x0..x5, &mut MemoryBridge)` → handler 调 OS 语义拿数据 → **write/map 回写失败即 EFAULT**（不允许"返回长度但目标缓冲没变"的假成功）。
-3. **ELF 装载链**：parser → loader（footprint 整块 RWX reserve → 写段 → 按 p_flags mem_protect 收紧）→ linker（relocation 写回 → resolve 按依赖图 → RELRO mem_protect 只读）→ case-runner 自动检测 `JNI_OnLoad`；Python 绑定层显式 `jni_onload()`。
+3. **ELF 装载链**：parser → loader（经共享 `MemoryAddressSpace` 预留/物化整块 footprint → 写完全部段 → 按 p_flags 统一收紧）→ linker（relocation 写回 → resolve 按依赖图 → RELRO 经同一 authority 切只读）→ case-runner 自动检测 `JNI_OnLoad`；Python 绑定层显式 `jni_onload()`。
 4. **ABI slot catalog 驱动 dispatch**：`JNIEnvABI`/`JavaVMABI` 持静态 `JniSlotSpec{name,offset,handler:Bridge|Unimplemented}` catalog，dispatch 查 catalog 决定放行/fail-fast/telemetry（声明式 catalog，handler 实现因依赖 backend 留装配层）。
 5. **Python↔Rust**：pyo3 cdylib `_rundroid` + Python `javashim`（`JavaClass`/`JavaObject`/`avm`）。`avm` 是 JNI/VM 唯一门面；marshalling 单一规则源（`py_to_jvalue`/`jvalue_to_py`）；guest JNI 经 trampoline hook 回调 Python override。死锁规避：锁内不进 Python、绑定层与 hook 共享同一个 `Arc<Mutex<AndroidVM>>`。
 
