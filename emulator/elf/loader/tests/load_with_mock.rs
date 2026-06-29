@@ -3,7 +3,7 @@
 //! 用一个 in-memory mock LoadContext 验证 loader 的"算地址 + 段映射 + 写入 + 导出表 + init_plan"
 //! 是否正确，完全不依赖 Unicorn。这是 loader / linker 三层解耦带来的可测试性收益。
 
-use rundroid_core::{Arch, BackendKind, IdAllocator, ModuleId, RuntimeConfig};
+use rundroid_core::{Arch, BackendKind, IdAllocator, RuntimeConfig};
 use rundroid_elf_loader::{
     DefaultLoader, ElfLoader, LoadContext, LoadRequest, MappedSegment, SegmentMapSpec,
 };
@@ -11,7 +11,7 @@ use rundroid_elf_parser::{
     DynamicInfo, ElfIdentity, ElfParseError, ElfParser, InitMetadata, LoadSegment, ParseInput,
     SegmentPerms,
 };
-use rundroid_memory::MemoryError;
+use rundroid_memory::{MemoryError, MemoryPerms, MemoryUsage};
 use rundroid_telemetry::TelemetryEvent;
 
 /// 最小 mock：把 loader 对 backend 的所有调用记录成"事件流"，
@@ -20,6 +20,7 @@ use rundroid_telemetry::TelemetryEvent;
 struct MockCtx {
     reserves: Vec<(u64, u64)>,
     maps: Vec<SegmentMapSpec<'static>>,
+    protects: Vec<(u64, u64, MemoryPerms, MemoryUsage)>,
     writes: Vec<(u64, Vec<u8>)>,
     zero_fills: Vec<(u64, u64)>,
     emits: usize,
@@ -56,6 +57,16 @@ impl LoadContext for MockCtx {
             guest_addr: spec.guest_addr,
             size: spec.size,
         })
+    }
+    fn protect_segment(
+        &mut self,
+        guest_addr: u64,
+        size: u64,
+        perms: MemoryPerms,
+        usage: MemoryUsage,
+    ) -> Result<(), MemoryError> {
+        self.protects.push((guest_addr, size, perms, usage));
+        Ok(())
     }
     fn write_bytes(&mut self, guest_addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.writes.push((guest_addr, bytes.to_vec()));
@@ -189,6 +200,12 @@ fn loader_maps_segments_and_builds_exports() {
     assert_eq!(ctx.maps.len(), 2);
     assert_eq!(ctx.maps[0].guest_addr, 0x1000_0000); // base + vaddr(0)
     assert_eq!(ctx.maps[1].guest_addr, 0x1000_2000); // base + vaddr(0x2000)
+    assert_eq!(ctx.protects.len(), 2);
+    assert_eq!(ctx.protects[0].0, 0x1000_0000);
+    assert_eq!(ctx.protects[0].2, MemoryPerms::READ_EXEC);
+    assert_eq!(ctx.protects[0].3, MemoryUsage::ELFImage);
+    assert_eq!(ctx.protects[1].0, 0x1000_2000);
+    assert_eq!(ctx.protects[1].2, MemoryPerms::READ_WRITE);
 
     // 第二段有 .bss：filesz=0x80 写入、memsz-filesz=0x180 零填充。
     assert_eq!(ctx.writes.len(), 2);

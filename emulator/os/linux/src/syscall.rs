@@ -16,7 +16,9 @@ use crate::errno::{
 };
 use crate::fd::Fd;
 use crate::kernel::{FdOpError, LinuxRuntime, WriteOutcome};
+use crate::kernel::mem::MmapRequest;
 use crate::memory_bridge::MemoryBridge;
+use rundroid_memory::{AllocationRequest, DynamicArena, MemoryPerms, MemoryUsage, PAGE_SIZE};
 use rundroid_telemetry::{TelemetryEvent, TelemetryEventKind};
 
 // ============================================================================
@@ -37,6 +39,7 @@ const SYS_EXIT: u64 = 93;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
+const SYS_MPROTECT: u64 = 226;
 const SYS_MMAP: u64 = 222;
 const SYS_GETRANDOM: u64 = 278;
 
@@ -93,7 +96,8 @@ impl LinuxRuntime {
             }
             SYS_BRK => SyscallResult::Done(self.brk()),
             SYS_MMAP => self.sys_mmap(x0, x1, x2, x3, x4, x5, mem),
-            SYS_MUNMAP => SyscallResult::Done(self.munmap(x0, x1 as usize) as u64),
+            SYS_MUNMAP => self.sys_munmap(x0, x1 as usize, mem),
+            SYS_MPROTECT => self.sys_mprotect(x0, x1 as usize, x2 as i32, mem),
             SYS_GETRANDOM => self.sys_getrandom(x0, x1, mem),
             SYS_DUP => self.sys_dup(x0),
             SYS_DUP3 => self.sys_dup3(x0, x1, x2),
@@ -335,7 +339,7 @@ impl LinuxRuntime {
     ///   （不依赖 map 的隐式写副作用）。
     fn sys_mmap(
         &mut self,
-        _hint_addr: u64,
+        hint_addr: u64,
         length: u64,
         prot: u64,
         flags: u64,
@@ -348,35 +352,73 @@ impl LinuxRuntime {
         let flags = flags as i64;
         let fd = fd as Fd;
 
-        // 匿名映射：kernel 分配地址 + syscall 层落地映射。
+        // 匿名映射：kernel 只给语义请求，统一 authority 决定 guest 地址。
         if fd == -1 || (flags & MAP_ANONYMOUS) != 0 {
-            let guest_addr = self.alloc_mmap_addr(length);
-            if !mem.map(guest_addr, length, prot) {
-                return SyscallResult::Done(EFAULT as u64);
-            }
-            return SyscallResult::Done(guest_addr);
+            let request = self.anonymous_mmap_request(hint_addr, length, prot);
+            return match self.materialize_mmap_request(request, mem) {
+                Ok(addr) => SyscallResult::Done(addr),
+                Err(errno) => SyscallResult::Done(errno as u64),
+            };
         }
 
-        // fd-backed：kernel 取 region+地址，syscall 层显式 map + 内容回写。
-        match self.device_mmap(fd, length, offset, prot, flags as i32) {
+        // fd-backed：kernel 给 backing 语义，统一 authority 选址与落地。
+        match self.fd_mmap(fd, length, offset, prot, flags as i32) {
             Ok(Some(region)) => {
-                let len = region.content.len();
-                // spec: 先建立目标侧映射，再通过 bridge 把内容字节显式落地。
-                if !mem.map(region.addr, len, region.prot) {
-                    return SyscallResult::Done(EFAULT as u64);
-                }
-                if !region.content.is_empty() && !mem.write(region.addr, &region.content) {
-                    return SyscallResult::Done(EFAULT as u64);
-                }
+                let request = MmapRequest {
+                    length: length.max(region.content.len()),
+                    prot: region.prot,
+                    hint_addr: region.addr,
+                    arena: DynamicArena::new(0x7F_0000_0000, 0x7F_F000_0000),
+                    perms: MemoryPerms::from_flags(
+                        (region.prot & 1) != 0,
+                        (region.prot & 2) != 0,
+                        (region.prot & 4) != 0,
+                    ),
+                    usage: region.usage,
+                    content: region.content,
+                };
+                let addr = match self.materialize_mmap_request(request, mem) {
+                    Ok(addr) => addr,
+                    Err(errno) => return SyscallResult::Done(errno as u64),
+                };
                 self.emit(&TelemetryEvent::new(
                     "device.mmap",
                     TelemetryEventKind::FileSystem,
                 ));
-                SyscallResult::Done(region.addr)
+                SyscallResult::Done(addr)
             }
             Ok(None) => SyscallResult::Done(ENOTTY as u64),
             Err(FdOpError::BadFd) => SyscallResult::Done(EBADF as u64),
             Err(FdOpError::Io(_)) => SyscallResult::Done(EINVAL as u64),
+        }
+    }
+
+    /// sys_munmap：共享 authority + backend unmap。
+    fn sys_munmap(&mut self, addr: u64, length: usize, mem: &mut dyn MemoryBridge) -> SyscallResult {
+        let space = self.address_space();
+        let mut guard = space.lock().unwrap();
+        let mut materializer = SyscallMemoryMaterializer { mem };
+        match guard.unmap(addr, align_len(length) as u64, &mut materializer) {
+            Ok(()) => SyscallResult::Done(0),
+            Err(_) => SyscallResult::Done(EFAULT as u64),
+        }
+    }
+
+    /// sys_mprotect：共享 authority + backend protect。
+    fn sys_mprotect(
+        &mut self,
+        addr: u64,
+        length: usize,
+        prot: i32,
+        mem: &mut dyn MemoryBridge,
+    ) -> SyscallResult {
+        let perms = MemoryPerms::from_flags((prot & 1) != 0, (prot & 2) != 0, (prot & 4) != 0);
+        let space = self.address_space();
+        let mut guard = space.lock().unwrap();
+        let mut materializer = SyscallMemoryMaterializer { mem };
+        match guard.protect(addr, align_len(length) as u64, perms, &mut materializer) {
+            Ok(()) => SyscallResult::Done(0),
+            Err(_) => SyscallResult::Done(EFAULT as u64),
         }
     }
 
@@ -415,6 +457,117 @@ impl LinuxRuntime {
             Err(_) => SyscallResult::Done(EBADF as u64),
         }
     }
+
+    fn materialize_mmap_request(
+        &mut self,
+        request: MmapRequest,
+        mem: &mut dyn MemoryBridge,
+    ) -> Result<u64, i64> {
+        let aligned_len = align_len(request.length) as u64;
+        let allocation = if request.hint_addr != 0 {
+            AllocationRequest::reserved(
+                align_down(request.hint_addr),
+                aligned_len,
+                PAGE_SIZE,
+                request.perms,
+                request.usage,
+            )
+        } else {
+            AllocationRequest::dynamic(
+                aligned_len,
+                PAGE_SIZE,
+                request.perms,
+                request.usage,
+                request.arena,
+                request.arena.start,
+            )
+        };
+
+        let space = self.address_space();
+        let mut guard = space.lock().unwrap();
+        let mut materializer = SyscallMemoryMaterializer { mem };
+        let region = guard.allocate(allocation, &mut materializer).map_err(|_| EFAULT)?;
+        if !request.content.is_empty() && !materializer.mem.write(region.addr, &request.content) {
+            let _ = guard.unmap(region.addr, region.size, &mut materializer);
+            return Err(EFAULT);
+        }
+        Ok(region.addr)
+    }
+}
+
+struct SyscallMemoryMaterializer<'a> {
+    mem: &'a mut dyn MemoryBridge,
+}
+
+impl<'a> rundroid_memory::MemoryMaterializer for SyscallMemoryMaterializer<'a> {
+    fn map(
+        &mut self,
+        addr: u64,
+        size: u64,
+        perms: MemoryPerms,
+        _usage: MemoryUsage,
+    ) -> Result<(), rundroid_memory::MemoryError> {
+        if self.mem.map(addr, size as usize, prot_from_perms(perms)) {
+            Ok(())
+        } else {
+            Err(rundroid_memory::MemoryError::MaterializeFailed {
+                op: "map",
+                addr,
+                size,
+                reason: "memory bridge map failed".into(),
+            })
+        }
+    }
+
+    fn protect(
+        &mut self,
+        addr: u64,
+        size: u64,
+        perms: MemoryPerms,
+    ) -> Result<(), rundroid_memory::MemoryError> {
+        if self.mem.protect(addr, size as usize, prot_from_perms(perms)) {
+            Ok(())
+        } else {
+            Err(rundroid_memory::MemoryError::MaterializeFailed {
+                op: "protect",
+                addr,
+                size,
+                reason: "memory bridge protect failed".into(),
+            })
+        }
+    }
+
+    fn unmap(&mut self, addr: u64, size: u64) -> Result<(), rundroid_memory::MemoryError> {
+        if self.mem.unmap(addr, size as usize) {
+            Ok(())
+        } else {
+            Err(rundroid_memory::MemoryError::MaterializeFailed {
+                op: "unmap",
+                addr,
+                size,
+                reason: "memory bridge unmap failed".into(),
+            })
+        }
+    }
+}
+
+fn prot_from_perms(perms: MemoryPerms) -> i32 {
+    (if perms.readable() { 1 } else { 0 })
+        | (if perms.writable() { 2 } else { 0 })
+        | (if perms.executable() { 4 } else { 0 })
+}
+
+fn align_len(length: usize) -> usize {
+    let page = PAGE_SIZE as usize;
+    if length == 0 {
+        page
+    } else {
+        (length + page - 1) & !(page - 1)
+    }
+}
+
+fn align_down(addr: u64) -> u64 {
+    addr & !(PAGE_SIZE - 1)
 }
 
 // ============================================================================
@@ -431,16 +584,20 @@ mod tests {
 
     /// 测试用 MemoryBridge：把三个闭包收敛成单一 bridge 对象。
     /// 写法对齐重构前三闭包 dispatch，最小化测试改动。
-    struct TestBridge<R, W, M> {
+    struct TestBridge<R, W, M, P, U> {
         read: R,
         write: W,
         map: M,
+        protect: P,
+        unmap: U,
     }
-    impl<R, W, M> MemoryBridge for TestBridge<R, W, M>
+    impl<R, W, M, P, U> MemoryBridge for TestBridge<R, W, M, P, U>
     where
         R: FnMut(u64, usize) -> Option<Vec<u8>>,
         W: FnMut(u64, &[u8]) -> bool,
         M: FnMut(u64, usize, i32) -> bool,
+        P: FnMut(u64, usize, i32) -> bool,
+        U: FnMut(u64, usize) -> bool,
     {
         fn read(&mut self, addr: u64, len: usize) -> Option<Vec<u8>> {
             (self.read)(addr, len)
@@ -451,17 +608,33 @@ mod tests {
         fn map(&mut self, addr: u64, len: usize, prot: i32) -> bool {
             (self.map)(addr, len, prot)
         }
+        fn protect(&mut self, addr: u64, len: usize, prot: i32) -> bool {
+            (self.protect)(addr, len, prot)
+        }
+        fn unmap(&mut self, addr: u64, len: usize) -> bool {
+            (self.unmap)(addr, len)
+        }
     }
 
     /// 由三个闭包构造测试 bridge。
     #[allow(clippy::type_complexity)]
-    fn bridge<R, W, M>(read: R, write: W, map: M) -> TestBridge<R, W, M>
+    fn bridge<R, W, M>(
+        read: R,
+        write: W,
+        map: M,
+    ) -> TestBridge<R, W, M, impl FnMut(u64, usize, i32) -> bool, impl FnMut(u64, usize) -> bool>
     where
         R: FnMut(u64, usize) -> Option<Vec<u8>>,
         W: FnMut(u64, &[u8]) -> bool,
         M: FnMut(u64, usize, i32) -> bool,
     {
-        TestBridge { read, write, map }
+        TestBridge {
+            read,
+            write,
+            map,
+            protect: |_addr, _len, _prot| true,
+            unmap: |_addr, _len| true,
+        }
     }
 
     /// 默认 map 成功的闭包工厂。
@@ -1141,6 +1314,208 @@ mod tests {
             "device mmap 内容应显式回写到目标侧"
         );
         assert_eq!(*mmap_addr.borrow(), addr);
+    }
+
+    /// anonymous/file/device mmap 都必须共享同一份地址空间真相，并携带各自 usage。
+    #[test]
+    fn regression_shared_authority_distinguishes_mmap_usage() {
+        use rundroid_driver::context::{
+            DeviceCloseContext, DeviceIoContext, DeviceMmapContext, DeviceMmapRequest,
+            DeviceMappedRegion, DeviceOpenContext,
+        };
+        use rundroid_driver::device::{DeviceError, VirtualDevice};
+        use rundroid_memory::{AllocationMode, MemoryAddressSpace, MemoryRegion};
+        use std::sync::{Arc, Mutex};
+
+        struct PatternDevice;
+
+        impl VirtualDevice for PatternDevice {
+            fn open(&mut self, _ctx: &mut DeviceOpenContext) -> Result<(), DeviceError> {
+                Ok(())
+            }
+
+            fn read(
+                &mut self,
+                _ctx: &mut DeviceIoContext,
+                _len: usize,
+            ) -> Result<Vec<u8>, DeviceError> {
+                Err(DeviceError::NotSupported)
+            }
+
+            fn write(
+                &mut self,
+                _ctx: &mut DeviceIoContext,
+                _data: &[u8],
+            ) -> Result<usize, DeviceError> {
+                Err(DeviceError::NotSupported)
+            }
+
+            fn mmap(
+                &mut self,
+                _ctx: &mut DeviceMmapContext,
+                req: &DeviceMmapRequest,
+            ) -> Result<Option<DeviceMappedRegion>, DeviceError> {
+                Ok(Some(DeviceMappedRegion {
+                    content: vec![0xCC; req.length],
+                    hint_addr: 0,
+                    prot: req.prot,
+                }))
+            }
+
+            fn close(&mut self, _ctx: &mut DeviceCloseContext) -> Result<(), DeviceError> {
+                Ok(())
+            }
+        }
+
+        let space = Arc::new(Mutex::new(MemoryAddressSpace::new()));
+        space
+            .lock()
+            .unwrap()
+            .register_region(MemoryRegion {
+                addr: 0x7F_0000_0000,
+                size: 0x3000,
+                perms: MemoryPerms::READ_EXEC,
+                mode: AllocationMode::Reserved,
+                usage: MemoryUsage::ELFImage,
+            })
+            .unwrap();
+        let mut rt = LinuxRuntime::with_address_space(Arc::clone(&space));
+        rt.mount_file("/data/map.bin", VirtFileSource::Bytes(vec![0x41, 0x42, 0x43, 0x44]))
+            .unwrap();
+        let factory: rundroid_driver::registry::DeviceFactory =
+            std::sync::Arc::new(|| Box::new(PatternDevice));
+        rt.mount_device("/dev/pattern", factory).unwrap();
+
+        let file_path = b"/data/map.bin\0".to_vec();
+        let file_fd = match rt.dispatch(
+            SYS_OPENAT, 0, file_path.as_ptr() as u64, 0, 0, 0, 0,
+            &mut bridge(move |_, _| Some(file_path.clone()), |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v as i32,
+            other => panic!("expected file fd, got {other:?}"),
+        };
+
+        let dev_path = b"/dev/pattern\0".to_vec();
+        let dev_fd = match rt.dispatch(
+            SYS_OPENAT, 0, dev_path.as_ptr() as u64, 0, 0, 0, 0,
+            &mut bridge(move |_, _| Some(dev_path.clone()), |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v as i32,
+            other => panic!("expected device fd, got {other:?}"),
+        };
+
+        let anon_addr = match rt.dispatch(
+            SYS_MMAP, 0, 0x1000, 3, MAP_ANONYMOUS as u64, u64::MAX, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected anonymous mmap address, got {other:?}"),
+        };
+        assert_eq!(anon_addr, 0x7F_0000_3000);
+
+        let file_written = std::cell::RefCell::new(Vec::<u8>::new());
+        let file_addr = match rt.dispatch(
+            SYS_MMAP, 0, 0x1000, 1, 0, file_fd as u64, 0,
+            &mut bridge(
+                |_, _| None,
+                |_addr, bytes| {
+                    file_written.borrow_mut().extend_from_slice(bytes);
+                    true
+                },
+                map_ok(),
+            ),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected file mmap address, got {other:?}"),
+        };
+        assert_eq!(file_written.into_inner(), vec![0x41, 0x42, 0x43, 0x44]);
+
+        let dev_written = std::cell::RefCell::new(Vec::<u8>::new());
+        let dev_addr = match rt.dispatch(
+            SYS_MMAP, 0, 0x1000, 3, 0, dev_fd as u64, 0,
+            &mut bridge(
+                |_, _| None,
+                |_addr, bytes| {
+                    dev_written.borrow_mut().extend_from_slice(bytes);
+                    true
+                },
+                map_ok(),
+            ),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected device mmap address, got {other:?}"),
+        };
+        assert_eq!(dev_written.into_inner(), vec![0xCC; 0x1000]);
+
+        assert!(anon_addr < file_addr && file_addr < dev_addr);
+        let guard = space.lock().unwrap();
+        assert_eq!(guard.find(anon_addr).unwrap().usage, MemoryUsage::AnonymousMmap);
+        assert_eq!(guard.find(file_addr).unwrap().usage, MemoryUsage::FileMmap);
+        assert_eq!(guard.find(dev_addr).unwrap().usage, MemoryUsage::DeviceMmap);
+    }
+
+    /// `munmap` 释放出的洞应当马上被后续 `mmap` 复用。
+    #[test]
+    fn regression_munmap_reuses_gap_for_mmap() {
+        let mut rt = LinuxRuntime::new();
+        let first = match rt.dispatch(
+            SYS_MMAP, 0, 0x2000, 3, MAP_ANONYMOUS as u64, u64::MAX, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected first mmap address, got {other:?}"),
+        };
+        let second = match rt.dispatch(
+            SYS_MMAP, 0, 0x1000, 3, MAP_ANONYMOUS as u64, u64::MAX, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected second mmap address, got {other:?}"),
+        };
+        assert!(second > first);
+
+        let unmap = rt.dispatch(
+            SYS_MUNMAP, first, 0x2000, 0, 0, 0, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        );
+        assert!(matches!(unmap, SyscallResult::Done(0)));
+        assert!(rt.address_space().lock().unwrap().find(first).is_none());
+
+        let reused = match rt.dispatch(
+            SYS_MMAP, 0, 0x2000, 3, MAP_ANONYMOUS as u64, u64::MAX, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected reused mmap address, got {other:?}"),
+        };
+        assert_eq!(reused, first);
+    }
+
+    /// `mprotect` 后共享地址空间里的权限视图必须同步更新。
+    #[test]
+    fn regression_mprotect_updates_shared_permission_view() {
+        let mut rt = LinuxRuntime::new();
+        let addr = match rt.dispatch(
+            SYS_MMAP, 0, 0x2000, 3, MAP_ANONYMOUS as u64, u64::MAX, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        ) {
+            SyscallResult::Done(v) => v,
+            other => panic!("expected mmap address, got {other:?}"),
+        };
+
+        let protect = rt.dispatch(
+            SYS_MPROTECT, addr + 0x1000, 0x1000, 1, 0, 0, 0,
+            &mut bridge(|_, _| None, |_, _| true, map_ok()),
+        );
+        assert!(matches!(protect, SyscallResult::Done(0)));
+
+        let space = rt.address_space();
+        let guard = space.lock().unwrap();
+        assert!(guard.find(addr).unwrap().perms.writable());
+        let protected = guard.find(addr + 0x1000).unwrap();
+        assert!(protected.perms.readable());
+        assert!(!protected.perms.writable());
+        assert!(!protected.perms.executable());
     }
 
     /// 路径冲突回归：已由 vfs::tests 覆盖，此处补一个端到端 syscall 路径测试。

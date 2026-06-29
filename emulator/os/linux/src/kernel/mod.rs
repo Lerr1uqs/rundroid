@@ -3,7 +3,7 @@
 //! 本模块定义 [`LinuxRuntime`] 类型本身（字段 + 构造 + 配置 API + 路径解析 + lifecycle），
 //! 各 OS 子系统域的语义方法以分文件 `impl LinuxRuntime` 形式落在：
 //! - [`fd_io`]：fd IO（read / read_at / write / ioctl / fstat / dup / dup3 / close）
-//! - [`mem`]：内存管理（alloc_mmap_addr / brk / munmap / device_mmap）
+//! - [`mem`]：内存管理（brk / 匿名与 fd-backed mmap 语义）
 //! - [`random`]：PRNG（getrandom_bytes）
 //!
 //! 所有 kernel 方法只产出数据／推进 OS 状态，**不接收**
@@ -19,6 +19,7 @@ pub use mem::MmapOutcome;
 
 use crate::fd::{Fd, FileDescriptorEntry, FileDescriptorTable};
 use crate::vfs::{VfsMountTable, VfsNode};
+use rundroid_memory::MemoryAddressSpace;
 use rundroid_driver::builtin::{null_factory, zero_factory};
 use rundroid_driver::context::DeviceOpenContext;
 use rundroid_driver::mapper::VirtFileSource;
@@ -38,10 +39,10 @@ pub struct LinuxRuntime {
     pub device_registry: DeviceRegistry,
     /// 文件描述符表。
     pub fds: FileDescriptorTable,
-    /// mmap 的"下一次返回地址"。私有：仅 kernel mem 域推进。
-    next_mmap: u64,
     /// brk 当前值。私有：仅 kernel mem 域读取。
     brk: u64,
+    /// 共享 guest 地址空间 authority。
+    address_space: Arc<Mutex<MemoryAddressSpace>>,
     /// 收集到的 stdout 字节（write(1/2) 语义落地处）。
     pub stdout: Vec<u8>,
     /// exit 请求的退出码。
@@ -57,23 +58,39 @@ impl LinuxRuntime {
     /// 创建新的运行时实例，预装 builtin 设备。
     /// 不挂载 telemetry router（测试场景）。带 telemetry 的路径用 [`with_telemetry`]。
     pub fn new() -> Self {
-        Self::build(None)
+        Self::build(Arc::new(Mutex::new(MemoryAddressSpace::new())), None)
     }
 
     /// 创建具有 telemetry 的运行时实例。
     pub fn with_telemetry(router: TelemetryRouter) -> Self {
-        Self::build(Some(router))
+        Self::build(Arc::new(Mutex::new(MemoryAddressSpace::new())), Some(router))
+    }
+
+    /// 创建复用共享 guest 地址空间的运行时。
+    pub fn with_address_space(address_space: Arc<Mutex<MemoryAddressSpace>>) -> Self {
+        Self::build(address_space, None)
+    }
+
+    /// 创建带 telemetry 且复用共享 guest 地址空间的运行时。
+    pub fn with_address_space_and_telemetry(
+        address_space: Arc<Mutex<MemoryAddressSpace>>,
+        router: TelemetryRouter,
+    ) -> Self {
+        Self::build(address_space, Some(router))
     }
 
     /// 内部构造：统一初始化逻辑。
-    fn build(telemetry: Option<TelemetryRouter>) -> Self {
+    fn build(
+        address_space: Arc<Mutex<MemoryAddressSpace>>,
+        telemetry: Option<TelemetryRouter>,
+    ) -> Self {
         let rng_seed = Arc::new(Mutex::new(0x9E37_79B9_7F4A_7C15u64));
         let mut rt = Self {
             vfs: VfsMountTable::new(),
             device_registry: DeviceRegistry::new(),
             fds: FileDescriptorTable::new(),
-            next_mmap: 0x7F_0000_0000,
             brk: 0x7E_0000_0000,
+            address_space,
             stdout: Vec::new(),
             exit_code: None,
             rng_seed,
@@ -174,6 +191,11 @@ impl LinuxRuntime {
         if let Some(router) = self.telemetry.as_mut() {
             router.emit(event);
         }
+    }
+
+    /// 共享地址空间 authority。
+    pub fn address_space(&self) -> Arc<Mutex<MemoryAddressSpace>> {
+        Arc::clone(&self.address_space)
     }
 
     /// 解析虚拟路径并打开（VFS → fd 表），推进 OS 状态返回新 fd。

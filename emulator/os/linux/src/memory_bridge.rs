@@ -1,7 +1,8 @@
 //! syscall 层访问 guest 目标侧内存的唯一抽象边界。
 //!
 //! [`MemoryBridge`] 只暴露 **读 / 写 / 映射** 三类能力，底层由装配层（case-runner /
-//! Python binding）适配到 engine 的 `GuestCPU::mem_read` / `mem_write` / `mem_map`。
+//! Python binding）适配到 engine 的 `GuestCPU::mem_read` / `mem_write` / `mem_map` /
+//! `mem_protect` / `mem_unmap`。
 //!
 //! 刻意保持窄接口：不包含寄存器访问（`reg_read` / `reg_write`）、`stop()` 等
 //! hook 视图能力——那些属于本 crate 之外的 backend 关注点，syscall 层不需要。
@@ -31,4 +32,10 @@ pub trait MemoryBridge {
     /// `prot` 为 POSIX `PROT_*` 位掩码（READ=1 / WRITE=2 / EXEC=4）。
     /// 失败（地址已占用等）时返回 `false`，调用方据此返回 `EFAULT`。
     fn map(&mut self, addr: u64, len: usize, prot: i32) -> bool;
+
+    /// 修改 guest 区间权限。
+    fn protect(&mut self, addr: u64, len: usize, prot: i32) -> bool;
+
+    /// 释放 guest 区间。
+    fn unmap(&mut self, addr: u64, len: usize) -> bool;
 }

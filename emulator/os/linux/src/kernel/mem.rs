@@ -1,40 +1,63 @@
 //! 内存管理语义方法（kernel 域）。
 //!
-//! `impl LinuxRuntime` 的内存管理：alloc_mmap_addr / brk / munmap / device_mmap。
-//! 地址分配只推进 `next_mmap` 状态，**不碰目标侧映射**——目标侧 mem_map 由
-//! syscall 层经 [`crate::memory_bridge::MemoryBridge::map`] 落地。
+//! `impl LinuxRuntime` 的内存管理只产出 mmap 语义请求与 backing 内容。
+//! guest 具体地址选择、冲突检测、materialize 统一由共享
+//! [`MemoryAddressSpace`](rundroid_memory::MemoryAddressSpace) authority 负责。
 
 use super::fd_io::FdOpError;
 use super::LinuxRuntime;
 use crate::fd::{mmap_from_fd, Fd};
+use rundroid_memory::{DynamicArena, MemoryPerms, MemoryUsage};
 
-/// device-backed mmap 的 kernel 结果：地址 + 初始内容 + prot。
-///
-/// syscall 层据此完成目标侧 map + 内容显式回写
-/// （先 [`MemoryBridge::map`]，再 [`MemoryBridge::write`]，不依赖 map 的隐式写）。
-///
-/// [`MemoryBridge::map`]: crate::memory_bridge::MemoryBridge::map
-/// [`MemoryBridge::write`]: crate::memory_bridge::MemoryBridge::write
+/// 统一的 mmap 语义请求。
+#[derive(Debug, Clone)]
+pub struct MmapRequest {
+    /// 请求长度。
+    pub length: usize,
+    /// POSIX `PROT_*` 位掩码。
+    pub prot: i32,
+    /// guest hint 地址（0 表示无 hint）。
+    pub hint_addr: u64,
+    /// 统一动态分配 arena。
+    pub arena: DynamicArena,
+    /// 账本权限视图。
+    pub perms: MemoryPerms,
+    /// usage/source 元数据。
+    pub usage: MemoryUsage,
+    /// 可选初始内容（fd/device-backed mmap）。
+    pub content: Vec<u8>,
+}
+
+/// device/file mmap 的语义结果。
 #[derive(Debug)]
 pub struct MmapOutcome {
-    /// 映射起始地址（设备 hint 或 runtime 分配）。
+    /// 设备建议地址（0 表示交给共享 authority 动态找洞）。
     pub addr: u64,
-    /// 设备返回的初始内容字节。
+    /// backing 内容。
     pub content: Vec<u8>,
-    /// 区域权限（POSIX `PROT_*` 位掩码）。
+    /// POSIX `PROT_*` 位掩码。
     pub prot: i32,
+    /// usage/source 元数据。
+    pub usage: MemoryUsage,
 }
 
 impl LinuxRuntime {
-    /// 为匿名 mmap 分配地址。
-    ///
-    /// bootstrap 使用固定 1MiB 步长推进 `next_mmap`（与请求长度无关），
-    /// 返回分配到的地址。`length` 参数保留供未来按页对齐分配使用。
-    /// 纯状态推进——目标侧映射由 syscall 层经 `MemoryBridge::map` 落地。
-    pub fn alloc_mmap_addr(&mut self, _length: usize) -> u64 {
-        let addr = self.next_mmap;
-        self.next_mmap = self.next_mmap.checked_add(0x10_0000).unwrap_or(addr);
-        addr
+    /// 构造匿名 mmap 请求。
+    pub fn anonymous_mmap_request(
+        &mut self,
+        hint_addr: u64,
+        length: usize,
+        prot: i32,
+    ) -> MmapRequest {
+        MmapRequest {
+            length,
+            prot,
+            hint_addr,
+            arena: DynamicArena::new(0x7F_0000_0000, 0x7F_F000_0000),
+            perms: MemoryPerms::from_flags((prot & 1) != 0, (prot & 2) != 0, (prot & 4) != 0),
+            usage: MemoryUsage::AnonymousMmap,
+            content: Vec::new(),
+        }
     }
 
     /// brk 当前值（bootstrap：固定返回当前 brk，不增长）。
@@ -42,22 +65,9 @@ impl LinuxRuntime {
         self.brk
     }
 
-    /// munmap：bootstrap 空实现（恒成功，返回 0）。
-    pub fn munmap(&mut self, _addr: u64, _length: usize) -> isize {
-        0
-    }
-
-    /// device-backed mmap：取设备 region 并决定地址。
-    ///
-    /// 推进 `next_mmap`（当 region 无 hint 时），返回 [`MmapOutcome`]。
-    /// **不碰目标侧内存**——内容字节由 syscall 层经 `MemoryBridge` 显式 map + write 落地。
-    ///
-    /// 返回：
-    /// - `Ok(Some)`：设备支持 mmap，返回 region（syscall 映射成功）。
-    /// - `Ok(None)`：设备/文件不支持 mmap（syscall 映射 ENOTTY）。
-    /// - `Err(BadFd)`：fd 无效（syscall 映射 EBADF）。
-    /// - `Err(Io(_))`：mmap 底座错误（syscall 映射 EINVAL）。
-    pub fn device_mmap(
+    /// fd-backed mmap：普通文件与设备都在这里产出 backing 语义，
+    /// 由 syscall 层完成统一地址分配。
+    pub fn fd_mmap(
         &mut self,
         fd: Fd,
         length: usize,
@@ -66,25 +76,18 @@ impl LinuxRuntime {
         flags: i32,
     ) -> Result<Option<MmapOutcome>, FdOpError> {
         let entry = self.fds.lookup(fd).ok_or(FdOpError::BadFd)?;
+        let usage = match entry.kind {
+            crate::fd::FdKind::File => MemoryUsage::FileMmap,
+            crate::fd::FdKind::Device => MemoryUsage::DeviceMmap,
+            _ => return Ok(None),
+        };
         match mmap_from_fd(entry, length, offset, prot, flags) {
-            Ok(Some(region)) => {
-                let addr = if region.hint_addr != 0 {
-                    region.hint_addr
-                } else {
-                    // 无 hint：按 region 内容长度推进 next_mmap（与匿名 1MiB 步长不同）。
-                    let a = self.next_mmap;
-                    self.next_mmap = self
-                        .next_mmap
-                        .checked_add((region.content.len() as u64).max(0x1000))
-                        .unwrap_or(a);
-                    a
-                };
-                Ok(Some(MmapOutcome {
-                    addr,
-                    content: region.content,
-                    prot: region.prot,
-                }))
-            }
+            Ok(Some(region)) => Ok(Some(MmapOutcome {
+                addr: region.hint_addr,
+                content: region.content,
+                prot: region.prot,
+                usage,
+            })),
             Ok(None) => Ok(None),
             Err(e) => Err(FdOpError::Io(e)),
         }
@@ -95,14 +98,16 @@ impl LinuxRuntime {
 mod tests {
     use super::*;
 
-    /// alloc_mmap_addr 地址递增（1MiB 步长），且不碰目标侧内存。
+    /// anonymous mmap 请求携带共享 authority 所需的 arena/perms/usage 元数据。
     #[test]
-    fn alloc_mmap_addr_increments_and_pure_state() {
+    fn anonymous_mmap_request_has_shared_authority_metadata() {
         let mut rt = LinuxRuntime::new();
-        let a1 = rt.alloc_mmap_addr(0x1000);
-        let a2 = rt.alloc_mmap_addr(0x1000);
-        assert!(a1 >= 0x7F_0000_0000, "首地址应在 mmap 区间");
-        assert_eq!(a2, a1 + 0x10_0000, "步长应为 1MiB");
+        let req = rt.anonymous_mmap_request(0, 0x1000, 3);
+        assert_eq!(req.length, 0x1000);
+        assert_eq!(req.usage, MemoryUsage::AnonymousMmap);
+        assert_eq!(req.arena.start, 0x7F_0000_0000);
+        assert!(req.perms.readable());
+        assert!(req.perms.writable());
     }
 
     /// brk 返回固定当前值（bootstrap 不增长）。
@@ -112,19 +117,12 @@ mod tests {
         assert_eq!(rt.brk(), 0x7E_0000_0000);
     }
 
-    /// munmap 空实现恒返回 0。
+    /// fd_mmap 对无效 fd 返回 BadFd。
     #[test]
-    fn munmap_is_noop_success() {
-        let mut rt = LinuxRuntime::new();
-        assert_eq!(rt.munmap(0xdead_beef, 0x1000), 0);
-    }
-
-    /// device_mmap 对无效 fd 返回 BadFd。
-    #[test]
-    fn device_mmap_bad_fd_returns_bad_fd() {
+    fn fd_mmap_bad_fd_returns_bad_fd() {
         let mut rt = LinuxRuntime::new();
         assert!(matches!(
-            rt.device_mmap(999, 0x1000, 0, 3, 0),
+            rt.fd_mmap(999, 0x1000, 0, 3, 0),
             Err(FdOpError::BadFd)
         ));
     }

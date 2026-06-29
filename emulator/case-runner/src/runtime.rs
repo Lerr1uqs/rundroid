@@ -20,7 +20,10 @@ use rundroid_elf_loader::{
 use rundroid_elf_parser::{ElfCrateParser, ElfParser, ParseInput, ParsedElf};
 use rundroid_jni::{AndroidVM, JavaVMABI, JNIEnvABI, JniRegistry, ObjectStore, RefTable};
 use rundroid_linux::{LinuxRuntime, MemoryBridge, SyscallResult};
-use rundroid_memory::{MemoryError, RegionTracker};
+use rundroid_memory::{
+    AllocationRequest, DynamicArena, MemoryAddressSpace, MemoryError, MemoryMaterializer,
+    MemoryPerms as AddressSpacePerms, MemoryUsage, RegionTracker, PAGE_SIZE,
+};
 use rundroid_telemetry::{EventSink, TelemetryEvent, TelemetryEventKind, TelemetryMode, TelemetryRouter};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -85,6 +88,7 @@ impl EventSink for CollectingSink {
 pub struct GuestRuntime {
     pub engine: Box<dyn Engine>,
     pub regions: RegionTracker,
+    pub address_space: Arc<Mutex<MemoryAddressSpace>>,
     /// LinuxRuntime 用 `Arc<Mutex<>>` 包装，因为 syscall hook 闭包也要访问它。
     /// 对外暴露的 API 通过 method 转发到内部 LinuxRuntime，调用方无感。
     pub linux_inner: Arc<Mutex<LinuxRuntime>>,
@@ -110,8 +114,6 @@ pub struct GuestRuntime {
     pub java_vm_pointer: Option<u64>,
     /// JNI trampoline hook 的 telemetry sink（run 后取出事件）。
     pub jni_telemetry: Option<Arc<Mutex<Vec<(String, TelemetryEventKind)>>>>,
-    /// reserve 游标：bump 分配镜像基址。
-    reserve_cursor: u64,
     /// sentinel/stack 是否已经映射（复用避免重叠 mem_map）。
     trampoline_mapped: bool,
 }
@@ -170,6 +172,18 @@ impl<'a> MemoryBridge for CpuMemoryBridge<'a> {
         let perms = MemPerms::from_flags(read, write, exec);
         self.cpu.mem_map(addr, len, perms).is_ok()
     }
+
+    fn protect(&mut self, addr: u64, len: usize, prot: i32) -> bool {
+        let read = (prot & 1) != 0;
+        let write = (prot & 2) != 0;
+        let exec = (prot & 4) != 0;
+        let perms = MemPerms::from_flags(read, write, exec);
+        self.cpu.mem_protect(addr, len, perms).is_ok()
+    }
+
+    fn unmap(&mut self, addr: u64, len: usize) -> bool {
+        self.cpu.mem_unmap(addr, len).is_ok()
+    }
 }
 
 impl SyscallHook for SyscallDispatcher {
@@ -207,6 +221,7 @@ impl GuestRuntime {
     pub fn assemble(config: RuntimeConfig) -> Result<Self, RuntimeAssemblyError> {
         let backend = UnicornBackend::new();
         let mut engine = backend.open(config.arch)?;
+        let address_space = Arc::new(Mutex::new(MemoryAddressSpace::new()));
         let sink = CollectingSink::default();
         let router = match config.telemetry {
             TelemetryMode::Disabled => TelemetryRouter::disabled(),
@@ -215,7 +230,7 @@ impl GuestRuntime {
 
         // syscall hook 与 LinuxRuntime 之间通过 Rc<RefCell<>> 共享。
         // hook 被 install_syscall_hook 注册后，每次 svc 都会回调到这个 LinuxRuntime。
-        let linux = Arc::new(Mutex::new(LinuxRuntime::new()));
+        let linux = Arc::new(Mutex::new(LinuxRuntime::with_address_space(Arc::clone(&address_space))));
         engine.install_syscall_hook(Box::new(SyscallDispatcher {
             linux: Arc::clone(&linux),
         }))?;
@@ -226,18 +241,28 @@ impl GuestRuntime {
         // 这个区段是 bootstrap case manifest 的公开契约。
         const SCRATCH_ADDR: u64 = 0x800_000;
         const SCRATCH_SIZE: usize = 0x10_0000;
-        engine.mem_map(SCRATCH_ADDR, SCRATCH_SIZE, MemPerms::READ_WRITE)?;
-
         let mut regions = RegionTracker::new();
-        regions.register(
-            SCRATCH_ADDR,
-            SCRATCH_SIZE as u64,
-            rundroid_memory::RegionOrigin::RuntimeScratch,
-        )?;
+        {
+            let mut materializer = EngineMemoryMaterializer {
+                engine: engine.as_mut(),
+                regions: &mut regions,
+            };
+            address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    SCRATCH_ADDR,
+                    SCRATCH_SIZE as u64,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_WRITE,
+                    MemoryUsage::Scratch,
+                ),
+                &mut materializer,
+            )?;
+        }
 
         Ok(Self {
             engine,
             regions,
+            address_space,
             linux_inner: linux,
             allocator: IdAllocator::new(),
             router,
@@ -253,8 +278,6 @@ impl GuestRuntime {
             jni_env_pointer: None,
             java_vm_pointer: None,
             jni_telemetry: None,
-            // 镜像装载起点：1 GiB 处，远离 stack/TLS 高端。
-            reserve_cursor: 0x4000_0000,
             trampoline_mapped: false,
         })
     }
@@ -287,11 +310,23 @@ impl GuestRuntime {
         let env_abi = JNIEnvABI::new(JNI_ENV_BASE);
         let vm_abi = JavaVMABI::new(env_abi.env_ptr() + env_abi.total_size() as u64);
 
-        // 1. 一次性映射整块 JNIEnv + JavaVM 区域到 guest 内存
         let total_map = env_abi.total_size() + vm_abi.total_size();
-        self.engine
-            .mem_map(env_abi.env_ptr(), total_map, MemPerms::READ_EXEC)
-            .map_err(RuntimeAssemblyError::Backend)?;
+        {
+            let mut materializer = EngineMemoryMaterializer {
+                engine: self.engine.as_mut(),
+                regions: &mut self.regions,
+            };
+            self.address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    env_abi.env_ptr(),
+                    total_map as u64,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_EXEC,
+                    MemoryUsage::JNIEnv,
+                ),
+                &mut materializer,
+            )?;
+        }
 
         // 2. 写入 JNIEnv 表 + JavaVM 表（含 invoke table + 各自 trampoline NOP）。
         //    mem_write 闭包借 &mut engine，写完即释放，后续可继续用 self.engine。
@@ -380,8 +415,10 @@ impl GuestRuntime {
         // link_root 在 root 上一次性 link 整张图（schedule 会拓扑遍历 deps）。
         let report = {
             let Self {
+                address_space,
                 engine,
                 graph,
+                regions,
                 router,
                 ..
             } = self;
@@ -389,8 +426,10 @@ impl GuestRuntime {
             // 而 resolve 又要读 graph。运行期是顺序的，借用裸指针绕过编译期借用检查。
             let graph_ptr: *mut ModuleGraph = graph;
             let mut link_ctx = LinkCtxAdapter {
+                space: address_space,
                 engine: engine.as_mut(),
                 graph_ptr,
+                regions,
                 router,
             };
             DefaultLinker::new().link_root(&mut link_ctx, graph, root_id)?
@@ -422,20 +461,19 @@ impl GuestRuntime {
         }
 
         let module_id = self.allocator.module();
-        let module_segments: Vec<rundroid_elf_loader::MappedSegmentInfo>;
         {
             let Self {
+                address_space,
                 engine,
                 regions,
                 router,
-                reserve_cursor,
                 ..
             } = self;
             let mut ctx = LoadCtxAdapter {
+                space: address_space,
                 engine: engine.as_mut(),
                 regions,
                 router,
-                next_reserve: reserve_cursor,
             };
             let module = DefaultLoader::new().load(
                 &mut ctx,
@@ -446,21 +484,7 @@ impl GuestRuntime {
                     module_id,
                 },
             )?;
-            module_segments = module.segments.clone();
             self.graph.insert(module, parsed.dynamic.soname.clone());
-        }
-
-        // review finding 3：footprint 装载时整块按 RWX 映射，
-        // 这里按 PT_LOAD 的精确 p_flags 收紧权限，避免 RWX 掩盖错误。
-        // 失败只记 telemetry 不阻塞装载——某些 backend 可能不支持 mem_protect。
-        for seg in &module_segments {
-            let p = MemPerms::from_flags(seg.perms.read, seg.perms.write, seg.perms.execute);
-            if let Err(_e) = self.engine.mem_protect(seg.guest_addr, seg.size as usize, p) {
-                self.router.emit(&TelemetryEvent::new(
-                    "mem.protect_failed",
-                    TelemetryEventKind::Memory,
-                ));
-            }
         }
 
         Ok(module_id)
@@ -512,7 +536,7 @@ impl GuestRuntime {
     /// 纯计算函数（如 rd_add）可以直接跑通；
     /// 依赖 syscall 的函数需要等 syscall hook 接入后才能跑。
     pub fn call_export(&mut self, entry_addr: u64, args: &[u64]) -> Result<u64, BackendError> {
-        use rundroid_backend::{Arm64Reg, MemPerms};
+        use rundroid_backend::Arm64Reg;
 
         // sentinel + stack 只在第一次调用时映射；后续复用。
         // 否则在同一 runtime 内多次 call 会触发重叠 mem_map。
@@ -521,8 +545,30 @@ impl GuestRuntime {
         const STACK_BASE: u64 = 0x7F_E000_0000;
         const STACK_TOP: u64 = STACK_BASE + 0x10_0000;
         if !self.trampoline_mapped {
-            self.engine.mem_map(SENTINEL_ADDR, 0x1000, MemPerms::READ_EXEC)?;
-            self.engine.mem_map(STACK_BASE, 0x10_0000, MemPerms::READ_WRITE)?;
+            let mut materializer = EngineMemoryMaterializer {
+                engine: self.engine.as_mut(),
+                regions: &mut self.regions,
+            };
+            self.address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    SENTINEL_ADDR,
+                    0x1000,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_EXEC,
+                    MemoryUsage::Trampoline,
+                ),
+                &mut materializer,
+            ).map_err(|e| BackendError::Emulation(Box::leak(format!("address space allocate sentinel failed: {e}").into_boxed_str())))?;
+            self.address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    STACK_BASE,
+                    0x10_0000,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_WRITE,
+                    MemoryUsage::Stack,
+                ),
+                &mut materializer,
+            ).map_err(|e| BackendError::Emulation(Box::leak(format!("address space allocate stack failed: {e}").into_boxed_str())))?;
             // ARM64 `ret` = 0xD65F03C0，小端字节序。
             self.engine.mem_write(SENTINEL_ADDR, &[0xC0, 0x03, 0x5F, 0xD6])?;
             self.trampoline_mapped = true;
@@ -639,45 +685,62 @@ impl GuestRuntime {
 }
 
 struct LoadCtxAdapter<'a> {
+    space: &'a Arc<Mutex<MemoryAddressSpace>>,
     engine: &'a mut dyn Engine,
     regions: &'a mut RegionTracker,
     router: &'a mut TelemetryRouter,
-    next_reserve: &'a mut u64,
 }
 
 impl<'a> LoadCtx for LoadCtxAdapter<'a> {
     fn reserve_image_space(&mut self, size: u64, align: u64) -> Result<u64, MemoryError> {
-        // 一次性映射整个镜像 footprint。
-        // 这样做有两个原因：
-        // 1. Unicorn 要求 mem_map 的 addr/size 都 page 对齐；
-        //    ELF 段是 footprint 内的子区间，逐段映射容易触发对齐失败或段间 page 重叠。
-        // 2. ELF 段经常共享同一 page（例如 RX 段末尾 + RW 段开头的边界 page），
-        //    Unicorn 拒绝重叠 mem_map，因此必须把整个 footprint 作为一整块映射。
-        //
-        // 权限：用 RWX 全开。精确的段级权限切换在 RELRO 写回之后进行。
-        let aligned = align_up(size, 0x1000);
-        let base = align_up(*self.next_reserve, align.max(0x1000));
-        self.engine
-            .mem_map(base, aligned as usize, MemPerms::ALL)
-            .map_err(|_| MemoryError::InvalidSize {
-                size: aligned,
-                reason: "backend mem_map rejected footprint",
-            })?;
-        self.regions.register(
-            base,
-            aligned,
-            rundroid_memory::RegionOrigin::ELFSegment,
+        let mut materializer = EngineMemoryMaterializer {
+            engine: self.engine,
+            regions: self.regions,
+        };
+        let region = self.space.lock().unwrap().allocate(
+            AllocationRequest::dynamic(
+                size,
+                align.max(PAGE_SIZE),
+                AddressSpacePerms::ALL,
+                MemoryUsage::ELFImage,
+                DynamicArena::new(0x4000_0000, 0x7F00_0000_0000),
+                0x4000_0000,
+            ),
+            &mut materializer,
         )?;
-        *self.next_reserve = base + aligned;
-        Ok(base)
+        Ok(region.addr)
     }
     fn map_segment(&mut self, spec: SegmentMapSpec<'_>) -> Result<MappedSegment, MemoryError> {
-        // footprint 已经在 reserve_image_space 里整块映射 + 记账，
-        // 这里不再调用 backend.mem_map，也不重复注册 region（会触发 Overlap）。
         Ok(MappedSegment {
             guest_addr: spec.guest_addr,
             size: spec.size,
         })
+    }
+    fn protect_segment(
+        &mut self,
+        guest_addr: u64,
+        size: u64,
+        perms: AddressSpacePerms,
+        _usage: MemoryUsage,
+    ) -> Result<(), MemoryError> {
+        let start = align_down(guest_addr);
+        let end = align_up(
+            guest_addr
+                .checked_add(size)
+                .ok_or(MemoryError::Overflow {
+                    addr: guest_addr,
+                    size,
+                })?,
+            PAGE_SIZE,
+        );
+        let mut materializer = EngineMemoryMaterializer {
+            engine: self.engine,
+            regions: self.regions,
+        };
+        self.space
+            .lock()
+            .unwrap()
+            .protect(start, end - start, perms, &mut materializer)
     }
     fn write_bytes(&mut self, guest_addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.engine
@@ -695,6 +758,67 @@ impl<'a> LoadCtx for LoadCtxAdapter<'a> {
     }
 }
 
+struct EngineMemoryMaterializer<'a> {
+    engine: &'a mut dyn Engine,
+    regions: &'a mut RegionTracker,
+}
+
+impl<'a> MemoryMaterializer for EngineMemoryMaterializer<'a> {
+    fn map(
+        &mut self,
+        addr: u64,
+        size: u64,
+        perms: AddressSpacePerms,
+        usage: MemoryUsage,
+    ) -> Result<(), MemoryError> {
+        self.engine
+            .mem_map(addr, size as usize, MemPerms::from_flags(perms.readable(), perms.writable(), perms.executable()))
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "map",
+                addr,
+                size,
+                reason: e.to_string(),
+            })?;
+        self.regions.register(addr, size, origin_from_usage(usage))?;
+        Ok(())
+    }
+
+    fn protect(&mut self, addr: u64, size: u64, perms: AddressSpacePerms) -> Result<(), MemoryError> {
+        self.engine
+            .mem_protect(
+                addr,
+                size as usize,
+                MemPerms::from_flags(perms.readable(), perms.writable(), perms.executable()),
+            )
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "protect",
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+
+    fn unmap(&mut self, addr: u64, size: u64) -> Result<(), MemoryError> {
+        self.engine
+            .mem_unmap(addr, size as usize)
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "unmap",
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+}
+
+fn origin_from_usage(usage: MemoryUsage) -> rundroid_memory::RegionOrigin {
+    match usage {
+        MemoryUsage::ELFImage | MemoryUsage::Relro => rundroid_memory::RegionOrigin::ELFSegment,
+        MemoryUsage::Stack => rundroid_memory::RegionOrigin::Stack,
+        MemoryUsage::Tls => rundroid_memory::RegionOrigin::TLS,
+        _ => rundroid_memory::RegionOrigin::RuntimeScratch,
+    }
+}
+
 /// LinkContext 适配器。
 ///
 /// 由于 [`DefaultLinker::link_root`] 同时持有 `&mut ModuleGraph` 和
@@ -702,8 +826,10 @@ impl<'a> LoadCtx for LoadCtxAdapter<'a> {
 /// 这里用裸指针让两者"逻辑上"不冲突——
 /// 运行期 link_root 是顺序调用，不会真的并发访问 graph。
 struct LinkCtxAdapter<'a> {
+    space: &'a Arc<Mutex<MemoryAddressSpace>>,
     engine: &'a mut dyn Engine,
     graph_ptr: *mut ModuleGraph,
+    regions: &'a mut RegionTracker,
     router: &'a mut TelemetryRouter,
 }
 
@@ -731,12 +857,17 @@ impl<'a> LinkCtx for LinkCtxAdapter<'a> {
         let Some(relro) = m.relro else {
             return Ok(());
         };
-        // RELRO 切只读：写完 GOT 后禁止修改。
-        let range = relro.end - relro.start;
-        let perms = MemPerms::READ;
-        self.engine
-            .mem_protect(relro.start, range as usize, perms)
-            .map_err(|_| MemoryError::NotMapped { addr: relro.start })?;
+        // RELRO 切只读：写完 GOT 后禁止修改，并同步共享地址空间账本。
+        let start = align_down(relro.start);
+        let end = align_up(relro.end, PAGE_SIZE);
+        let mut materializer = EngineMemoryMaterializer {
+            engine: self.engine,
+            regions: self.regions,
+        };
+        self.space
+            .lock()
+            .unwrap()
+            .protect(start, end - start, AddressSpacePerms::READ, &mut materializer)?;
         self.router.emit(&TelemetryEvent::new(
             "relro.protect",
             TelemetryEventKind::Memory,
@@ -754,4 +885,8 @@ fn align_up(v: u64, a: u64) -> u64 {
     } else {
         (v + a - 1) & !(a - 1)
     }
+}
+
+fn align_down(v: u64) -> u64 {
+    v & !(PAGE_SIZE - 1)
 }

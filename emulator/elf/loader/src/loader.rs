@@ -17,6 +17,7 @@ use crate::model::{
 use crate::tls::extract_tls_template;
 use rundroid_elf_parser::model::{DynSymbol, SymbolBinding, SymbolVisibility};
 use rundroid_elf_parser::ParsedElf;
+use rundroid_memory::{MemoryPerms, MemoryUsage};
 use rundroid_telemetry::{TelemetryEvent, TelemetryEventKind};
 
 /// ARM64 page size。Unicorn 与 Android bionic 都按 4KiB 算。
@@ -61,8 +62,26 @@ impl ElfLoader for DefaultLoader {
         ));
 
         // 逐段映射 + 写入。段间不重叠由有效 ELF 保证。
+        //
+        // 这里故意先把所有段内容都写完，再统一做权限收紧。
+        // backend `mem_protect` 是按页生效的；若两个 segment 共用同一页，
+        // 边写边收紧会让后续 segment 写入撞上已变只读的共享页。
         for seg in &image.segments {
             map_one_segment(ctx, seg, load_bias, request.bytes)?;
+        }
+        for seg in &image.segments {
+            let guest_addr = load_bias + seg.vaddr;
+            ctx.protect_segment(
+                guest_addr,
+                seg.memsz,
+                MemoryPerms::from_flags(seg.perms.read, seg.perms.write, seg.perms.execute),
+                MemoryUsage::ELFImage,
+            )
+            .map_err(|source| ElfLoadError::SegmentMap {
+                addr: guest_addr,
+                size: seg.memsz,
+                source,
+            })?;
         }
 
         let exports = build_exports(image, load_bias);

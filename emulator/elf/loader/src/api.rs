@@ -9,7 +9,7 @@ use crate::error::ElfLoadError;
 use crate::model::LoadedModule;
 use rundroid_elf_parser::model::SegmentPerms;
 use rundroid_elf_parser::ParsedElf;
-use rundroid_memory::MemoryError;
+use rundroid_memory::{MemoryError, MemoryPerms, MemoryUsage};
 use rundroid_telemetry::TelemetryEvent;
 
 /// loader 抽象。
@@ -41,14 +41,22 @@ pub struct LoadRequest<'a> {
 #[allow(unused_variables)]
 pub trait LoadContext {
     /// 在 guest 地址空间里预留一段连续空间并返回其起始地址。
-    /// 实现负责保证返回的区间与已映射区不重叠。
-    /// 注意：这里只"占位 + 记账"，不一定要立刻 `mem_map`——
-    /// 真正的映射在 [`Self::map_segment`] 中按段进行。
+    /// 实现负责通过共享 guest 地址空间 authority 完成选址与 eager materialize。
     fn reserve_image_space(&mut self, size: u64, align: u64) -> Result<u64, MemoryError>;
 
     /// 按 spec 映射一个段到 guest 地址空间。
-    /// 实现负责调用 backend `mem_map` 并更新 region 账本。
+    /// footprint 已在 [`Self::reserve_image_space`] 中 materialize；
+    /// 这里主要用于段级权限视图与 telemetry。
     fn map_segment(&mut self, spec: SegmentMapSpec<'_>) -> Result<MappedSegment, MemoryError>;
+
+    /// 更新已预留镜像 footprint 的权限视图。
+    fn protect_segment(
+        &mut self,
+        guest_addr: u64,
+        size: u64,
+        perms: MemoryPerms,
+        usage: MemoryUsage,
+    ) -> Result<(), MemoryError>;
 
     /// 向 guest 地址写入字节。
     fn write_bytes(&mut self, guest_addr: u64, bytes: &[u8]) -> Result<(), MemoryError>;

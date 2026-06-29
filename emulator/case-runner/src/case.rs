@@ -153,12 +153,15 @@ pub fn run_case(
         stdout_utf8_preview: stdout_preview,
         error,
     };
-    let backend: BackendInfo = backend_info_from(
-        Arch::Arm64,
-        BackendKind::Unicorn,
-        &rt.regions,
-        exit_code,
-    );
+    let backend: BackendInfo = {
+        let space = rt.address_space.lock().unwrap();
+        backend_info_from(
+            Arch::Arm64,
+            BackendKind::Unicorn,
+            space.regions(),
+            exit_code,
+        )
+    };
     let events = rt.take_events();
     Ok(Artifacts {
         result,

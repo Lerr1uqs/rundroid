@@ -54,7 +54,10 @@ use rundroid_jni::{
 };
 use rundroid_jni_trampoline::JniTrampolineHook;
 use rundroid_linux::{LinuxRuntime, MemoryBridge, SyscallResult};
-use rundroid_memory::MemoryError;
+use rundroid_memory::{
+    AllocationRequest, DynamicArena, MemoryAddressSpace, MemoryError, MemoryMaterializer,
+    MemoryPerms as AddressSpacePerms, MemoryUsage, PAGE_SIZE,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -299,6 +302,7 @@ impl PythonShimAdapter {
 struct PyEmulatorBridge {
     engine: EngineHolder,
     linux: Arc<Mutex<LinuxRuntime>>,
+    address_space: Arc<Mutex<MemoryAddressSpace>>,
     /// 共享模块 ID 分配器。
     ///
     /// 同一个 Python Emulator 允许连续 `load()` 多个不同模块，
@@ -306,12 +310,6 @@ struct PyEmulatorBridge {
     /// 若每次 `load()` 都新建分配器，会重复生成 `ModuleId(1)`，
     /// 使 `ModuleGraph` 中后插入模块覆盖先前模块。
     module_id_alloc: ModuleIdAllocator,
-    /// ELF 镜像保留区游标。
-    ///
-    /// Python 绑定层允许同一个 Emulator 连续 `load()` 多个 so，
-    /// 因此镜像基址必须来自同一条 bump 分配游标。
-    /// 若每次 `load()` 都从固定地址重新开始，第二个模块会与第一个模块重叠映射。
-    reserve_cursor: u64,
     graph: ModuleGraph,
     trampoline_mapped: bool,
     /// Android VM — class / method / field / object 的 canonical authority。
@@ -361,7 +359,9 @@ impl PyEmulatorBridge {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
             })?;
 
-        let mut linux = LinuxRuntime::new();
+        let address_space = Arc::new(Mutex::new(MemoryAddressSpace::new()));
+
+        let mut linux = LinuxRuntime::with_address_space(Arc::clone(&address_space));
         linux.seed_rng(seed);
 
         let linux = Arc::new(Mutex::new(linux));
@@ -373,10 +373,21 @@ impl PyEmulatorBridge {
             })?;
 
         const SCRATCH_ADDR: u64 = 0x800_000;
-        engine.mem_map(SCRATCH_ADDR, 0x10_0000, MemPerms::READ_WRITE)
-            .map_err(|e: rundroid_backend::BackendError| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-            })?;
+        {
+            let mut materializer = PyEngineMaterializer {
+                engine: &mut *engine,
+            };
+            address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    SCRATCH_ADDR,
+                    0x10_0000,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_WRITE,
+                    MemoryUsage::Scratch,
+                ),
+                &mut materializer,
+            ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        }
 
         // VM 用 Arc<Mutex<AndroidVM>> 包裹：JNI trampoline hook 与绑定层共享同一 VM。
         // 取出内部独立 Arc<Mutex>（objects / id_alloc）clone 给 shim / id_alloc 字段，
@@ -390,8 +401,8 @@ impl PyEmulatorBridge {
         Ok(Self {
             engine: EngineHolder { engine: Some(engine) },
             linux,
+            address_space,
             module_id_alloc: ModuleIdAllocator::new(),
-            reserve_cursor: 0x4000_0000,
             graph: ModuleGraph::new(),
             trampoline_mapped: false,
             vm,
@@ -438,8 +449,8 @@ impl PyEmulatorBridge {
         let module = {
             let engine_ref: &mut dyn Engine = &mut *self.engine;
             let mut load_ctx = LoadCtxAdapterPy {
+                space: &self.address_space,
                 engine: engine_ref,
-                next_reserve: &mut self.reserve_cursor,
             };
             DefaultLoader::new()
                 .load(&mut load_ctx, &parsed, LoadRequest {
@@ -452,18 +463,17 @@ impl PyEmulatorBridge {
                 })?
         };
 
-        for seg in &module.segments {
-            let p = MemPerms::from_flags(seg.perms.read, seg.perms.write, seg.perms.execute);
-            let _ = self.engine.mem_protect(seg.guest_addr, seg.size as usize, p);
-        }
-
         let soname = parsed.dynamic.soname.clone();
         self.graph.insert(module, soname);
 
         {
             let engine_ref: &mut dyn Engine = &mut *self.engine;
             let graph_ptr: *mut ModuleGraph = &mut self.graph;
-            let mut link_ctx = LinkCtxAdapterPy { engine: engine_ref, graph_ptr };
+            let mut link_ctx = LinkCtxAdapterPy {
+                engine: engine_ref,
+                graph_ptr,
+                space: &self.address_space,
+            };
             DefaultLinker::new()
                 .link_root(&mut link_ctx, &mut self.graph, module_id)
                 .map_err(|e: rundroid_elf_linker::ElfLinkError| {
@@ -1242,9 +1252,21 @@ impl PyEmulatorBridge {
         // 1. 一次性映射整块 JNIEnv + JavaVM 区域（env struct / 函数表 / trampoline +
         //    JavaVM struct / invoke table / javavm trampoline）。
         let total_map = env_abi.total_size() + vm_abi.total_size();
-        self.engine
-            .mem_map(env_abi.env_ptr(), total_map, MemPerms::READ_EXEC)
-            .map_err(backend_err)?;
+        {
+            let mut materializer = PyEngineMaterializer {
+                engine: &mut *self.engine,
+            };
+            self.address_space.lock().unwrap().allocate(
+                AllocationRequest::reserved(
+                    env_abi.env_ptr(),
+                    total_map as u64,
+                    PAGE_SIZE,
+                    AddressSpacePerms::READ_EXEC,
+                    MemoryUsage::JNIEnv,
+                ),
+                &mut materializer,
+            ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        }
 
         // 2. 写入 env header + 函数指针表 + trampoline NOP + JavaVM header + invoke table + trampoline NOP。
         {
@@ -1394,12 +1416,38 @@ impl PyEmulatorBridge {
         const STACK_TOP: u64    = STACK_BASE + 0x10_0000;
 
         if !self.trampoline_mapped {
-            self.engine.mem_map(SENTINEL_ADDR, 0x1000, MemPerms::READ_EXEC)
-                .map_err(backend_err)?;
+            {
+                let mut materializer = PyEngineMaterializer {
+                    engine: &mut *self.engine,
+                };
+                self.address_space.lock().unwrap().allocate(
+                    AllocationRequest::reserved(
+                        SENTINEL_ADDR,
+                        0x1000,
+                        PAGE_SIZE,
+                        AddressSpacePerms::READ_EXEC,
+                        MemoryUsage::Trampoline,
+                    ),
+                    &mut materializer,
+                ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            }
             self.engine.mem_write(SENTINEL_ADDR, &[0xC0, 0x03, 0x5F, 0xD6])
                 .map_err(backend_err)?;
-            self.engine.mem_map(STACK_BASE, 0x10_0000, MemPerms::READ_WRITE)
-                .map_err(backend_err)?;
+            {
+                let mut materializer = PyEngineMaterializer {
+                    engine: &mut *self.engine,
+                };
+                self.address_space.lock().unwrap().allocate(
+                    AllocationRequest::reserved(
+                        STACK_BASE,
+                        0x10_0000,
+                        PAGE_SIZE,
+                        AddressSpacePerms::READ_WRITE,
+                        MemoryUsage::Stack,
+                    ),
+                    &mut materializer,
+                ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            }
             self.trampoline_mapped = true;
         }
 
@@ -1505,6 +1553,19 @@ impl<'a> MemoryBridge for CpuMemoryBridge<'a> {
         let perms = MemPerms::from_flags(read, write, exec);
         self.cpu.mem_map(addr, len, perms).is_ok()
     }
+
+    fn protect(&mut self, addr: u64, len: usize, prot: i32) -> bool {
+        use rundroid_backend::MemPerms;
+        let read = (prot & 1) != 0;
+        let write = (prot & 2) != 0;
+        let exec = (prot & 4) != 0;
+        let perms = MemPerms::from_flags(read, write, exec);
+        self.cpu.mem_protect(addr, len, perms).is_ok()
+    }
+
+    fn unmap(&mut self, addr: u64, len: usize) -> bool {
+        self.cpu.mem_unmap(addr, len).is_ok()
+    }
 }
 
 impl SyscallHook for SyscallDispatcherPy {
@@ -1536,8 +1597,8 @@ impl SyscallHook for SyscallDispatcherPy {
 // ============================================================================
 
 struct LoadCtxAdapterPy<'a> {
+    space: &'a Arc<Mutex<MemoryAddressSpace>>,
     engine: &'a mut dyn Engine,
-    next_reserve: &'a mut u64,
 }
 
 fn align_up(v: u64, a: u64) -> u64 {
@@ -1546,12 +1607,19 @@ fn align_up(v: u64, a: u64) -> u64 {
 
 impl<'a> LoadContext for LoadCtxAdapterPy<'a> {
     fn reserve_image_space(&mut self, size: u64, align: u64) -> Result<u64, MemoryError> {
-        let aligned = align_up(size, 0x1000);
-        let base = align_up(*self.next_reserve, align.max(0x1000));
-        self.engine.mem_map(base, aligned as usize, MemPerms::ALL)
-            .map_err(|_| MemoryError::InvalidSize { size: aligned, reason: "backend rejected" })?;
-        *self.next_reserve = base + aligned;
-        Ok(base)
+        let mut materializer = PyEngineMaterializer { engine: self.engine };
+        let region = self.space.lock().unwrap().allocate(
+            AllocationRequest::dynamic(
+                size,
+                align.max(PAGE_SIZE),
+                AddressSpacePerms::ALL,
+                MemoryUsage::ELFImage,
+                DynamicArena::new(0x4000_0000, 0x7F00_0000_0000),
+                0x4000_0000,
+            ),
+            &mut materializer,
+        )?;
+        Ok(region.addr)
     }
 
     fn map_segment(
@@ -1559,6 +1627,30 @@ impl<'a> LoadContext for LoadCtxAdapterPy<'a> {
         spec: rundroid_elf_loader::SegmentMapSpec<'_>,
     ) -> Result<rundroid_elf_loader::MappedSegment, MemoryError> {
         Ok(rundroid_elf_loader::MappedSegment { guest_addr: spec.guest_addr, size: spec.size })
+    }
+
+    fn protect_segment(
+        &mut self,
+        guest_addr: u64,
+        size: u64,
+        perms: AddressSpacePerms,
+        _usage: MemoryUsage,
+    ) -> Result<(), MemoryError> {
+        let start = align_down(guest_addr);
+        let end = align_up(
+            guest_addr
+                .checked_add(size)
+                .ok_or(MemoryError::Overflow {
+                    addr: guest_addr,
+                    size,
+                })?,
+            PAGE_SIZE,
+        );
+        let mut materializer = PyEngineMaterializer { engine: self.engine };
+        self.space
+            .lock()
+            .unwrap()
+            .protect(start, end - start, perms, &mut materializer)
     }
 
     fn write_bytes(&mut self, guest_addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -1575,9 +1667,59 @@ impl<'a> LoadContext for LoadCtxAdapterPy<'a> {
     fn emit(&mut self, _event: rundroid_telemetry::TelemetryEvent<'_>) {}
 }
 
+struct PyEngineMaterializer<'a> {
+    engine: &'a mut dyn Engine,
+}
+
+impl<'a> MemoryMaterializer for PyEngineMaterializer<'a> {
+    fn map(
+        &mut self,
+        addr: u64,
+        size: u64,
+        perms: AddressSpacePerms,
+        _usage: MemoryUsage,
+    ) -> Result<(), MemoryError> {
+        self.engine
+            .mem_map(addr, size as usize, MemPerms::from_flags(perms.readable(), perms.writable(), perms.executable()))
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "map",
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+
+    fn protect(&mut self, addr: u64, size: u64, perms: AddressSpacePerms) -> Result<(), MemoryError> {
+        self.engine
+            .mem_protect(
+                addr,
+                size as usize,
+                MemPerms::from_flags(perms.readable(), perms.writable(), perms.executable()),
+            )
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "protect",
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+
+    fn unmap(&mut self, addr: u64, size: u64) -> Result<(), MemoryError> {
+        self.engine
+            .mem_unmap(addr, size as usize)
+            .map_err(|e| MemoryError::MaterializeFailed {
+                op: "unmap",
+                addr,
+                size,
+                reason: e.to_string(),
+            })
+    }
+}
+
 struct LinkCtxAdapterPy<'a> {
     engine: &'a mut dyn Engine,
     graph_ptr: *mut ModuleGraph,
+    space: &'a Arc<Mutex<MemoryAddressSpace>>,
 }
 
 impl<'a> LinkContext for LinkCtxAdapterPy<'a> {
@@ -1595,8 +1737,21 @@ impl<'a> LinkContext for LinkCtxAdapterPy<'a> {
             .map_err(|_| MemoryError::NotMapped { addr: patch.target_addr })
     }
 
-    fn protect_relro(&mut self, _module: rundroid_core::ModuleId) -> Result<(), MemoryError> {
-        Ok(())
+    fn protect_relro(&mut self, module: rundroid_core::ModuleId) -> Result<(), MemoryError> {
+        let graph: &ModuleGraph = unsafe { &*self.graph_ptr };
+        let Some(m) = graph.get(module) else {
+            return Ok(());
+        };
+        let Some(relro) = m.relro else {
+            return Ok(());
+        };
+        let start = align_down(relro.start);
+        let end = align_up(relro.end, PAGE_SIZE);
+        let mut materializer = PyEngineMaterializer { engine: self.engine };
+        self.space
+            .lock()
+            .unwrap()
+            .protect(start, end - start, AddressSpacePerms::READ, &mut materializer)
     }
 
     fn emit(&mut self, _event: rundroid_telemetry::TelemetryEvent<'_>) {}
@@ -1611,4 +1766,8 @@ fn _rundroid(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEmulatorBridge>()?;
     m.add_class::<PyVirtFile>()?;
     Ok(())
+}
+
+fn align_down(v: u64) -> u64 {
+    v & !(PAGE_SIZE - 1)
 }

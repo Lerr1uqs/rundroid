@@ -618,12 +618,20 @@ pub fn mmap_from_fd(
     flags: i32,
 ) -> Result<Option<DeviceMappedRegion>, FdReadWriteError> {
     match &entry.handle {
-        FdHandle::File(_fh) => {
-            // File-backed mmap 暂未实现（Phase 2）。
-            // 对常规文件执行 mmap 在 bootstrap 阶段返回 None，
-            // 调用侧回退为匿名映射。
-            let _ = (_fh, length, offset, prot, flags);
-            Ok(None)
+        FdHandle::File(fh) => {
+            if !matches!(entry.kind, FdKind::File) {
+                let _ = (length, offset, prot, flags);
+                return Ok(None);
+            }
+            let content = file_pread(fh, offset, length).map_err(|e| match e {
+                FileReadError::HostIo(msg) => FdReadWriteError::Internal(msg),
+                FileReadError::ProviderError(msg) => FdReadWriteError::Internal(msg),
+            })?;
+            Ok(Some(DeviceMappedRegion {
+                content,
+                hint_addr: 0,
+                prot,
+            }))
         }
         FdHandle::Device(dev) => {
             let mut ctx = DeviceMmapContext { fd: entry.fd };

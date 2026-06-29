@@ -7,7 +7,7 @@
 
 use crate::runtime::EventRecord;
 use rundroid_core::{Arch, BackendKind};
-use rundroid_memory::RegionTracker;
+use rundroid_memory::MemoryRegion;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -89,16 +89,15 @@ impl Artifacts {
 pub fn backend_info_from(
     arch: Arch,
     backend: BackendKind,
-    regions: &RegionTracker,
+    regions: &[MemoryRegion],
     exit_code: Option<i32>,
 ) -> BackendInfo {
     let regions: Vec<RegionEntry> = regions
-        .regions()
         .iter()
         .map(|r| RegionEntry {
             addr: r.addr,
             size: r.size,
-            origin: format!("{:?}", r.origin).to_lowercase(),
+            origin: format!("{:?}", r.usage).to_lowercase(),
         })
         .collect();
     BackendInfo {

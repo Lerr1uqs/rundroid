@@ -11,5 +11,6 @@ description = "rundroid Linux 用户态运行时：基础 fd / VFS / syscall"
 [dependencies]
 rundroid-core.workspace = true
 rundroid-driver.workspace = true
+rundroid-memory.workspace = true
 rundroid-telemetry.workspace = true
 thiserror.workspace = true
