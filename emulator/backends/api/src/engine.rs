@@ -35,6 +35,9 @@ pub trait Engine {
     /// 从 guest 地址读取字节到调用方提供的缓冲区。
     fn mem_read(&self, addr: u64, buf: &mut [u8]) -> Result<(), BackendError>;
 
+    /// 释放一段已映射 guest 内存。
+    fn mem_unmap(&mut self, addr: u64, size: usize) -> Result<(), BackendError>;
+
     /// 写入一个 64 位寄存器。
     fn reg_write(&mut self, reg: Arm64Reg, value: u64) -> Result<(), BackendError>;
 
@@ -154,5 +157,9 @@ pub trait GuestCPU {
     /// syscall 层的 mmap 通过此方法在目标侧建立真实映射。
     /// 如果地址已被占用或其他原因失败，返回 `BackendError`。
     fn mem_map(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError>;
+    /// 修改 guest 区间权限。
+    fn mem_protect(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError>;
+    /// 释放 guest 区间。
+    fn mem_unmap(&mut self, addr: u64, size: usize) -> Result<(), BackendError>;
     fn stop(&mut self);
 }

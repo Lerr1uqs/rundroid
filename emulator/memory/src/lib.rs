@@ -1,7 +1,8 @@
 //! `rundroid-memory`
 //!
 //! guest 地址空间抽象。bootstrap 阶段提供：
-//! - [`region::RegionTracker`]：跟踪已映射区间，检测重叠
+//! - [`address_space::MemoryAddressSpace`]：统一 guest VMA authority
+//! - [`region::RegionTracker`]：过渡期兼容账本入口
 //! - [`layout`]：stack / TLS 等固定布局的地址计算
 //! - [`error::MemoryError`]：内存层错误模型
 //!
@@ -11,10 +12,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod address_space;
 pub mod error;
 pub mod layout;
 pub mod region;
 
+pub use address_space::{
+    AllocationMode, AllocationPlacement, AllocationRequest, DynamicArena, MemoryAddressSpace,
+    MemoryMaterializer, MemoryPerms, MemoryRegion, MemoryUsage, PAGE_SIZE,
+};
 pub use error::MemoryError;
 pub use layout::{StackLayout, TlsLayout};
-pub use region::{MemoryRegion, RegionOrigin, RegionTracker};
+pub use region::{RegionOrigin, RegionTracker};

@@ -28,7 +28,33 @@ pub enum MemoryError {
     #[error("invalid region size {size:#x}: {reason}")]
     InvalidSize { size: u64, reason: &'static str },
 
+    /// 请求的地址未按要求对齐。
+    #[error("address {addr:#x} is not aligned to {align:#x}")]
+    Misaligned { addr: u64, align: u64 },
+
     /// 请求的地址未映射（在查找 / 校验场景下触发）。
     #[error("address {addr:#x} not mapped")]
     NotMapped { addr: u64 },
+
+    /// 请求的区间没有完整覆盖现有 VMA。
+    #[error("range {addr:#x}+{size:#x} is not fully covered by mapped regions")]
+    RangeNotMapped { addr: u64, size: u64 },
+
+    /// gap search 在给定 arena 内找不到满足条件的洞。
+    #[error("no available gap for size {size:#x} align {align:#x} in arena {start:#x}..{end:#x}")]
+    NoAvailableGap {
+        size: u64,
+        align: u64,
+        start: u64,
+        end: u64,
+    },
+
+    /// 地址空间物化执行器失败。
+    #[error("materialize failed for {op} at {addr:#x}+{size:#x}: {reason}")]
+    MaterializeFailed {
+        op: &'static str,
+        addr: u64,
+        size: u64,
+        reason: String,
+    },
 }

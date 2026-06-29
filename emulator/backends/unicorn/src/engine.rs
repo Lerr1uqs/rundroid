@@ -103,6 +103,23 @@ impl<'a, 'u: 'a> GuestCPU for UnicornGuestCPU<'a, 'u> {
                 reason: "syscall mmap rejected by unicorn",
             })
     }
+    fn mem_protect(&mut self, addr: u64, size: usize, perms: MemPerms) -> Result<(), BackendError> {
+        const PAGE: u64 = 0x1000;
+        let aligned_addr = addr & !(PAGE - 1);
+        let end = (addr + size as u64 + PAGE - 1) & !(PAGE - 1);
+        let aligned_size = end.saturating_sub(aligned_addr);
+        self.uc
+            .mem_protect(aligned_addr, aligned_size, translate_perms(perms))
+            .map_err(|_| BackendError::MemoryAccess {
+                addr: aligned_addr,
+                len: aligned_size as usize,
+            })
+    }
+    fn mem_unmap(&mut self, addr: u64, size: usize) -> Result<(), BackendError> {
+        self.uc
+            .mem_unmap(addr, size as u64)
+            .map_err(|_| BackendError::MemoryAccess { addr, len: size })
+    }
     fn stop(&mut self) {
         self.stop_requested = true;
     }
@@ -129,6 +146,12 @@ impl BackendEngine for UnicornEngine {
         self.uc
             .mem_read(addr, buf)
             .map_err(|_| BackendError::MemoryAccess { addr, len: buf.len() })
+    }
+
+    fn mem_unmap(&mut self, addr: u64, size: usize) -> Result<(), BackendError> {
+        self.uc
+            .mem_unmap(addr, size as u64)
+            .map_err(|_| BackendError::MemoryAccess { addr, len: size })
     }
 
     fn reg_write(&mut self, reg: Arm64Reg, value: u64) -> Result<(), BackendError> {
