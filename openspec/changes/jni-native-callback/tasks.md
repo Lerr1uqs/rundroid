@@ -1,0 +1,15 @@
+- [ ] 新增 `jni-native-callback` capability 的正式 spec
+- [ ] 定义 `GuestFunctionCaller` trait（`call_guest_function(&mut self, fn_ptr, &[u64]) -> Result<u64, BackendError>`）
+- [ ] 在 `JniEnvSurface` 中新增 `guest_caller: Option<Box<dyn GuestFunctionCaller>>` 字段
+- [ ] 在 `JniEnvSurface::new_with_objects` 及构造链中支持传入 `guest_caller`
+- [ ] 实现 `jvalues_to_native_args(env_ptr, class_or_obj_id, &[JValue]) -> Vec<u64>` 参数编组函数
+- [ ] 实现 `native_return_to_jvalue(ret_type: &JType, x0: u64) -> JValue` 返回值分发函数
+- [ ] 修改 `dispatch_by_method_id`：当 `has_native(mid) && guest_caller.is_some()` 时走 native 回调路径
+- [ ] 修改 `dispatch_static_by_method_id`：当 `has_native(mid) && guest_caller.is_some()` 时走 native 回调路径
+- [ ] 在 case-runner 中实现 `GuestFunctionCaller`（包装 `GuestRuntime::call_export` / sentinel 机制）
+- [ ] 接入 `GuestFunctionCaller` 到 `JniTrampolineHook` 或 `JniEnvSurface` 构造路径
+- [ ] 重构 `call_export` 为可复用的 `call_guest_function` 方法（或直接适配 `GuestFunctionCaller` trait）
+- [ ] 增加 harness case：RegisterNatives 绑定 guest 函数 → 通过 JNI ABI 调用 → 验证返回值
+- [ ] 增加 harness case：Java_* 符号回落查找路径覆盖验证
+- [ ] `cargo test --workspace` 确保现有测试不受影响
+- [ ] 使用 `openspec validate --type change jni-native-callback --strict` 验证 change
